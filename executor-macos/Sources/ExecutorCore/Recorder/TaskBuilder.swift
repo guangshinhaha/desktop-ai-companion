@@ -10,6 +10,8 @@ public final class TaskBuilder {
         var inputName: String?
         var consequential: String
         var approval: String?
+        /// Proposed from what changed on screen (ExpectProposer). Nil keeps the default for the action.
+        var expect: [String: Any]?
     }
 
     let appBundle: String
@@ -35,6 +37,25 @@ public final class TaskBuilder {
 
     public var stepCount: Int { steps.count }
     public var preconditionCount: Int { secureFields.count }
+
+
+    /// True when `typed(into:)` or `pressed(_:)` would add a step for this target. The session settles the
+    /// previous step's screen change first, before the new action can alter the screen.
+    public func startsStep(_ t: Target) -> Bool {
+        switch t.kind {
+        case .secure: return false
+        case .press: return true
+        case .text, .select:
+            if let last = steps.last, last.action != "press", last.target == t.descriptor { return false }
+            return true
+        }
+    }
+
+    /// Sets step `index`'s check from the screen change.
+    func setExpect(_ check: [String: Any], at index: Int) {
+        guard steps.indices.contains(index) else { return }
+        steps[index].expect = check
+    }
 
     /// The officer typed into this element (or chose in it).
     public func typed(into t: Target) {
@@ -136,10 +157,13 @@ public final class TaskBuilder {
                 "target": Self.dict(s.target), "consequential": s.consequential,
             ]
             if let n = s.inputName {
+                // A field step's check is its own input, never what is on screen.
                 o["value"] = ["input": n]
                 o["expect"] = [["kind": "value_equals", "input": n]]
+            } else if let e = s.expect {
+                o["expect"] = [e]
             } else {
-                // A placeholder until the expect proposer (#14) replaces it: the control is still there.
+                // Nothing stable changed on screen, so the check is that the control is still there.
                 o["expect"] = [["kind": "exists", "target": Self.dict(s.target)]]
             }
             if let a = s.approval { o["approval"] = ["summary": a, "undoable": false] }

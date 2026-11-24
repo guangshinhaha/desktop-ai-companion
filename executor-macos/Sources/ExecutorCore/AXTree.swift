@@ -30,7 +30,8 @@ public final class AXApp {
 
     final class Signal { var fired = false }
 
-    public init(bundleId: String, windowTitleContains: String? = nil) throws {
+    /// `observe: false` skips the notification subscription, for a caller that only takes snapshots.
+    public init(bundleId: String, windowTitleContains: String? = nil, observe: Bool = true) throws {
         guard AXIsProcessTrusted() else { throw Failure.notTrusted }
         // More than one process can share a bundle id (a second browser profile). Take the one with a window.
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
@@ -50,7 +51,7 @@ public final class AXApp {
         self.windowTitleContains = windowTitleContains
         AXUIElementSetMessagingTimeout(element, 2)
         wake()
-        subscribe()
+        if observe { subscribe() }
     }
 
     /// Browsers build the page's tree lazily. These two writes ask them to. Errors are expected
@@ -166,3 +167,5 @@ public final class AXApp {
         return (v as! AXUIElement)
     }
 }
+
+extension AXApp: WindowSnapshotting {}
