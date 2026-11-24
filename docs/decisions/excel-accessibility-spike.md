@@ -9,7 +9,7 @@ Excel for Mac is not installed on the test Mac. Only Numbers 15 (`com.apple.iWor
 
 ## Scope change (Shin, via the coordinator)
 
-Excel is out of the measured set. The measured set is Numbers (through AX) and the on-disk file read. Google Sheets in Chrome was added as a target, because Google Drive and Workspace is the more relevant one for officers. **Google Sheets was not tested**: see "Google Sheets in Chrome" below.
+Excel is out of the measured set. The measured set is Numbers (through AX) and the on-disk file read. Google Sheets was added as a target, because Google Drive and Workspace is the more relevant one for officers. Google Sheets was tested in Dia (not Chrome): see "Google Sheets in Dia" below.
 
 ## Method
 
@@ -83,11 +83,42 @@ whole process, cold, 3 runs: real 0.06 s each (Python start-up dominates)
 
 Both are far below the 100 ms step budget. Speed does not decide this. What decides it is below.
 
-## Google Sheets in Chrome: untested, needs Shin sign-in
+## Google Sheets in Dia (tested, 24 Nov 2026)
 
-Not measured. On the test Mac, Chrome was running with no open window, so there was no signed-in Google Sheets session to read. Chrome profiles do hold a Chrome sign-in, but I could not tell which account they are, and creating a new sheet writes to a remote Google account. The repo sets `shinstack-mode.shared: ask`, so I did not open a profile or create a sheet. Shin signs in (and confirms the account) before this can run.
+Shin pointed the test at Dia (Dia.app, `company.thebrowser.dia`, Chromium-based), already signed in to Google. Chrome was not used. Account details, the Drive and other tabs were not read. Scripts: `spike/dia_lib.swift` (shared helpers; concatenate with a script to compile), `spike/dia_dump.swift`, `spike/dia_sheets_sub.swift`, `spike/dia_sheets_read.swift`.
 
-Plan once signed in: create a new sheet from `stand-in/data/staff.csv` only (synthetic), read cells from Chrome's accessibility tree (`AXWebArea`, `AXDOMIdentifier`), and time it like Numbers. Expected risk, not measured: Sheets draws its grid on a canvas, so cells may be absent from the AX tree unless Sheets' accessibility mode is on. Until measured, the pick below says nothing about Sheets.
+What was done: `open -a Dia https://sheets.new` opened one new sheet; it was titled `spike-11-synthetic`, filled with the four columns of `stand-in/data/staff.csv` only (tab-separated text on the clipboard, Edit > Paste pressed by AX), read, then moved to the Drive trash (see "Cleanup"). Screen unlocked (`CGSSessionScreenIsLocked=0`).
+
+### What AX exposes in Sheets
+
+1. **The tree needs waking, like Numbers.** First walk of Dia's window with no write: 57 elements, no `AXWebArea` (only browser chrome). After `AXManualAccessibility = true` on the app (returned success for Dia; `AXEnhancedUserInterface` returned `-25208` again) the page's web area appears with the whole DOM (`AXWebArea` titled "... - Google Sheets", ids such as `docs-chrome`, `waffle-grid-container`). Only the visible tab of a window has a web area, so the sheet tab must be selected first (AXPress on its `AXTabButton` works).
+2. **The cells are not in the tree.** The grid under `waffle-grid-container` has about 80 `AXGroup` and 3 empty `AXStaticText`, no `AXCell`, no `AXTable`, no text for any cell. Sheets draws the grid itself. Searching the tree for "Aiden" found nothing. A link "Turn on screen reader support" (`docs-a11y-aria-enable`) is present; I focused it and pressed Return by key event, and the link disappeared, but the grid still had no cell text. I did not confirm that Sheets' screen-reader mode is really on, so "needs screen-reader mode" is **not** established either way.
+3. **What is exposed: the active cell.** The Name box is an `AXTextField` (`t-name-box`) whose `AXValue` is the selection in A1 form (`A1:D6` after the paste, `B3`, `D6`). The formula bar is an `AXTextArea` (inside `t-formula-bar-input`) whose `AXValue` is the active cell's text. So the `B3` address is exposed natively and needs no row/column arithmetic, unlike Numbers.
+4. **Selection.** Reading it works (Name box plus formula bar). Setting it through pure AX did not work: `AXValue` on the Name box plus `AXFocused` needs a Return key event (`CGEvent.postToPid`) to commit. Sheets' own menu bar items (File, Tools) are in the tree but `AXPress` does not open them (no menu contents appear), so Sheets menus are unreachable by AX alone.
+5. **Staleness.** The formula bar lags the Name box after a selection change. In the first 5x4 pass (fixed 20 ms wait) 6 of 20 reads returned the previous cell. With polling until the text changes, one read (D2) still did not match the CSV (see next point). A reader must wait for verified state, not a sleep.
+6. **My own side effect.** The sheet ended with D2 holding `bella.example@staff.example.test` and a tall row 2, which differs from the CSV. I believe my Name-box/Return navigation wrote it in the first, unsettled pass (the Return went to a cell rather than the Name box); I did not trace it. So 19 of 20 values matched the CSV, and the mismatch is real data in the sheet, not only a stale read. It is a warning: driving selection with key events can edit cells.
+7. Not tested: formulas, number formats, merged or hidden cells, a mouse click selection, `AXObserver` notifications, large sheets, scrolling beyond the viewport, other sheet tabs.
+
+### Timings (Dia, one run each unless stated)
+
+| Step | Time |
+|---|---|
+| Locate the web area (BFS) | 2.8 to 4.2 ms |
+| Locate Name box and formula bar | 25 to 37 ms |
+| Read selected cell (Name box + formula bar) | 0.26 ms first, 0.02 ms with handles cached |
+| Select one cell (set Name box, Return, wait until it commits) | 7 to 65 ms |
+| 5x4 read (A2:D6), navigate and poll per cell | 254 ms total, 12.7 ms per cell |
+| 5x4 read, fixed 20 ms wait (unreliable) | 750 ms with stale reads |
+
+The 5x4 read is a 20-step navigate-and-read, not one bulk call. Only the selected cell is readable, so cost scales with cells, and every step can edit the sheet if the focus is wrong.
+
+### Cleanup
+
+The sheet was moved to the Drive trash through Sheets' menu search ("Move to trash"); Sheets showed "File moved to trash". It stays in the trash for 30 days unless Shin empties it. Nothing else was created. I pressed no sign-in or account control. The tab was left on that dialog. The clipboard was overwritten with the synthetic TSV (it held 18 bytes of text before; not restored). A second window holding only the sheet tab appeared in Dia during the run.
+
+### Reading for the pick
+
+Sheets in Dia is workable for exactly one thing: the selected cell, address and text, in well under 100 ms once awake. It is not workable for list runs or any bulk read. That matches the pick below. Dia and Chrome share the engine, so Chrome is expected to behave the same, but that was not tested.
 
 ## The pick
 
@@ -99,6 +130,7 @@ Reasons, from the measurements:
 - Both are fast enough, so the AX cost is reliability and portability, not time.
 - AX reflects unsaved edits and the current selection; the file does not. An officer who copies a cell they have just edited, or "the highlighted cell", needs AX. This is an expectation risk, not a speed one.
 - AX on Excel is unproven (see below), so the design must not depend on it.
+- Google Sheets in Dia (tested) agrees: only the selected cell is readable (Name box gives `B3`, formula bar gives the text), the grid cells are not in the tree, and reads can go stale. It confirms "AX for the selected cell only, best effort". Bulk reads of a Sheet need an export or the Sheets API, not AX; that is a later call.
 
 ## What this changes
 
@@ -120,7 +152,7 @@ GovSuite is the government version of Word, PowerPoint and Docs. It is to be int
 
 ## Untested, and what would settle it
 
-- **Google Sheets in Chrome, all of it** (see above; needs Shin's sign-in).
+- **Google Sheets in Chrome** (Dia was tested, not Chrome), Sheets screen-reader mode, bulk reads, and observer notifications.
 - **Excel for Mac, all of it** (now out of the measured set by Shin's call; Excel was not tested). Whether it exposes `AXTable` or `AXCell` at all, where the text sits (`AXValue` or `AXTitle`), whether it gives the A1 address (Excel has a Name Box, an `AXTextField` that may carry it), selection, and the timing. Needs Excel on a Mac. Hands-on for Shin or a Mac with Office. Rerun `spike/ax_dump.swift` and `spike/ax_select.swift` with the bundle id `com.microsoft.Excel`, which only needs that string changed.
 - Whether the tree wake-up is required for Excel, and for Numbers on other macOS versions.
 - A real mouse click or keyboard selection in Numbers, and `AXObserver` selection notifications.
