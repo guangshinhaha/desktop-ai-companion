@@ -38,8 +38,11 @@ public enum Resolution {
 /// The first locator that finds anything decides: one match is found, two or more is
 /// ambiguous. Locator 5 (vision) is Phase 1.
 public enum Resolver {
-    /// Below this a fuzzy label is not a match at all.
-    static let fuzzyThreshold = 0.5
+    /// Below this a fuzzy label is not a match at all. Set high on purpose: Approve/Disapprove
+    /// and Enable/Disable must never count as the same control.
+    static let fuzzyThreshold = 0.85
+    /// Labels longer than this are never fuzzy-matched (bounds time and memory on hostile pages).
+    static let maxLabelLength = 2000
     /// Fuzzy candidates within this of the best score count as equally good.
     static let fuzzyMargin = 0.1
 
@@ -107,10 +110,14 @@ public enum Resolver {
 
     static func byFuzzyLabel(_ d: Descriptor, _ all: [UINode]) -> Outcome {
         guard d.label != nil || d.labelMatches != nil else { return .none }
+        let anchors = (d.anchors ?? []).filter { !squash($0).isEmpty }
+        // A fuzzy label alone is a guess. TD 5.2 scopes it by anchors; an explicit
+        // label_matches pattern is the other way to say what "close enough" means.
+        if anchors.isEmpty && d.labelMatches == nil { return .none }
 
         func score(_ n: UINode) -> Double? {
             if let role = d.role, n.role != role { return nil }
-            guard let l = n.label, !squash(l).isEmpty else { return nil }
+            guard let l = n.label, !squash(l).isEmpty, l.count <= maxLabelLength else { return nil }
             var s = 1.0
             if let g = d.labelMatches {
                 if !glob(g, l) { return nil }
@@ -125,16 +132,15 @@ public enum Resolver {
         guard let best = scored.map(\.1).max() else { return .none }
         var contenders = scored.filter { best - $0.1 <= fuzzyMargin }.map(\.0)
 
-        let anchors = (d.anchors ?? []).filter { !squash($0).isEmpty }
         if !anchors.isEmpty {
             // Every anchor must be on screen, or this locator has no evidence to go on.
-            let anchorNodes = anchors.map { a in all.filter { n in n.label.map { similarity(a, $0) >= 0.9 } ?? false } }
+            let anchorNodes = anchors.map { a in all.filter { n in n.label.map { $0.count <= maxLabelLength && similarity(a, $0) >= 0.9 } ?? false } }
             if anchorNodes.contains(where: { $0.isEmpty }) { return .none }
             if contenders.count > 1 {
                 // Anchors break a tie only when one candidate sits clearly nearest to them.
                 let dist = contenders.map { c in
                     anchorNodes.reduce(0) { sum, group in
-                        sum + (group.filter { $0 !== c }.map { treeDistance(c, $0) }.min() ?? Int.max / 8)
+                        sum + (group.filter { $0 !== c }.map { treeDistance(c, $0) }.min() ?? unreachable)
                     }
                 }
                 let nearest = dist.min()!
@@ -164,6 +170,13 @@ public enum Resolver {
             current = chosen[0]
         }
         if let role = d.role, current.role != role { return .none }
+        // A path says where; the label still has to agree, or this is a different control.
+        if let want = d.label {
+            guard let l = current.label, l.count <= maxLabelLength, similarity(want, l) >= fuzzyThreshold else { return .none }
+        }
+        if let g = d.labelMatches {
+            guard let l = current.label, l.count <= maxLabelLength, glob(g, l) else { return .none }
+        }
         return .one(current)
     }
 
@@ -189,13 +202,17 @@ public enum Resolver {
         return ms.filter { $0.depth == d }.map(\.node)
     }
 
+    /// Distance when two nodes share no ancestor, or an anchor has nothing else to measure to.
+    /// Small enough that sums over many anchors cannot overflow.
+    static let unreachable = 1_000_000
+
     static func treeDistance(_ a: UINode, _ b: UINode) -> Int {
         let chainA = [a] + a.ancestors()
         let chainB = [b] + b.ancestors()
         for (i, x) in chainA.enumerated() {
             if let j = chainB.firstIndex(where: { $0 === x }) { return i + j }
         }
-        return Int.max / 8
+        return unreachable
     }
 
     /// Trim and collapse whitespace. Case stays: "exact" means exact.
@@ -209,40 +226,45 @@ public enum Resolver {
         return squash(String(mapped))
     }
 
-    /// 1.0 for equal text (ignoring case and punctuation), 0.9 when one label's words are all
-    /// in the other ("Create" in "Create account"), otherwise the bigram overlap (Dice).
+    /// 1.0 for equal text (ignoring case and punctuation). 0.9 when one label's words are all in
+    /// the other and exactly one word differs ("Create" and "Create account"), unless that word
+    /// negates ("Don't approve" is not "Approve"). Otherwise the bigram overlap (Dice).
     static func similarity(_ a: String, _ b: String) -> Double {
         let x = normalize(a), y = normalize(b)
         if x.isEmpty || y.isEmpty { return 0 }
         if x == y { return 1 }
         let tx = Set(x.split(separator: " ")), ty = Set(y.split(separator: " "))
-        if tx.isSubset(of: ty) || ty.isSubset(of: tx) { return 0.9 }
+        if tx.isSubset(of: ty) || ty.isSubset(of: tx) {
+            let extra = tx.symmetricDifference(ty)
+            return extra.count == 1 && extra.isDisjoint(with: negations) ? 0.9 : 0
+        }
+        if tx.isDisjoint(with: negations) != ty.isDisjoint(with: negations) { return 0 }
         func bigrams(_ s: String) -> [String] {
             let c = Array(s)
             return c.count < 2 ? [s] : (0..<(c.count - 1)).map { String(c[$0...$0 + 1]) }
         }
-        var pool = bigrams(y)
+        let bx = bigrams(x), by = bigrams(y)
+        var pool: [String: Int] = [:]
+        for g in by { pool[g, default: 0] += 1 }
         var common = 0
-        for g in bigrams(x) {
-            if let i = pool.firstIndex(of: g) { pool.remove(at: i); common += 1 }
-        }
-        return 2.0 * Double(common) / Double(bigrams(x).count + bigrams(y).count)
+        for g in bx where (pool[g] ?? 0) > 0 { pool[g]! -= 1; common += 1 }
+        return 2.0 * Double(common) / Double(bx.count + by.count)
     }
 
+    static let negations: Set<Substring> = ["not", "no", "don", "dont", "cannot", "cant", "never", "cancel"]
+
     /// `*` any run, `?` any one character, case-insensitive, whole label.
+    /// Iterative with one backtrack point, so a long label cannot exhaust the stack.
     static func glob(_ pattern: String, _ text: String) -> Bool {
         let p = Array(squash(pattern).lowercased()), t = Array(squash(text).lowercased())
-        var memo: [[Bool?]] = Array(repeating: Array(repeating: nil, count: t.count + 1), count: p.count + 1)
-        func go(_ i: Int, _ j: Int) -> Bool {
-            if let m = memo[i][j] { return m }
-            let r: Bool
-            if i == p.count { r = j == t.count }
-            else if p[i] == "*" { r = go(i + 1, j) || (j < t.count && go(i, j + 1)) }
-            else if j < t.count && (p[i] == "?" || p[i] == t[j]) { r = go(i + 1, j + 1) }
-            else { r = false }
-            memo[i][j] = r
-            return r
+        var i = 0, j = 0, star = -1, mark = 0
+        while j < t.count {
+            if i < p.count, p[i] == "*" { star = i; mark = j; i += 1 }
+            else if i < p.count, p[i] == "?" || p[i] == t[j] { i += 1; j += 1 }
+            else if star >= 0 { i = star + 1; mark += 1; j = mark }
+            else { return false }
         }
-        return go(0, 0)
+        while i < p.count, p[i] == "*" { i += 1 }
+        return i == p.count
     }
 }

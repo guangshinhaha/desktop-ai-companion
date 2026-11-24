@@ -133,6 +133,50 @@ final class ResolverTests: XCTestCase {
         XCTAssertFalse(Resolver.glob("Account created*", "Cannot create account"))
     }
 
+    // MARK: findings from the adversarial review
+
+    func testOppositeOrLongerControlsAreNeverTheSameControl() {
+        let pairs = [("Approve", "Disapprove"), ("Approve", "Don't approve"), ("Enable", "Disable"),
+                     ("Accept", "Except"), ("Delete", "Delete all records"), ("Send", "Do not send")]
+        for (want, have) in pairs {
+            let page = UINode(role: "AXWindow", children: [UINode(role: "AXStaticText", label: "Role"), UINode(role: "AXButton", label: have)])
+            for anchors in [nil, ["Role"]] {
+                guard case .notFound = Resolver.resolve(Descriptor(role: "AXButton", label: want, anchors: anchors), in: page) else {
+                    return XCTFail("\(want) resolved to \(have)")
+                }
+            }
+        }
+    }
+
+    func testFuzzyLabelWithoutAnchorsIsNotAGuess() {
+        let page = UINode(role: "AXWindow", children: [UINode(role: "AXButton", label: "Create")])
+        guard case .notFound = Resolver.resolve(Descriptor(role: "AXButton", label: "Create account"), in: page) else {
+            return XCTFail("expected notFound")
+        }
+    }
+
+    func testPathMustAgreeWithTheLabel() {
+        let page = UINode(role: "AXWindow", children: [UINode(role: "AXButton", label: "Delete everything")])
+        let d = Descriptor(role: "AXButton", label: "Create account", path: ["AXButton"])
+        guard case .notFound = Resolver.resolve(d, in: page) else { return XCTFail("path matched a different control") }
+        // Renamed slightly (no exact match, no anchors) but the path and a close label still agree.
+        let ok = Descriptor(role: "AXButton", label: "Delete everything!", path: ["AXButton"])
+        expectFound(Resolver.resolve(ok, in: page), .path)
+    }
+
+    func testHugeLabelDoesNotCrashOrHang() {
+        let page = UINode(role: "AXWindow", children: [UINode(role: "AXButton", label: String(repeating: "a", count: 300_000))])
+        guard case .notFound = Resolver.resolve(Descriptor(labelMatches: "*b"), in: page) else { return XCTFail("expected notFound") }
+        XCTAssertTrue(Resolver.glob("a*a", String(repeating: "a", count: 300_000)))
+        XCTAssertFalse(Resolver.glob("*b", String(repeating: "a", count: 20_000)))
+    }
+
+    func testManyAnchorsDoNotOverflow() {
+        let page = UINode(role: "AXWindow", children: [UINode(role: "AXButton", label: "Save A"), UINode(role: "AXButton", label: "Save B")])
+        let d = Descriptor(role: "AXButton", label: "Save", anchors: Array(repeating: "Save A", count: 40))
+        switch Resolver.resolve(d, in: page) { case .notFound: XCTFail("expected a result"); default: break }
+    }
+
     // MARK: waiting
 
     final class Clock { var t = 0.0 }

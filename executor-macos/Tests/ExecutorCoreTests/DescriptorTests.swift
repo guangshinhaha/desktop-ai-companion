@@ -21,6 +21,13 @@ final class DescriptorTests: XCTestCase {
         XCTAssertThrowsError(try Descriptor.load(from: Data("[]".utf8)))
     }
 
+    func testRejectsWhatTheSchemaRejects() {
+        for bad in [#"{"role":""}"#, #"{"path":[]}"#, #"{"label":"x","bogus":1}"#, #"{"anchors":[""],"role":"a"}"#,
+                    #"{"target":{"label":"x"},"label":"y"}"#, #"{"label":5}"#, #"{"target":5}"#, #"{"target":{"label":"x","bogus":1}}"#] {
+            XCTAssertThrowsError(try Descriptor.load(from: Data(bad.utf8)), bad)
+        }
+    }
+
     /// Every target in the schema package's example task decodes, so the two cannot drift apart.
     func testEveryTargetInTheSchemaFixtureDecodes() throws {
         let url = URL(fileURLWithPath: #filePath)

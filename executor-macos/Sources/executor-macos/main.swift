@@ -36,7 +36,9 @@ while i < args.count {
     case "--app": bundle = value("--app")
     case "--window": window = value("--window")
     case "--ceiling":
-        guard let c = Double(value("--ceiling")), c > 0 else { fail("--ceiling must be a positive number of seconds") }
+        guard let c = Double(value("--ceiling")), c > 0, c <= 3600 else {
+            fail("--ceiling must be a number of seconds above 0 and at most 3600")
+        }
         ceiling = c
     default: fail("unknown argument \(args[i])\n\(usage)")
     }

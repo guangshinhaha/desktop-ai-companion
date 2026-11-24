@@ -34,21 +34,41 @@ public struct Descriptor: Codable, Equatable, Sendable {
 
     /// Reads a bare descriptor, or an object that holds one under `target` (a step).
     public static func load(from data: Data) throws -> Descriptor {
-        let decoder = JSONDecoder()
-        struct Wrapper: Decodable { var target: Descriptor? }
         let obj = try JSONSerialization.jsonObject(with: data)
-        guard let dict = obj as? [String: Any] else {
+        guard var dict = obj as? [String: Any] else {
             throw LoadError.notADescriptor("descriptor file must hold a JSON object")
         }
-        let d: Descriptor
-        if dict["target"] != nil, let t = try decoder.decode(Wrapper.self, from: data).target {
-            d = t
-        } else {
-            d = try decoder.decode(Descriptor.self, from: data)
+        // A step holds its descriptor under `target`. A step also has other keys, so only
+        // the descriptor's own keys beside `target` are an error (which one would win?).
+        if let t = dict["target"] {
+            if let clash = dict.keys.first(where: { Self.keys.contains($0) }) {
+                throw LoadError.notADescriptor("both target and \(clash) given; pass one descriptor")
+            }
+            guard let inner = t as? [String: Any] else { throw LoadError.notADescriptor("target must be an object") }
+            dict = inner
         }
+        // The same rules as the schema: known keys only, non-empty strings, path has an element.
+        for k in dict.keys where !Self.keys.contains(k) {
+            throw LoadError.notADescriptor("unknown key \(k)")
+        }
+        for k in ["role", "label", "label_matches", "dom_id"] {
+            if let v = dict[k], (v as? String).map({ $0.isEmpty }) ?? true {
+                throw LoadError.notADescriptor("\(k) must be a non-empty string")
+            }
+        }
+        for k in ["path", "anchors"] {
+            guard let v = dict[k] else { continue }
+            guard let arr = v as? [Any], arr.allSatisfy({ ($0 as? String).map { !$0.isEmpty } ?? false }) else {
+                throw LoadError.notADescriptor("\(k) must be a list of non-empty strings")
+            }
+            if k == "path" && arr.isEmpty { throw LoadError.notADescriptor("path must have at least one element") }
+        }
+        let d = try JSONDecoder().decode(Descriptor.self, from: JSONSerialization.data(withJSONObject: dict))
         if d.role == nil && d.label == nil && d.labelMatches == nil && d.domId == nil && d.path == nil {
             throw LoadError.notADescriptor("descriptor needs at least one of role, label, label_matches, dom_id, path")
         }
         return d
     }
+
+    static let keys: Set<String> = ["role", "label", "label_matches", "dom_id", "path", "anchors"]
 }
