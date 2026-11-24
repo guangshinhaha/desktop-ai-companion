@@ -67,7 +67,7 @@ public enum Resolver {
     /// Re-resolves until the element is found or ambiguous, or the step ceiling passes.
     /// `wait(timeout)` blocks until an accessibility event arrives or `timeout` seconds pass
     /// (TD 5.3: event first, then a bounded backoff from 100 ms to 2 s for apps that miss events).
-    /// There is no fixed sleep: a found element returns at once.
+    /// No fixed delay: a found element returns at once.
     public static func resolve(
         _ d: Descriptor,
         ceiling: TimeInterval,
