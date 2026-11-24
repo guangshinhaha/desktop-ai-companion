@@ -54,7 +54,7 @@
       },
       "if": { "properties": { "type": { "const": "choice" } }, "required": ["type"] },
       "then": { "required": ["choices"] },
-      "else": { "not": { "required": ["choices"] } }
+      "else": { "properties": { "choices": false } }
     },
     "descriptor": {
       "type": "object",
@@ -148,6 +148,10 @@
         "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 }
       },
       "allOf": [
+        {
+          "if": { "properties": { "consequential": { "enum": ["yes", "unknown"] } }, "required": ["consequential"] },
+          "then": { "required": ["approval"] }
+        },
         {
           "if": { "properties": { "action": { "enum": ["set_value", "select"] } }, "required": ["action"] },
           "then": { "required": ["target", "value"], "not": { "required": ["into"] } }

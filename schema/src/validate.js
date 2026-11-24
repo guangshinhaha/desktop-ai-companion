@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { parseJson } from "./json.js";
 
 const schema = JSON.parse(readFileSync(new URL("../task.v1.json", import.meta.url), "utf8"));
 const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
@@ -46,14 +47,13 @@ function semantic(doc) {
   const needApp = (path, key) => {
     if (!apps.has(key)) add(path, `refers to undeclared app "${key}"`);
   };
-  const checks = (base, list) =>
-    list.forEach((c, j) => {
-      if (c.input !== undefined) needInput(`${base}/${j}/input`, c.input);
-    });
+  const checkInput = (path, c) => {
+    if (c.input !== undefined) needInput(`${path}/input`, c.input);
+  };
 
   (doc.preconditions ?? []).forEach((p, i) => {
     needApp(`/preconditions/${i}/app`, p.app);
-    checks(`/preconditions/${i}/check`, [p.check]);
+    checkInput(`/preconditions/${i}/check`, p.check);
   });
   const ids = new Set();
   doc.steps.forEach((s, i) => {
@@ -67,7 +67,7 @@ function semantic(doc) {
       if (inputs.get(s.into) && inputs.get(s.into).source !== "read")
         add(`${at}/into`, `input "${s.into}" must have source "read"`);
     }
-    checks(`${at}/expect`, s.expect);
+    s.expect.forEach((c, j) => checkInput(`${at}/expect/${j}`, c));
     for (const m of s.approval?.summary.matchAll(/\{([^}]*)\}/g) ?? [])
       needInput(`${at}/approval/summary`, m[1]);
   });
@@ -81,7 +81,7 @@ export function validateTask(doc) {
   }
   const seen = new Set();
   const errors = [];
-  for (const e of check.errors.map(fromAjv)) {
+  for (const e of check.errors.filter((x) => x.keyword !== "if").map(fromAjv)) {
     const key = `${e.path}|${e.message}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -89,4 +89,14 @@ export function validateTask(doc) {
     }
   }
   return { valid: false, errors };
+}
+
+// Validates the text of a task file. Syntax errors throw SyntaxError. A key repeated at any
+// depth is an error (JSON.parse would silently keep the last one), reported with its pointer.
+export function validateText(text) {
+  const { doc, duplicates } = parseJson(text);
+  const dupErrors = duplicates.map((d) => ({ path: d.path, message: `duplicate key "${d.key}"` }));
+  const r = validateTask(doc);
+  const errors = [...dupErrors, ...r.errors];
+  return { valid: errors.length === 0, errors };
 }

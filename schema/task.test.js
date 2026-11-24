@@ -133,6 +133,7 @@ test("every step needs expect and consequential", () => {
   for (const c of ["yes", "no", "unknown"]) {
     const d = valid();
     d.steps[0].consequential = c;
+    d.steps[0].approval = { summary: "Fill in {full_name}", undoable: true };
     assert.equal(validateTask(d).valid, true, c);
   }
   for (const c of ["", "Yes", true, null, "maybe"]) {
