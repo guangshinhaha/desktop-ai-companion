@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grl.gov.sg/desktop-ai-companion/schema/task.v1.json",
+  "title": "Recorded task, format v1",
+  "description": "A recorded task: steps, element descriptors and input NAMES. It never holds a typed value. A value is {input: name} or a confirmed constant. Spec: docs/td.md section 4, PRD R-2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "id", "version", "name", "author", "created", "platform", "apps", "inputs", "steps"],
+  "properties": {
+    "format": { "const": "task/v1" },
+    "id": { "type": "string", "pattern": "^tsk_[a-z0-9]+$" },
+    "version": { "type": "integer", "minimum": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "author": { "type": "string", "minLength": 1 },
+    "created": { "type": "string", "format": "date-time" },
+    "platform": { "enum": ["macos", "windows"] },
+    "apps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/app" } },
+    "preconditions": { "type": "array", "items": { "$ref": "#/$defs/precondition" } },
+    "inputs": { "type": "array", "items": { "$ref": "#/$defs/input" } },
+    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "bundle"],
+      "properties": {
+        "key": { "$ref": "#/$defs/name" },
+        "bundle": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "check"],
+      "properties": {
+        "app": { "$ref": "#/$defs/name" },
+        "check": { "$ref": "#/$defs/check" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "source"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "type": { "enum": ["text", "email", "choice", "number", "date"] },
+        "source": { "enum": ["ask", "column", "read"] },
+        "choices": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      },
+      "if": { "properties": { "type": { "const": "choice" } }, "required": ["type"] },
+      "then": { "required": ["choices"] },
+      "else": { "properties": { "choices": false } }
+    },
+    "descriptor": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "role": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "label_matches": { "type": "string", "minLength": 1 },
+        "dom_id": { "type": "string", "minLength": 1 },
+        "path": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "anchors": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "inputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input"],
+      "properties": { "input": { "$ref": "#/$defs/name" } }
+    },
+    "constant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["constant", "confirmed_no_personal_data"],
+      "properties": {
+        "constant": { "type": ["string", "number", "boolean"] },
+        "confirmed_no_personal_data": { "const": true }
+      }
+    },
+    "typedValue": {
+      "description": "The only two forms a typed value may take. A bare literal is rejected.",
+      "oneOf": [{ "$ref": "#/$defs/inputRef" }, { "$ref": "#/$defs/constant" }]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["exists", "appears", "disappears", "value_equals", "window_title", "focused"] },
+        "target": { "$ref": "#/$defs/descriptor" },
+        "matches": { "type": "string", "minLength": 1 },
+        "input": { "$ref": "#/$defs/name" },
+        "constant": { "type": ["string", "number", "boolean"] },
+        "confirmed_no_personal_data": { "const": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["exists", "appears", "disappears", "focused"] } }, "required": ["kind"] },
+          "then": { "required": ["target"], "not": { "anyOf": [{ "required": ["matches"] }, { "required": ["input"] }, { "required": ["constant"] }, { "required": ["confirmed_no_personal_data"] }] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "window_title" } }, "required": ["kind"] },
+          "then": { "required": ["matches"], "not": { "anyOf": [{ "required": ["target"] }, { "required": ["input"] }, { "required": ["constant"] }, { "required": ["confirmed_no_personal_data"] }] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "value_equals" } }, "required": ["kind"] },
+          "then": {
+            "not": { "required": ["matches"] },
+            "oneOf": [
+              { "required": ["input"], "not": { "anyOf": [{ "required": ["constant"] }, { "required": ["confirmed_no_personal_data"] }] } },
+              { "required": ["constant", "confirmed_no_personal_data"], "not": { "required": ["input"] } }
+            ]
+          }
+        }
+      ]
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "undoable"],
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 },
+        "undoable": { "type": "boolean" }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "say", "app", "action", "expect", "consequential"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^s[0-9]+$" },
+        "say": { "type": "string", "minLength": 1 },
+        "app": { "$ref": "#/$defs/name" },
+        "action": { "enum": ["press", "set_value", "select", "type_keys", "focus_app", "open_url", "read_value", "wait_for"] },
+        "target": { "$ref": "#/$defs/descriptor" },
+        "value": { "$ref": "#/$defs/typedValue" },
+        "into": { "$ref": "#/$defs/name" },
+        "expect": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/check" } },
+        "consequential": { "enum": ["yes", "no", "unknown"] },
+        "approval": { "$ref": "#/$defs/approval" },
+        "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "consequential": { "enum": ["yes", "unknown"] } }, "required": ["consequential"] },
+          "then": { "required": ["approval"] }
+        },
+        {
+          "if": { "properties": { "action": { "enum": ["set_value", "select"] } }, "required": ["action"] },
+          "then": { "required": ["target", "value"], "not": { "required": ["into"] } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "type_keys" } }, "required": ["action"] },
+          "then": { "required": ["value"], "not": { "required": ["into"] } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "open_url" } }, "required": ["action"] },
+          "then": { "required": ["value"], "not": { "anyOf": [{ "required": ["target"] }, { "required": ["into"] }] } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "press" } }, "required": ["action"] },
+          "then": { "required": ["target"], "not": { "anyOf": [{ "required": ["value"] }, { "required": ["into"] }] } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "read_value" } }, "required": ["action"] },
+          "then": { "required": ["target", "into"], "not": { "required": ["value"] } }
+        },
+        {
+          "if": { "properties": { "action": { "enum": ["focus_app", "wait_for"] } }, "required": ["action"] },
+          "then": { "not": { "anyOf": [{ "required": ["value"] }, { "required": ["into"] }] } }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "recorded_on_app_versions": { "type": "object", "additionalProperties": { "type": "string" } },
+        "last_verified": { "type": "string", "format": "date" }
+      }
+    }
+  }
+}

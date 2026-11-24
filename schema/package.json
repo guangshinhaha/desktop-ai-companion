@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "pretest": "npm ci --no-audit --no-fund",
     "test": "node --test"
+  },
+  "dependencies": {
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1"
   }
 }

@@ -1,0 +1,51 @@
+{
+  "format": "task/v1",
+  "id": "tsk_8f2c",
+  "version": 3,
+  "name": "Provision a school staff account",
+  "description": "Create a staff account and assign a role in the admin portal.",
+  "author": "officer-id",
+  "created": "2026-12-02T10:14:00+08:00",
+  "platform": "macos",
+  "apps": [
+    { "key": "sheet", "bundle": "com.microsoft.Excel" },
+    { "key": "portal", "bundle": "com.google.Chrome", "url": "https://admin.example.gov.sg/*" }
+  ],
+  "preconditions": [
+    { "app": "portal", "check": { "kind": "window_title", "matches": "Admin Portal*" } }
+  ],
+  "inputs": [
+    { "name": "full_name", "type": "text", "source": "ask" },
+    { "name": "email", "type": "email", "source": "ask" },
+    { "name": "role", "type": "choice", "choices": ["Teacher", "Admin"], "source": "ask" }
+  ],
+  "steps": [
+    {
+      "id": "s4",
+      "say": "Type the officer's name into Full name",
+      "app": "portal",
+      "action": "set_value",
+      "target": {
+        "role": "AXTextField",
+        "label": "Full name",
+        "dom_id": "fullName",
+        "path": ["AXWebArea", "AXGroup:form", "AXTextField:1"],
+        "anchors": ["Create staff account"]
+      },
+      "value": { "constant": "Alex Example Tan", "constant": "Teacher", "confirmed_no_personal_data": true },
+      "expect": [{ "kind": "value_equals", "input": "full_name" }],
+      "consequential": "no"
+    },
+    {
+      "id": "s9",
+      "say": "Press Create account",
+      "app": "portal",
+      "action": "press",
+      "target": { "role": "AXButton", "label": "Create account", "dom_id": "submit" },
+      "expect": [{ "kind": "appears", "target": { "role": "AXStaticText", "label_matches": "Account created*" } }],
+      "consequential": "yes",
+      "approval": { "summary": "Create a staff account for {full_name} ({email}) with role {role}", "undoable": false }
+    }
+  ],
+  "provenance": { "recorded_on_app_versions": { "portal": "Chrome 131" }, "last_verified": "2026-12-05" }
+}
