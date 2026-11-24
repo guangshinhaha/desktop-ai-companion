@@ -2,7 +2,7 @@
 // Run: npm run generate (from stand-in/). Output is deterministic.
 // Columns: full_name, email, school, role. No NRIC, phone or address.
 import { writeFileSync } from "node:fs";
-import { deflateRawSync, crc32 } from "node:zlib";
+import { crc32 } from "node:zlib";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,20 +32,20 @@ function sheetXml(): string {
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`;
 }
 
-// Minimal zip writer (deflate, fixed timestamp so output is reproducible).
+// Minimal zip writer (stored, fixed timestamp so output is reproducible).
 function zip(files: [string, string][]): Buffer {
   const parts: Buffer[] = [];
   const central: Buffer[] = [];
   let offset = 0;
   for (const [name, text] of files) {
     const raw = Buffer.from(text, "utf8");
-    const data = deflateRawSync(raw);
+    const data = raw; // stored, not deflated: byte-identical on any zlib build
     const nameBuf = Buffer.from(name);
     const crc = crc32(raw);
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(0, 8);
     local.writeUInt16LE(0x21, 12); // date 1980-01-01
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(data.length, 18);
@@ -56,7 +56,7 @@ function zip(files: [string, string][]): Buffer {
     cd.writeUInt32LE(0x02014b50, 0);
     cd.writeUInt16LE(20, 4);
     cd.writeUInt16LE(20, 6);
-    cd.writeUInt16LE(8, 10);
+    cd.writeUInt16LE(0, 10);
     cd.writeUInt16LE(0x21, 14);
     cd.writeUInt32LE(crc, 16);
     cd.writeUInt32LE(data.length, 20);
