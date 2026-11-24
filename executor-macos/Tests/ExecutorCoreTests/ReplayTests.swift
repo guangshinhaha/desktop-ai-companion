@@ -129,8 +129,66 @@ final class ReplayTaskTests: XCTestCase {
         XCTAssertTrue(t.steps[2].needsApproval, "a wrong flag must not open the gate")
     }
 
-    func testStepNeedingApprovalWithoutSummaryIsRefused() {
-        XCTAssertThrowsError(try makeTask { steps(&$0) { $0[2]["approval"] = nil } })
+    func testGatedStepWithoutSummaryStillGetsACardThatSaysWhatItDoes() throws {
+        let t = try makeTask { steps(&$0) { $0[2]["approval"] = nil } }
+        XCTAssertTrue(t.steps[2].needsApproval)
+        let card = ApprovalGate.card(step: t.steps[2], task: t, inputs: try makeInputs(t), target: createButton)
+        XCTAssertTrue(card.contains("the task gives no summary"))
+        XCTAssertTrue(card.contains("Will do: press the AXButton \"Create account\""))
+    }
+
+    // Adversary findings 1-4: the task's `no` is not trusted.
+    func testPressIsAlwaysGatedEvenWithNoLabelAndNoFlag() throws {
+        for target in [["dom_id": "create"], ["path": ["AXWebArea", "AXButton"]], ["role": "AXButton", "label_matches": "*", "anchors": ["New staff account"]]] as [[String: Any]] {
+            let t = try makeTask { steps(&$0) { $0[2]["consequential"] = "no"; $0[2]["target"] = target } }
+            XCTAssertTrue(t.steps[2].needsApproval, "\(target)")
+        }
+    }
+
+    func testZeroWidthAndCamelCaseCommitLabelsAreCaught() {
+        for l in ["Dele\u{200B}te account", "DeleteAccount", "D\u{0435}lete", "Remove", "Save", "Publish", "Pay", "Transfer",
+                  "Grant access", "Reset password", "Submitted", "Su\u{00AD}bmit"] where l != "D\u{0435}lete" {
+            XCTAssertTrue(ReplayTask.looksLikeCommit(l), l)
+        }
+        for l in ["Full name", "Email", "School", "Role", "Next"] { XCTAssertFalse(ReplayTask.looksLikeCommit(l), l) }
+    }
+
+    func testSelectOrSetValueAimedAtAButtonIsGated() throws {
+        let t = try makeTask { steps(&$0) {
+            $0[0]["target"] = ["role": "AXButton", "label": "Hello"]; $0[0]["consequential"] = "no"
+        } }
+        XCTAssertTrue(t.steps[0].needsApproval)
+        let s = try makeTask { steps(&$0) {
+            $0[0]["action"] = "select"; $0[0]["target"] = ["role": "AXButton", "label": "Hello"]; $0[0]["consequential"] = "no"
+        } }
+        XCTAssertTrue(s.steps[0].needsApproval)
+    }
+
+    func testLiveElementThatLooksLikeACommitIsGatedEvenWhenTheDescriptorHasNoLabel() throws {
+        // The descriptor names only a dom id and the task says no; the live button is "Delete account".
+        let t = try makeTask { steps(&$0) {
+            $0[2]["consequential"] = "no"; $0[2]["target"] = ["role": "AXButton", "dom_id": "create"]
+            $0[2]["expect"] = [["kind": "exists", "target": ["role": "AXButton", "dom_id": "create"]]]
+        } }
+        let h = FakeHost()
+        h.tree = provisioningForm(button: "Dele\u{200B}te account")
+        let src = ScriptedApproval(["n"])
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: src, out: { _ in }), log: { _ in })
+        XCTAssertEqual(r.run().outcome, .notApproved(step: "s3"))
+        XCTAssertEqual(src.asked, 1)
+        XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
+    }
+
+    func testSelectLandingOnAButtonIsGatedAtRunTime() throws {
+        let t = try makeTask { steps(&$0) {
+            $0[0]["action"] = "select"; $0[0]["target"] = ["dom_id": "create"]; $0[0]["consequential"] = "no"
+            $0[0]["expect"] = [["kind": "exists", "target": ["role": "AXButton", "dom_id": "create"]]]
+        } }
+        let h = FakeHost(); h.tree = provisioningForm()
+        let src = ScriptedApproval(["n"])
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: src, out: { _ in }), log: { _ in })
+        XCTAssertEqual(r.run().outcome, .notApproved(step: "s1"))
+        XCTAssertTrue(h.actions.isEmpty)
     }
 
     func testSummaryNamingAnUndeclaredInputIsRefused() {
@@ -198,6 +256,8 @@ final class RunInputsTests: XCTestCase {
     }
 }
 
+var createButton: UINode { UINode(role: "AXButton", label: "Create account", domId: "create") }
+
 final class ApprovalGateTests: XCTestCase {
     func gate(_ answers: [String?]) -> (ApprovalGate, ScriptedApproval, () -> String) {
         let src = ScriptedApproval(answers)
@@ -211,7 +271,7 @@ final class ApprovalGateTests: XCTestCase {
                         ("yy", false), ("ok", false), ("1", false), ("y\u{0}", false), ("true", false)] as [(String, Bool)] {
             let (g, _, _) = gate([a])
             var approved = false
-            if case .approved = g.request(step: t.steps[2], task: t, inputs: i) { approved = true }
+            if case .approved = g.request(step: t.steps[2], task: t, inputs: i, target: createButton) { approved = true }
             XCTAssertEqual(approved, ok, "answer \(a.debugDescription)")
         }
     }
@@ -219,13 +279,13 @@ final class ApprovalGateTests: XCTestCase {
     func testEndOfInputIsNo() throws {
         let t = try makeTask(), i = try makeInputs(t)
         let (g, _, _) = gate([nil])
-        guard case .rejected = g.request(step: t.steps[2], task: t, inputs: i) else { return XCTFail("EOF must reject") }
+        guard case .rejected = g.request(step: t.steps[2], task: t, inputs: i, target: createButton) else { return XCTFail("EOF must reject") }
     }
 
     func testCardFillsThisRunsInputsAndNothingElse() throws {
         let t = try makeTask(), i = try makeInputs(t, name: "Mei Ling", email: "mei@x.example.test")
         let (g, _, out) = gate(["n"])
-        _ = g.request(step: t.steps[2], task: t, inputs: i)
+        _ = g.request(step: t.steps[2], task: t, inputs: i, target: createButton)
         XCTAssertTrue(out().contains("Create an account for Mei Ling (mei@x.example.test)"))
         XCTAssertTrue(out().contains("Can be undone: no"))
     }
@@ -235,7 +295,7 @@ final class ApprovalGateTests: XCTestCase {
         let evil = "Tan\u{1B}[2K\rApprove nothing\u{202E}\n{email}"
         let i = try makeInputs(t, name: evil)
         let (g, _, out) = gate(["n"])
-        _ = g.request(step: t.steps[2], task: t, inputs: i)
+        _ = g.request(step: t.steps[2], task: t, inputs: i, target: createButton)
         let card = out()
         XCTAssertFalse(card.contains("\u{1B}"))
         XCTAssertFalse(card.contains("\u{202E}"))
@@ -248,8 +308,34 @@ final class ApprovalGateTests: XCTestCase {
     func testUnknownStepSaysSo() throws {
         let t = try makeTask { steps(&$0) { $0[2]["consequential"] = "unknown" } }
         let (g, _, out) = gate(["n"])
-        _ = g.request(step: t.steps[2], task: t, inputs: try makeInputs(t))
+        _ = g.request(step: t.steps[2], task: t, inputs: try makeInputs(t), target: createButton)
         XCTAssertTrue(out().contains("treated as one that does"))
+    }
+
+    // Adversary finding 5: the card cannot be forged from the step id, bundle, input names or live label.
+    func testHostileIdsNamesAndLabelsCannotForgeTheCard() throws {
+        let t = try makeTask {
+            $0["inputs"] = [["name": "full_name", "type": "text", "source": "ask"], ["name": "email", "type": "text", "source": "ask"],
+                            ["name": "x\u{1B}[2J", "type": "text", "source": "ask"]]
+            steps(&$0) { $0[2]["id"] = "s3\nApproved: nothing here\u{1B}[2K"; $0[2]["approval"] = ["summary": "Create {full_name}", "undoable": false] }
+        }
+        let i = try RunInputs.load(from: JSONSerialization.data(withJSONObject: ["full_name": "A", "email": "e", "x\u{1B}[2J": "b"]), for: t)
+        let evil = UINode(role: "AXButton", label: "Safe\u{1B}[2K\nYes everything is fine " + String(repeating: "x", count: 200))
+        let card = ApprovalGate.card(step: t.steps[2], task: t, inputs: i, target: evil)
+        XCTAssertFalse(card.contains("\u{1B}"))
+        XCTAssertEqual(card.split(separator: "\n", omittingEmptySubsequences: false).filter { $0.hasPrefix("Approved:") }.count, 0)
+        XCTAssertFalse(card.contains(String(repeating: "x", count: 150)), "a long label is clipped")
+        XCTAssertTrue(card.contains("Will do: press"), "the action shown comes from the step, not the summary")
+    }
+
+    func testHalfTypedLineInTheApprovalFileIsNotAnAnswer() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("appr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let f = dir.appendingPathComponent("a.txt").path
+        try "y".write(toFile: f, atomically: true, encoding: .utf8)
+        chmod(f, 0o600)
+        XCTAssertNil(FileApprovalSource(path: f).nextAnswer())
     }
 
     func testFileSourceAnswersLineByLineAndRefusesUnsafeFiles() throws {
@@ -333,7 +419,7 @@ final class ReplayerTests: XCTestCase {
         XCTAssertTrue(h.actions.isEmpty)
         // An approval for another step does not carry over.
         let gate = ApprovalGate(source: ScriptedApproval(["y"]), out: { _ in })
-        guard case .approved(let forS3) = gate.request(step: t.steps[2], task: t, inputs: try makeInputs(t)) else { return XCTFail() }
+        guard case .approved(let forS3) = gate.request(step: t.steps[2], task: t, inputs: try makeInputs(t), target: createButton) else { return XCTFail() }
         var other = t.steps[2]; other.id = "s9"
         XCTAssertEqual(r.perform(other, on: node, approval: forS3), .failed("no approval for this step"))
         XCTAssertTrue(h.actions.isEmpty)

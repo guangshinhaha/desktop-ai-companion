@@ -60,8 +60,9 @@ public final class Replayer {
 
             // 2. The gate. Nothing below runs for a step that needs approval unless the officer said y.
             var approval: Approval?
-            if step.needsApproval {
-                switch gate.request(step: step, task: task, inputs: inputs) {
+            let gated = Self.mustAsk(step, live: match.node)
+            if gated {
+                switch gate.request(step: step, task: task, inputs: inputs, target: match.node) {
                 case .rejected:
                     return report(.notApproved(step: step.id), at: i)
                 case .approved(let a):
@@ -75,7 +76,8 @@ public final class Replayer {
                     return report(.diverged(step: step.id, reason: "\(d) appeared after approval; nothing was clicked"), at: i)
                 }
                 switch Resolver.resolve(step.target, in: snap) {
-                case .found(let m) where m.node.role == match.node.role && m.node.label == match.node.label:
+                case .found(let m) where m.node.role == match.node.role && m.node.label == match.node.label
+                                         && Self.mustAsk(step, live: m.node):
                     match = m
                 default:
                     return report(.diverged(step: step.id, reason: "the element changed or went away after approval; nothing was done"), at: i)
@@ -91,11 +93,11 @@ public final class Replayer {
                 if case .none = checksFailure(step, root: host.snapshot()) {
                     log("  action reported \(why), but the checks pass")
                 } else {
-                    let tail = step.needsApproval ? " The step may or may not have taken effect: check the app before running again." : ""
+                    let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
                     return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
                 }
             case .ok:
-                if let why = awaitChecks(step, ceiling: stepCeiling) {
+                if let why = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
                     return report(.diverged(step: step.id, reason: why), at: i)
                 }
             }
@@ -128,9 +130,21 @@ public final class Replayer {
 
     // MARK: acting
 
+    /// The task's own rule, plus what is actually on screen: a commit-looking label, or a set_value or
+    /// select that landed on something that is not a field. The descriptor may carry no label at all.
+    static func mustAsk(_ step: ReplayTask.Step, live node: UINode) -> Bool {
+        if step.needsApproval { return true }
+        if node.label.map(ReplayTask.looksLikeCommit) ?? false { return true }
+        switch step.action {
+        case .press: return true
+        case .setValue: return !ReplayTask.textRoles.contains(node.role)
+        case .select: return !ReplayTask.choiceRoles.contains(node.role)
+        }
+    }
+
     /// The only place that acts. A step that needs approval must arrive with the approval for that very step.
     func perform(_ step: ReplayTask.Step, on node: UINode, approval: Approval?) -> ActionResult {
-        if step.needsApproval, approval?.stepId != step.id {
+        if Self.mustAsk(step, live: node), approval?.stepId != step.id {
             return .failed("no approval for this step")
         }
         switch step.action {
@@ -145,7 +159,7 @@ public final class Replayer {
     // MARK: checks
 
     /// Waits until every check of the step passes. Returns nil on success, or why not.
-    func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval) -> String? {
+    func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval, gated: Bool) -> String? {
         var last = "no window"
         let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now) {
             guard let root = host.snapshot() else { return .keepWaiting }
@@ -158,7 +172,7 @@ public final class Replayer {
         switch r {
         case .done: return nil
         case .ceiling:
-            let tail = step.needsApproval ? " The step may or may not have taken effect: check the app before running again." : ""
+            let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
             return "check not met within \(Int(ceiling)) s: \(last)." + tail
         case .stopped(let why): return why
         }

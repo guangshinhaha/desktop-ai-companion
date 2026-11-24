@@ -34,15 +34,60 @@ public struct ReplayTask {
         public var undoable: Bool
         public var timeoutSeconds: Double?
 
-        /// A step needs the officer's approval unless the task says `no` AND the control does not look
-        /// like one that commits. `unknown` counts as `yes`. A control whose label reads like a commit
-        /// (Create, Submit, Send, Delete, Approve, Confirm) is gated even when the task says `no`, so a
-        /// wrongly recorded flag cannot open the gate.
+        /// A step needs approval unless the task says `no` AND it is plainly typing into a text field or
+        /// choosing in a pop-up. `unknown` counts as `yes`. The task's flag is not trusted beyond that: a
+        /// press never runs without approval in Phase 0, a set_value or select aimed at anything but a
+        /// field is gated, and a label that reads like a commit is gated. The replayer also checks the
+        /// live element, because a descriptor may carry no label at all.
         public var needsApproval: Bool {
             if consequential != .no { return true }
-            if action == .press, let l = target.label, TaskBuilder.isConsequentialLabel(l) { return true }
-            return false
+            switch action {
+            case .press: return true
+            case .setValue: if !(target.role.map(ReplayTask.textRoles.contains) ?? false) { return true }
+            case .select: if !(target.role.map(ReplayTask.choiceRoles.contains) ?? false) { return true }
+            }
+            return target.label.map(ReplayTask.looksLikeCommit) ?? false
         }
+    }
+
+    static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"]
+    static let choiceRoles: Set<String> = ["AXPopUpButton", "AXComboBox", "AXMenuButton"]
+
+    /// Words that commit. Matched with invisible characters removed and camelCase split, so
+    /// "Dele\u{200B}te" and "DeleteAccount" count. Long stems also match inside a longer word.
+    /// Wrongly gating is the safe error; wrongly not gating is not.
+    static let commitWords: Set<String> = [
+        "create", "submit", "send", "delete", "remove", "approve", "confirm", "save", "publish", "pay", "transfer",
+        "grant", "reset", "revoke", "post", "apply", "finish", "complete", "accept", "sign", "register", "enrol",
+        "enroll", "buy", "purchase", "order", "merge", "deploy", "release", "share", "invite", "yes", "ok", "done",
+        "commit", "update", "change", "disable", "enable", "activate", "deactivate", "assign", "provision", "submitted",
+    ]
+    static let commitStems = ["create", "submit", "delete", "remove", "approve", "confirm", "publish", "transfer",
+                              "revoke", "purchase", "register", "provision", "activate"]
+
+    public static func looksLikeCommit(_ label: String) -> Bool {
+        // Invisible and combining characters are dropped, not turned into spaces, so they cannot split a word.
+        var kept = ""
+        var prevLower = false
+        for u in label.precomposedStringWithCompatibilityMapping.unicodeScalars {
+            switch u.properties.generalCategory {
+            case .format, .control, .nonspacingMark, .enclosingMark: continue
+            default: break
+            }
+            let ch = Character(u)
+            if ch.isLetter {
+                if ch.isUppercase, prevLower { kept.append(" ") }
+                prevLower = ch.isLowercase
+                kept.append(ch)
+            } else {
+                prevLower = false
+                kept.append(" ")
+            }
+        }
+        let words = kept.lowercased().split(separator: " ").map(String.init)
+        if words.contains(where: commitWords.contains) { return true }
+        let squashed = words.joined()
+        return commitStems.contains { squashed.contains($0) }
     }
 
     public struct InputSpec: Equatable {
@@ -143,10 +188,8 @@ public struct ReplayTask {
         }
         let step = Step(id: id, say: say, action: action, target: target, value: value, expect: checks, consequential: cons,
                         approvalSummary: summary, undoable: undoable, timeoutSeconds: (s["timeout_seconds"] as? NSNumber)?.doubleValue)
-        if step.needsApproval {
-            guard let sum = summary, !sum.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw Invalid("\(w) needs the officer's approval but has no approval summary")
-            }
+        // A gated step with no summary is allowed: the card says so and still shows what will be done.
+        if let sum = summary {
             for name in placeholders(in: sum) where !declared.contains(name) {
                 throw Invalid("\(w) approval summary names input \(name), which the task does not declare")
             }
