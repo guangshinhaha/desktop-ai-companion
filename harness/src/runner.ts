@@ -55,7 +55,7 @@ async function untilRegistered(pid: number, ceilingMs = 20000) {
  * visible, then starts the replay. This is setup before the first step and is in no step time. It is a
  * Phase 1 finding that a replay started before the page is ready cannot see it; the report says so.
  */
-async function untilPageVisible(executor: string, dir: string, ceilingMs = 40000) {
+async function untilPageVisible(executor: string, dir: string, ceilingMs = 40000): Promise<boolean> {
   const descriptor = join(dir, "ready.json");
   writeFileSync(descriptor, JSON.stringify({ role: "AXTextField", label: "Full name" }));
   const end = Date.now() + ceilingMs;
@@ -64,8 +64,9 @@ async function untilPageVisible(executor: string, dir: string, ceilingMs = 40000
       const c = spawn(executor, ["resolve", "--descriptor", descriptor, "--ceiling", "2"], { stdio: "ignore" });
       c.once("close", (x) => res(x));
     });
-    if (code === 0) return;
+    if (code === 0) return true;
   }
+  return false;
 }
 
 async function stopBrowser(p: ChildProcess) {
@@ -97,7 +98,7 @@ export async function oneRun(o: Options, query: string, run: number): Promise<Ru
   try {
     if (!browser.pid) throw new Error("browser did not start");
     await untilRegistered(browser.pid);
-    if (o.probeReady !== false) await untilPageVisible(o.executor, dir);
+    const visible = o.probeReady === false ? true : await untilPageVisible(o.executor, dir);
     const args = ["replay", o.taskPath, "--inputs", inputs, "--pid", String(browser.pid), "--approval-file", approvals];
     if (o.ceiling) args.push("--ceiling", String(o.ceiling));
     const child = spawn(o.executor, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -128,7 +129,7 @@ export async function oneRun(o: Options, query: string, run: number): Promise<Ru
     clearTimeout(killer);
     const accounts: Account[] = (await standIn(o.base, "/api/accounts")).accounts;
     const v = judge({ exitCode, timedOut, accounts }, expected);
-    const detail = execReason || (v.outcome !== "pass" ? stderr.trim().split("\n")[0] ?? "" : "");
+    const detail = (visible ? "" : "the form was not visible in the accessibility tree after 40 s, before the replay started; ") + execReason || (v.outcome !== "pass" ? stderr.trim().split("\n")[0] ?? "" : "");
     // Never put the run's values in a reason: the executor's reasons name steps and elements, not inputs.
     return { ...v, reason: detail && v.outcome !== "pass" ? `${v.reason}; executor: ${detail}` : v.reason, stepMs };
   } finally {

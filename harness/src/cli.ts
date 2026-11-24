@@ -34,6 +34,7 @@ const ceilingSec = values.ceiling ? Number(values.ceiling) : undefined;
 if (ceilingSec !== undefined && !(ceilingSec > 0 && ceilingSec <= 3600)) die("--ceiling must be above 0 and at most 3600");
 
 const base = `http://127.0.0.1:${values.port}`;
+try { await standIn(base, "/healthz"); die(`something already answers on port ${values.port}; pick another with --port`); } catch { /* free: good */ }
 const server = spawn("node", [join(repo, "stand-in/provisioning/server.ts")], { env: { ...process.env, PORT: values.port }, stdio: "ignore" });
 let stopping = false;
 const stopServer = () => { if (!stopping) { stopping = true; server.kill("SIGTERM"); } };
