@@ -1,6 +1,7 @@
 import ExecutorCore
 import Foundation
 
+// executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
 // executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
 // Exit codes: 0 found, 2 ambiguous, 3 not found, 1 usage or error.
 
@@ -10,28 +11,36 @@ func fail(_ msg: String, code: Int32 = 1) -> Never {
 }
 
 let usage = """
-usage: executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
+usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
+       executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
   --app      bundle id of the running app (default com.google.Chrome)
   --window   pick the window whose title contains this text (default: the focused window)
   --ceiling  step ceiling in seconds (default 30)
 """
 
 var args = Array(CommandLine.arguments.dropFirst())
-guard args.first == "resolve" else { fail(usage) }
+let command = args.first
+guard command == "resolve" || command == "record" else { fail(usage) }
 args.removeFirst()
 
 var file: String?
+var out: String?
+var taskName = "Recorded task"
+var author = "officer"
 var bundle = "com.google.Chrome"
 var window: String?
 var ceiling = 30.0
 var i = 0
 @MainActor func value(_ flag: String) -> String {
     i += 1
-    guard i < args.count else { fail("\(flag) needs a value\n\(usage)") }
+    guard i < args.count, !args[i].hasPrefix("--") else { fail("\(flag) needs a value\n\(usage)") }
     return args[i]
 }
 while i < args.count {
     switch args[i] {
+    case "--out": out = value("--out")
+    case "--name": taskName = value("--name")
+    case "--author": author = value("--author")
     case "--descriptor": file = value("--descriptor")
     case "--app": bundle = value("--app")
     case "--window": window = value("--window")
@@ -44,6 +53,20 @@ while i < args.count {
     }
     i += 1
 }
+if command == "record" {
+    guard let out, !out.isEmpty else { fail("--out is required\n\(usage)") }
+    guard !taskName.trimmingCharacters(in: .whitespaces).isEmpty, !author.trimmingCharacters(in: .whitespaces).isEmpty else {
+        fail("--name and --author must not be empty")
+    }
+    guard !args.contains("--ceiling"), file == nil, window == nil else { fail("record takes --out, --app, --name and --author\n\(usage)") }
+    do {
+        _ = try Recorder(Recorder.Options(out: out, appBundle: bundle, name: taskName, author: author)).run()
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+guard command == "resolve" else { fail(usage) }
 guard let file else { fail("--descriptor is required\n\(usage)") }
 
 let descriptor: Descriptor
