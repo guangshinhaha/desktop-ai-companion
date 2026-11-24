@@ -2,7 +2,7 @@ import ExecutorCore
 import Foundation
 
 // executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
-// executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
+// executor-macos resolve --descriptor <file> [--app <bundle id>] [--pid <n>] [--window <title text>] [--ceiling <seconds>]
 // Exit codes: 0 found, 2 ambiguous, 3 not found, 1 usage or error.
 
 func fail(_ msg: String, code: Int32 = 1) -> Never {
@@ -12,10 +12,11 @@ func fail(_ msg: String, code: Int32 = 1) -> Never {
 
 let usage = """
 usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
-       executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
+       executor-macos resolve --descriptor <file> [--app <bundle id>] [--pid <n>] [--window <title text>] [--ceiling <seconds>]
        executor-macos serve   (JSON-RPC over stdio, one message per line; methods: ping)
        executor-macos replay <task.json> --inputs <file> [--pid <n>] [--approval-file <file>] [--ceiling <seconds>]
   --app      bundle id of the running app (default com.google.Chrome)
+  --pid      resolve in this one process only. Without it, more than one candidate process is ambiguous (exit 2)
   --window   pick the window whose title contains this text (default: the focused window)
   --ceiling  step ceiling in seconds (default 30)
 """
@@ -34,6 +35,7 @@ var author = "officer"
 var bundle = "com.google.Chrome"
 var window: String?
 var ceiling = 30.0
+var pid: pid_t?
 var i = 0
 @MainActor func value(_ flag: String) -> String {
     i += 1
@@ -47,6 +49,9 @@ while i < args.count {
     case "--author": author = value("--author")
     case "--descriptor": file = value("--descriptor")
     case "--app": bundle = value("--app")
+    case "--pid":
+        guard let p = Int32(value("--pid")), p > 1 else { fail("--pid must be a process id") }
+        pid = p
     case "--window": window = value("--window")
     case "--ceiling":
         guard let c = Double(value("--ceiling")), c > 0, c <= 3600 else {
@@ -62,7 +67,7 @@ if command == "record" {
     guard !taskName.trimmingCharacters(in: .whitespaces).isEmpty, !author.trimmingCharacters(in: .whitespaces).isEmpty else {
         fail("--name and --author must not be empty")
     }
-    guard !args.contains("--ceiling"), file == nil, window == nil else { fail("record takes --out, --app, --name and --author\n\(usage)") }
+    guard !args.contains("--ceiling"), file == nil, window == nil, pid == nil else { fail("record takes --out, --app, --name and --author\n\(usage)") }
     do {
         _ = try Recorder(Recorder.Options(out: out, appBundle: bundle, name: taskName, author: author)).run()
         exit(0)
@@ -82,7 +87,10 @@ do {
 }
 
 let app: AXApp
-do { app = try AXApp(bundleId: bundle, windowTitleContains: window) } catch { fail("\(error)") }
+do { app = try AXApp(bundleId: bundle, windowTitleContains: window, pid: pid, requireUnique: true) } catch {
+    if case AXApp.Failure.ambiguous = error { fail("\(error)", code: 2) }
+    fail("\(error)")
+}
 
 func describe(_ n: UINode) -> String {
     "role=\(n.role) label=\(n.label.map { "\"\($0)\"" } ?? "-") dom_id=\(n.domId ?? "-")"
