@@ -13,7 +13,8 @@ func fail(_ msg: String, code: Int32 = 1) -> Never {
 let usage = """
 usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
        executor-macos resolve --descriptor <file> [--app <bundle id>] [--pid <n>] [--window <title text>] [--ceiling <seconds>]
-       executor-macos serve   (JSON-RPC over stdio, one message per line; methods: ping)
+       executor-macos serve   (JSON-RPC over stdio, one message per line; methods: ping, replay.start)
+       executor-macos verify-audit [--file <audit export>]   (reads standard input without --file; exit 5 names the broken seq)
        executor-macos replay <task.json> --inputs <file> [--pid <n>] [--approval-file <file>] [--ceiling <seconds>]
   --app      bundle id of the running app (default com.google.Chrome)
   --pid      resolve in this one process only. Without it, more than one candidate process is ambiguous (exit 2)
@@ -24,6 +25,7 @@ usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name
 var args = Array(CommandLine.arguments.dropFirst())
 let command = args.first
 if command == "serve" { RPC.serve(); exit(0) }
+if command == "verify-audit" { runVerifyAudit(Array(args.dropFirst())) }
 if command == "replay" { runReplay(Array(args.dropFirst())) }
 guard command == "resolve" || command == "record" else { fail(usage) }
 args.removeFirst()

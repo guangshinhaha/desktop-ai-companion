@@ -197,6 +197,21 @@ pub struct AuditEntry<'a> {
     pub shown: Option<&'a str>,
 }
 
+/// The events of TD 7.2, plus the one the store writes for itself. `append_event` accepts nothing else.
+pub const AUDIT_EVENTS: [&str; 11] = [
+    "run_started",
+    "approved",
+    "rejected",
+    "step_diverged",
+    "recovered",
+    "run_finished",
+    "item_marked_by_officer",
+    "task_saved",
+    "task_shared",
+    "task_handed_over",
+    "audit_purged",
+];
+
 pub struct Store {
     conn: Connection,
 }
@@ -389,6 +404,12 @@ impl Store {
         Ok(())
     }
 
+    /// Sets a run's final status ('finished', 'stopped', 'refused').
+    pub fn finish_run(&self, id: &str, status: &str) -> Result<()> {
+        self.conn.execute("UPDATE runs SET status = ?2 WHERE id = ?1", params![id, status])?;
+        Ok(())
+    }
+
     pub fn set_run_item(
         &self,
         run_id: &str,
@@ -418,6 +439,51 @@ impl Store {
         let seq = append_in(&tx, e)?;
         tx.commit()?;
         Ok(seq)
+    }
+
+    /// Appends one record of a TD 7.2 event. Unlike `append_audit`, an event name outside the list is an
+    /// error, so a typo or a made-up event cannot enter the trail. `audit_purged` is the store's own.
+    pub fn append_event(&mut self, e: &AuditEntry) -> Result<i64> {
+        if !AUDIT_EVENTS.contains(&e.event) || e.event == "audit_purged" {
+            return Err(StoreError::Db("unknown audit event".into()));
+        }
+        self.append_audit(e)
+    }
+
+    /// The trail as JSON lines for `executor-macos verify-audit`: a control line (anchor and head), then
+    /// one object per record in seq order. It holds the approved values (decision 0005): send it to the
+    /// verifier's standard input, never to a file or a log.
+    pub fn export_audit(&self) -> Result<String> {
+        let (head_seq, head_hash, anchor_seq, anchor_hash): (i64, String, i64, String) =
+            self.conn.query_row(
+                "SELECT head_seq, head_hash, anchor_seq, anchor_hash FROM audit_meta",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        let mut out = serde_json::json!({
+            "anchor_seq": anchor_seq, "anchor_hash": anchor_hash,
+            "head_seq": head_seq, "head_hash": head_hash,
+        })
+        .to_string();
+        out.push('\n');
+        let mut st = self.conn.prepare(
+            "SELECT seq, at, officer, event, task, run, item, step, shown, prev_hash, hash
+             FROM audit ORDER BY seq",
+        )?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let rec = serde_json::json!({
+                "seq": r.get::<_, i64>(0)?, "at": r.get::<_, i64>(1)?,
+                "officer": r.get::<_, String>(2)?, "event": r.get::<_, String>(3)?,
+                "task": r.get::<_, Option<String>>(4)?, "run": r.get::<_, Option<String>>(5)?,
+                "item": r.get::<_, Option<i64>>(6)?, "step": r.get::<_, Option<String>>(7)?,
+                "shown": r.get::<_, Option<String>>(8)?,
+                "prev_hash": r.get::<_, String>(9)?, "hash": r.get::<_, String>(10)?,
+            });
+            out.push_str(&rec.to_string());
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Walks the chain from the anchor (zeros, or what the last retention purge left) and checks
@@ -450,7 +516,11 @@ impl Store {
                 r.get::<_, Option<String>>(7)?.as_deref(),
                 r.get::<_, Option<String>>(8)?.as_deref(),
             );
-            if seq != next_seq || prev != next_prev || calc != hash {
+            // A gap names the record that should be there, the same as executor-macos verify-audit.
+            if seq != next_seq {
+                return Err(StoreError::Chain(next_seq));
+            }
+            if prev != next_prev || calc != hash {
                 return Err(StoreError::Chain(seq));
             }
             next_seq += 1;
