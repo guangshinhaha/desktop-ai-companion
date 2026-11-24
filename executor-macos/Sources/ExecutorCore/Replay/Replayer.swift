@@ -149,7 +149,12 @@ public final class Replayer {
             return host.press(node)
         case .setValue, .select:
             guard let ref = step.value, let v = inputs.resolve(ref) else { return .failed("no value for this step") }
-            return step.action == .setValue ? host.setValue(node, to: v.reveal()) : host.choose(node, option: v.reveal())
+            if step.action == .setValue { return host.setValue(node, to: v.reveal()) }
+            // Opening a pop-up and pressing the option it already shows leaves Chrome's select with nothing
+            // chosen (issue #70: the first option, which is selected from page load). Nothing to do then;
+            // the step's value_equals check still reads the field and decides.
+            if host.value(of: node) == v.reveal() { return .ok }
+            return host.choose(node, option: v.reveal())
         }
     }
 
