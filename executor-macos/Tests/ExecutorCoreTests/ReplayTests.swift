@@ -12,6 +12,11 @@ final class FakeHost: ReplayHost {
     var fields: [String: String] = [:]          // dom id -> value
     var onPress: ((UINode, FakeHost) -> Void)?
     var pressResult: ActionResult = .ok
+    var reselectClears = false
+    var chooseIgnored = false
+    /// What the page itself holds per select (the option's DOM value), which the accessibility value never shows.
+    var dom: [String: String] = [:]
+    var domValueOfLabel: [String: String] = [:]
     /// Tree changes that happen at a given clock time (a slow response).
     var scheduled: [(at: TimeInterval, apply: (FakeHost) -> Void)] = []
 
@@ -35,7 +40,12 @@ final class FakeHost: ReplayHost {
     }
     func choose(_ node: UINode, option: String) -> ActionResult {
         actions.append("choose:\(node.domId ?? "-")")
-        if let id = node.domId { fields[id] = option }
+        if let id = node.domId, !chooseIgnored {
+            // Chrome (issue #70): pressing the option a pop-up already shows leaves nothing chosen.
+            let clears = reselectClears && fields[id] == option
+            fields[id] = clears ? "" : option
+            dom[id] = clears ? "" : (domValueOfLabel[option] ?? option)
+        }
         return .ok
     }
     func value(of node: UINode) -> String? { node.domId.flatMap { fields[$0] } }
@@ -390,6 +400,70 @@ final class ReplayerTests: XCTestCase {
         XCTAssertEqual(h.actions, ["set:full-name", "set:email", "press:Create account"])
         XCTAssertEqual(src.asked, 1)
         XCTAssertTrue(h.waits.isEmpty, "everything was already true, so nothing waited")
+    }
+
+    /// One select step whose option's visible label ("Form Teacher") is not its DOM value ("form_teacher").
+    /// The accessibility value is the label, and the recorded input is the label, so the check compares labels.
+    func selectTask() throws -> ReplayTask {
+        try makeTask { steps(&$0) { s in
+            s = [["id": "s1", "say": "Choose Role", "app": "chrome", "action": "select",
+                  "target": ["role": "AXPopUpButton", "label": "Role", "dom_id": "role"],
+                  "value": ["input": "full_name"],
+                  "expect": [["kind": "value_equals", "input": "full_name"]], "consequential": "no"]]
+        } }
+    }
+
+    func testSelectWhoseLabelDiffersFromItsValueKeepsItsPageValue() throws {
+        // Preselected option "Form Teacher" whose DOM value is "form_teacher". Pressing it again would empty
+        // the page's value (issue #70); the fix leaves it alone, and the check compares the shown label.
+        let t = try selectTask(), h = host()
+        h.fields["role"] = "Form Teacher"
+        h.dom["role"] = "form_teacher"
+        h.domValueOfLabel = ["Form Teacher": "form_teacher", "Teacher": "teacher"]
+        h.reselectClears = true
+        let src = ScriptedApproval([])
+        let r = Replayer(task: t, inputs: try makeInputs(t, name: "Form Teacher"), host: h,
+                         gate: ApprovalGate(source: src, out: { _ in }), log: { _ in })
+        XCTAssertEqual(r.run().outcome, .finished)
+        XCTAssertTrue(h.actions.isEmpty)
+        XCTAssertEqual(h.dom["role"], "form_teacher")
+    }
+
+    func testSelectWhoseLabelDiffersFromItsValueIsChosenWhenNotShown() throws {
+        let t = try selectTask(), h = host()
+        h.fields["role"] = "Teacher"
+        h.dom["role"] = "teacher"
+        h.domValueOfLabel = ["Form Teacher": "form_teacher", "Teacher": "teacher"]
+        let src = ScriptedApproval([])
+        let r = Replayer(task: t, inputs: try makeInputs(t, name: "Form Teacher"), host: h,
+                         gate: ApprovalGate(source: src, out: { _ in }), log: { _ in })
+        XCTAssertEqual(r.run().outcome, .finished)
+        XCTAssertEqual(h.actions, ["choose:role"])
+        XCTAssertEqual(h.dom["role"], "form_teacher")
+    }
+
+    func testSelectOfTheOptionAlreadyShownIsNotReselected() throws {
+        // Pressing an already-selected option empties Chrome's select; the first option is selected at load.
+        let t = try selectTask(), h = host()
+        h.fields["role"] = "Teacher"
+        h.reselectClears = true
+        let src = ScriptedApproval([])
+        let r = Replayer(task: t, inputs: try makeInputs(t, name: "Teacher"), host: h,
+                         gate: ApprovalGate(source: src, out: { _ in }), log: { _ in })
+        XCTAssertEqual(r.run().outcome, .finished)
+        XCTAssertTrue(h.actions.isEmpty, "nothing to do, so nothing is pressed")
+    }
+
+    func testSelectCheckStillFailsWhenTheFieldHoldsAnotherOption() throws {
+        // Not loosened: if choosing does not land the value, the step stops.
+        let t = try selectTask(), h = host()
+        h.fields["role"] = "Teacher"
+        h.chooseIgnored = true
+        let src = ScriptedApproval([])
+        let r = Replayer(task: t, inputs: try makeInputs(t, name: "Admin Clerk"), host: h,
+                         gate: ApprovalGate(source: src, out: { _ in }), ceiling: 1, log: { _ in })
+        guard case .diverged(let step, _) = r.run().outcome else { return XCTFail("expected a stop") }
+        XCTAssertEqual(step, "s1")
     }
 
     func testNoStopsTheRunAndNothingIsPressed() throws {
