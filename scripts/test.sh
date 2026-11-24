@@ -17,6 +17,7 @@ run executor-macos swift test
 run stand-in npm test
 run harness npm test
 run schema npm test
+run model-adapter npm test
 run shell/ui node --test
 
 # The shell's tests are headless (no window, no tray). They ping the real executor, so build it first.
