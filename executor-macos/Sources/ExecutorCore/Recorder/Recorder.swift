@@ -75,6 +75,15 @@ public final class Recorder {
     public func run() throws -> Int {
         try preflight()
         NSApplication.shared.setActivationPolicy(.accessory)
+        // The window before and after each press, to propose its check. Read on demand, never watched.
+        do {
+            session.snapshotter = try AXApp(bundleId: options.appBundle, observe: false)
+        } catch {
+            for (el, attr) in woken { _ = AXUIElementSetAttributeValue(el, attr as CFString, kCFBooleanFalse) }
+            woken = []
+            throw error
+        }
+        session.start()
         try tap.start()
         indicator.show { [weak self] in self?.stop() }
         for sig in [SIGINT, SIGTERM, SIGHUP] {
@@ -93,6 +102,9 @@ public final class Recorder {
         if session.uncapturedSubmitKeys > 0 {
             log("note: Return pressed in a field \(session.uncapturedSubmitKeys) time(s) is not recorded; click the button instead.")
         }
+        for t in session.timings {
+            log(String(format: "expect %@: %@ (snapshot %.1f ms, compare %.2f ms)", t.step, t.kind, t.snapshotMs, t.compareMs))
+        }
         log("stopped: tap off, indicator off. \(session.builder.stepCount) step(s), \(session.builder.preconditionCount) precondition(s) written to \(options.out)")
         return session.builder.stepCount
     }
@@ -102,6 +114,7 @@ public final class Recorder {
         stopped = true
         tap.stop()
         indicator.hide()
+        session.settle()   // the last press's effect is on screen by now
         for (el, attr) in woken { _ = AXUIElementSetAttributeValue(el, attr as CFString, kCFBooleanFalse) }
         woken = []
         signalSources.forEach { $0.cancel() }
