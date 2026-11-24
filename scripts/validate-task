@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Validate a recorded task against schema/task.v1.json.
+# Usage: scripts/validate-task <file>   (exit 0 valid, 1 invalid with failing paths, 2 usage)
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ ! -d "$root/schema/node_modules/ajv" ]; then
+  (cd "$root/schema" && npm ci --no-audit --no-fund >&2)
+fi
+exec node "$root/schema/src/cli.js" "$@"
