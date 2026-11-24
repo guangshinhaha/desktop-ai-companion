@@ -138,6 +138,7 @@ impl Store {
         conn.pragma_update(None, "key", keys.key()?.pragma())?;
         // Forces SQLCipher to decrypt page 1: a wrong key fails here, not later.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
+        conn.pragma_update(None, "recursive_triggers", true)?;
         let store = Store { conn };
         store.migrate()?;
         Ok(store)
@@ -164,23 +165,57 @@ impl Store {
                state TEXT NOT NULL, last_step TEXT,
                PRIMARY KEY (run_id, item));
              CREATE TABLE IF NOT EXISTS audit (
-               seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
+               seq INTEGER PRIMARY KEY, at INTEGER NOT NULL,
                officer TEXT NOT NULL, event TEXT NOT NULL, task TEXT, run TEXT,
                item INTEGER, step TEXT, shown TEXT,
                prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS chat (
                id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
                role TEXT NOT NULL, content TEXT NOT NULL);
-             -- Retention gate: normally NULL. Only purge_audit_before sets it, inside one
-             -- transaction, to a cutoff; the delete trigger allows only rows older than it.
-             CREATE TABLE IF NOT EXISTS audit_purge_gate (
-               only_row INTEGER PRIMARY KEY CHECK (only_row = 1), cutoff INTEGER);
-             INSERT OR IGNORE INTO audit_purge_gate (only_row, cutoff) VALUES (1, NULL);
+             -- One control row: the chain head, the anchor left by a retention purge (the hash
+             -- of the last purged record), and the purge gate (purge_upto, NULL when closed).
+             CREATE TABLE IF NOT EXISTS audit_meta (
+               only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+               head_seq INTEGER NOT NULL, head_hash TEXT NOT NULL,
+               anchor_seq INTEGER NOT NULL, anchor_hash TEXT NOT NULL,
+               purge_upto INTEGER);
+             INSERT OR IGNORE INTO audit_meta VALUES (1, 0, '0000000000000000000000000000000000000000000000000000000000000000', 0, '0000000000000000000000000000000000000000000000000000000000000000', NULL);
+             -- Rows are append-only. Each insert must be the next seq and link to the head, so
+             -- REPLACE cannot overwrite a row even with recursive triggers off.
+             CREATE TRIGGER IF NOT EXISTS audit_insert_guard BEFORE INSERT ON audit
+               WHEN NEW.seq IS NOT (SELECT head_seq + 1 FROM audit_meta)
+                 OR NEW.prev_hash IS NOT (SELECT head_hash FROM audit_meta)
+               BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+             CREATE TRIGGER IF NOT EXISTS audit_head_advance AFTER INSERT ON audit
+               BEGIN UPDATE audit_meta SET head_seq = NEW.seq, head_hash = NEW.hash; END;
              CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit
                BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
              CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit
-               WHEN OLD.at >= COALESCE((SELECT cutoff FROM audit_purge_gate WHERE only_row = 1), -9223372036854775807)
+               WHEN OLD.seq > COALESCE((SELECT purge_upto FROM audit_meta), -1)
                BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+             -- The control row moves only in three shapes: head advance (from the insert trigger),
+             -- open the purge gate up to a seq (anchor set to that row's hash), close the gate.
+             CREATE TRIGGER IF NOT EXISTS audit_meta_guard BEFORE UPDATE ON audit_meta
+               WHEN NOT (
+                 (NEW.head_seq = OLD.head_seq + 1
+                  AND NEW.head_hash IS (SELECT hash FROM audit WHERE seq = NEW.head_seq)
+                  AND NEW.anchor_seq = OLD.anchor_seq AND NEW.anchor_hash = OLD.anchor_hash
+                  AND NEW.purge_upto IS OLD.purge_upto)
+                 OR
+                 (OLD.purge_upto IS NULL AND NEW.purge_upto IS NOT NULL
+                  AND NEW.purge_upto > OLD.anchor_seq AND NEW.purge_upto <= OLD.head_seq
+                  AND NEW.anchor_seq = NEW.purge_upto
+                  AND NEW.anchor_hash IS (SELECT hash FROM audit WHERE seq = NEW.purge_upto)
+                  AND NEW.head_seq = OLD.head_seq AND NEW.head_hash = OLD.head_hash)
+                 OR
+                 (OLD.purge_upto IS NOT NULL AND NEW.purge_upto IS NULL
+                  AND NEW.head_seq = OLD.head_seq AND NEW.head_hash = OLD.head_hash
+                  AND NEW.anchor_seq = OLD.anchor_seq AND NEW.anchor_hash = OLD.anchor_hash))
+               BEGIN SELECT RAISE(ABORT, 'audit control row is guarded'); END;
+             CREATE TRIGGER IF NOT EXISTS audit_meta_no_insert BEFORE INSERT ON audit_meta
+               BEGIN SELECT RAISE(ABORT, 'audit control row is guarded'); END;
+             CREATE TRIGGER IF NOT EXISTS audit_meta_no_delete BEFORE DELETE ON audit_meta
+               BEGIN SELECT RAISE(ABORT, 'audit control row is guarded'); END;
              PRAGMA user_version = 1;
              COMMIT;",
         )?;
@@ -262,29 +297,26 @@ impl Store {
     /// Appends a hash-chained audit record. Returns its seq.
     pub fn append_audit(&mut self, e: &AuditEntry) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let prev: String = tx
-            .query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
-            .optional()?
-            .unwrap_or_else(|| "0".repeat(64));
-        let hash = audit_hash(&prev, e.at, e.officer, e.event, e.task, e.run, e.item, e.step, e.shown);
-        tx.execute(
-            "INSERT INTO audit (at, officer, event, task, run, item, step, shown, prev_hash, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![e.at, e.officer, e.event, e.task, e.run, e.item, e.step, e.shown, prev, hash],
-        )?;
-        let seq = tx.last_insert_rowid();
+        let seq = append_in(&tx, e)?;
         tx.commit()?;
         Ok(seq)
     }
 
-    /// Walks the chain. After a retention purge the first surviving row is the anchor.
+    /// Walks the chain from the anchor (zeros, or what the last retention purge left) and checks
+    /// it ends at the recorded head, so a gap, an edit, a truncated tail or a wipe all fail.
     pub fn verify_audit(&self) -> Result<()> {
+        let (head_seq, head_hash, anchor_seq, anchor_hash): (i64, String, i64, String) =
+            self.conn.query_row(
+                "SELECT head_seq, head_hash, anchor_seq, anchor_hash FROM audit_meta",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
         let mut st = self.conn.prepare(
             "SELECT seq, at, officer, event, task, run, item, step, shown, prev_hash, hash
              FROM audit ORDER BY seq",
         )?;
         let mut rows = st.query([])?;
-        let mut expect_prev: Option<String> = None;
+        let (mut next_seq, mut next_prev) = (anchor_seq + 1, anchor_hash);
         while let Some(r) = rows.next()? {
             let seq: i64 = r.get(0)?;
             let prev: String = r.get(9)?;
@@ -300,10 +332,14 @@ impl Store {
                 r.get::<_, Option<String>>(7)?.as_deref(),
                 r.get::<_, Option<String>>(8)?.as_deref(),
             );
-            if calc != hash || expect_prev.as_ref().is_some_and(|p| *p != prev) {
+            if seq != next_seq || prev != next_prev || calc != hash {
                 return Err(StoreError::Chain(seq));
             }
-            expect_prev = Some(hash);
+            next_seq += 1;
+            next_prev = hash;
+        }
+        if next_seq - 1 != head_seq || next_prev != head_hash {
+            return Err(StoreError::Chain(next_seq));
         }
         Ok(())
     }
@@ -312,30 +348,65 @@ impl Store {
         Ok(self.conn.query_row("SELECT count(*) FROM audit", [], |r| r.get(0))?)
     }
 
-    /// Retention. Deletes only records older than `cutoff`, through the gate the delete trigger
-    /// checks. It takes a cutoff, not row ids or content, so it cannot edit a row.
-    /// Returns rows removed.
-    pub fn purge_audit_before(&mut self, cutoff: i64) -> Result<usize> {
+    /// Retention (the only delete path). Removes the contiguous oldest prefix of records whose
+    /// `at` is older than `now - retention_days`, stopping at the first record that is not.
+    /// It takes an age, not row ids or content, so it cannot edit a row. It leaves an anchor so
+    /// the rest still verifies, and appends an `audit_purged` record (count in `item`).
+    /// `retention_days` of 0 is refused. Returns rows removed.
+    pub fn purge_expired(&mut self, now: i64, retention_days: u32) -> Result<usize> {
+        if retention_days == 0 {
+            return Err(StoreError::Db("retention must be at least 1 day".into()));
+        }
+        let cutoff = now - i64::from(retention_days) * SECONDS_PER_DAY;
         let tx = self.conn.transaction()?;
-        tx.execute("UPDATE audit_purge_gate SET cutoff = ?1 WHERE only_row = 1", [cutoff])?;
-        let n = tx.execute("DELETE FROM audit WHERE at < ?1", [cutoff]);
-        // Close the gate whether or not the delete worked; commit only on success.
-        tx.execute("UPDATE audit_purge_gate SET cutoff = NULL WHERE only_row = 1", [])?;
-        let n = n?;
+        let (head_seq, anchor_seq): (i64, i64) = tx.query_row(
+            "SELECT head_seq, anchor_seq FROM audit_meta",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let first_kept: Option<i64> =
+            tx.query_row("SELECT MIN(seq) FROM audit WHERE at >= ?1", [cutoff], |r| r.get(0))?;
+        let upto = first_kept.map_or(head_seq, |s| s - 1);
+        if upto <= anchor_seq {
+            return Ok(0);
+        }
+        tx.execute(
+            "UPDATE audit_meta SET purge_upto = ?1, anchor_seq = ?1,
+             anchor_hash = (SELECT hash FROM audit WHERE seq = ?1)",
+            [upto],
+        )?;
+        let n = tx.execute("DELETE FROM audit WHERE seq <= ?1", [upto])?;
+        tx.execute("UPDATE audit_meta SET purge_upto = NULL", [])?;
+        let note = AuditEntry {
+            at: now,
+            officer: "system",
+            event: "audit_purged",
+            task: None,
+            run: None,
+            item: Some(n as i64),
+            step: None,
+            shown: None,
+        };
+        append_in(&tx, &note)?;
         tx.commit()?;
         Ok(n)
     }
+}
 
-    /// Purges records older than `retention_days` before `now`.
-    pub fn purge_expired(&mut self, now: i64, retention_days: u32) -> Result<usize> {
-        self.purge_audit_before(now - i64::from(retention_days) * SECONDS_PER_DAY)
-    }
-
-    /// Raw connection, for tests that attempt forbidden writes.
-    #[doc(hidden)]
-    pub fn raw(&self) -> &Connection {
-        &self.conn
-    }
+fn append_in(tx: &rusqlite::Transaction, e: &AuditEntry) -> Result<i64> {
+    let (head_seq, prev): (i64, String) = tx.query_row(
+        "SELECT head_seq, head_hash FROM audit_meta",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let seq = head_seq + 1;
+    let hash = audit_hash(&prev, e.at, e.officer, e.event, e.task, e.run, e.item, e.step, e.shown);
+    tx.execute(
+        "INSERT INTO audit (seq, at, officer, event, task, run, item, step, shown, prev_hash, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![seq, e.at, e.officer, e.event, e.task, e.run, e.item, e.step, e.shown, prev, hash],
+    )?;
+    Ok(seq)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -351,18 +422,23 @@ fn audit_hash(
     shown: Option<&str>,
 ) -> String {
     let mut h = Sha256::new();
-    // Length-prefixed fields, so two different records cannot hash the same bytes.
-    let mut put = |s: &str| {
-        h.update((s.len() as u64).to_be_bytes());
-        h.update(s.as_bytes());
+    // Length-prefixed fields with a presence byte, so no two different records share an encoding.
+    let mut put = |s: Option<&str>| match s {
+        None => h.update([0u8]),
+        Some(s) => {
+            h.update([1u8]);
+            h.update((s.len() as u64).to_be_bytes());
+            h.update(s.as_bytes());
+        }
     };
-    put(prev);
-    put(&at.to_string());
-    put(officer);
-    put(event);
-    for o in [task, run, step, shown] {
-        put(o.unwrap_or("\u{0}none"));
-    }
-    put(&item.map_or("\u{0}none".to_string(), |i| i.to_string()));
+    put(Some(prev));
+    put(Some(&at.to_string()));
+    put(Some(officer));
+    put(Some(event));
+    put(task);
+    put(run);
+    put(step);
+    put(shown);
+    put(item.map(|i| i.to_string()).as_deref());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
