@@ -126,7 +126,13 @@ async fn record_stop(app: AppHandle) -> Result<(), String> {
     let path = tauri::async_runtime::spawn_blocking(move || recording::stop(rec))
         .await
         .map_err(|e| e.to_string())??;
-    let draft = review::Draft::from_file(&path)?;
+    let draft = match review::Draft::from_file(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path); // a refused recording does not linger
+            return Err(e);
+        }
+    };
     *app.state::<Session>().draft.lock().map_err(|_| "busy")? = Some(draft);
     open_review_window(&app);
     Ok(())

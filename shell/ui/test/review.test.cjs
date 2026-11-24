@@ -150,3 +150,14 @@ test("problems show an alert, and the page never persists anything", async () =>
   const src = require("node:fs").readFileSync(require.resolve("../review.js"), "utf8");
   assert.ok(!/localStorage|sessionStorage|indexedDB|document\.cookie/.test(src));
 });
+
+test("the author typed survives a failed save, so the officer can retry", async () => {
+  const { ui, mount } = setup({ review_save: () => { throw "store locked"; } });
+  await ui.load();
+  const a = role(mount, "author")[0];
+  a.value = "Officer Tan";
+  await a.fire("input");
+  await role(mount, "save")[0].click();
+  assert.equal(role(mount, "author")[0].value, "Officer Tan");
+  assert.match(role(mount, "error")[0].textContent, /store locked/);
+});

@@ -33,7 +33,25 @@ fn private_dir(dir: &Path) -> Result<(), String> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .map_err(|e| format!("cannot create the drafts folder: {}", e.kind()))
+        .map_err(|e| format!("cannot create the drafts folder: {}", e.kind()))?;
+    // A folder that already existed keeps its old mode unless it is set here.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot secure the drafts folder: {}", e.kind()))
+}
+
+/// Deletes leftover `draft-*.json` files (a review window closed without save or discard, or a
+/// refused recording). Regular files only; a link is removed, never followed.
+pub fn sweep(dir: &Path, keep: Option<&Path>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("draft-") && name.ends_with(".json") && Some(p.as_path()) != keep {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, String> {
@@ -41,6 +59,7 @@ pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, Stri
         return Err("that is not an application bundle id".into());
     }
     private_dir(dir)?;
+    sweep(dir, None);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -69,12 +88,18 @@ pub fn stop(mut rec: Recording) -> Result<PathBuf, String> {
     }
     let (tx, rx) = mpsc::channel();
     let mut child = rec.child;
+    let ceiling_pid = pid.clone();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait());
     });
     match rx.recv_timeout(STOP_CEILING) {
         Ok(Ok(status)) if status.success() && rec.out.exists() => Ok(rec.out),
         Ok(_) => Err("the recording was not saved (no steps were recorded, or the recorder failed)".into()),
-        Err(_) => Err("the recorder did not stop in time".into()),
+        Err(_) => {
+            // A recorder that ignores the stop must not keep its tap and indicator running. The
+            // waiting thread reaps it once it is gone.
+            let _ = Command::new("/bin/kill").args(["-KILL", &ceiling_pid]).status();
+            Err("the recorder did not stop in time and was ended".into())
+        }
     }
 }

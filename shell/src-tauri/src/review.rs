@@ -92,6 +92,30 @@ pub fn check_task(task: &Value) -> Vec<String> {
     if task["format"] != "task/v1" {
         e.push("/format: must be task/v1".into());
     }
+    let keys_ok = |v: &Value, allowed: &[&str]| v.as_object().is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())));
+    if !keys_ok(
+        task,
+        &["format", "id", "version", "name", "description", "author", "created", "platform", "apps", "preconditions", "inputs", "steps", "provenance"],
+    ) {
+        e.push("/: a field the format does not have".into());
+    }
+    if !task["id"].as_str().is_some_and(|id| id.strip_prefix("tsk_").is_some_and(|r| !r.is_empty() && r.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9')))) {
+        e.push("/id: must look like tsk_ followed by lower-case letters and digits".into());
+    }
+    if !matches!(task["platform"].as_str(), Some("macos" | "windows")) {
+        e.push("/platform: must be macos or windows".into());
+    }
+    if !task["name"].as_str().is_some_and(|n| !n.trim().is_empty()) {
+        e.push("/name: a task needs a name".into());
+    }
+    if !task["apps"].as_array().is_some_and(|a| !a.is_empty()) {
+        e.push("/apps: a task needs a target app".into());
+    }
+    for (i, inp) in task["inputs"].as_array().into_iter().flatten().enumerate() {
+        if !inp["name"].as_str().is_some_and(valid_name) {
+            e.push(format!("/inputs/{i}/name: invalid"));
+        }
+    }
     let declared: BTreeSet<&str> =
         task["inputs"].as_array().into_iter().flatten().filter_map(|i| i["name"].as_str()).collect();
     let ss = steps(task);
@@ -101,8 +125,36 @@ pub fn check_task(task: &Value) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for (i, s) in ss.iter().enumerate() {
         let at = format!("/steps/{i}");
-        if !s["id"].as_str().is_some_and(|id| ids.insert(id.to_string())) {
-            e.push(format!("{at}/id: missing or duplicate"));
+        if !s["id"].as_str().is_some_and(|id| {
+            id.strip_prefix('s').is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+                && ids.insert(id.to_string())
+        }) {
+            e.push(format!("{at}/id: must be s and a number, and unique"));
+        }
+        if !keys_ok(s, &["id", "say", "app", "action", "target", "value", "into", "expect", "consequential", "approval", "timeout_seconds"]) {
+            e.push(format!("{at}: a field the format does not have"));
+        }
+        let action = s["action"].as_str().unwrap_or("");
+        if !["press", "set_value", "select", "type_keys", "focus_app", "open_url", "read_value", "wait_for"].contains(&action) {
+            e.push(format!("{at}/action: not a supported action"));
+        }
+        let (has_value, has_target, has_into) = (!s["value"].is_null(), !s["target"].is_null(), !s["into"].is_null());
+        let shape_ok = match action {
+            "set_value" | "select" => has_target && has_value && !has_into,
+            "type_keys" => has_value && !has_into,
+            "open_url" => has_value && !has_target && !has_into,
+            "press" => has_target && !has_value && !has_into,
+            "read_value" => has_target && has_into && !has_value,
+            _ => !has_value && !has_into,
+        };
+        if !shape_ok {
+            e.push(format!("{at}: does not fit its action"));
+        }
+        if !s["approval"].is_null()
+            && !(s["approval"]["summary"].as_str().is_some_and(|t| !t.trim().is_empty())
+                && s["approval"]["undoable"].is_boolean())
+        {
+            e.push(format!("{at}/approval: needs a summary and an undoable flag"));
         }
         if !s["say"].as_str().is_some_and(|t| !t.is_empty()) {
             e.push(format!("{at}/say: missing"));
@@ -125,6 +177,9 @@ pub fn check_task(task: &Value) -> Vec<String> {
                 && v.as_object().is_some_and(|o| o.len() == 2);
             if !by_input && !by_constant {
                 e.push(format!("{at}/value: must be an input or a confirmed constant"));
+            }
+            if by_constant && v["constant"].as_str().is_some_and(|c| c.trim().is_empty()) {
+                e.push(format!("{at}/value: a constant cannot be blank"));
             }
         }
         for (j, c) in s["expect"].as_array().into_iter().flatten().enumerate() {
@@ -306,7 +361,9 @@ impl Draft {
                 // own step and nowhere else, so deleting that step deletes the value.
                 sum = remove_token(&sum, g);
             }
-            s["approval"]["summary"] = json!(sum.trim());
+            let sum = sum.trim();
+            let fallback = no_braces(s["say"].as_str().unwrap_or("This step"));
+            s["approval"]["summary"] = json!(if sum.is_empty() { fallback.as_str() } else { sum });
         }
     }
 
@@ -344,8 +401,8 @@ impl Draft {
         if !confirmed {
             return Err("confirm that the value contains no personal data first".into());
         }
-        if value.is_empty() || value.chars().count() > MAX_CONSTANT_CHARS {
-            return Err("a constant is between 1 and 500 characters".into());
+        if value.trim().is_empty() || value.chars().count() > MAX_CONSTANT_CHARS {
+            return Err("a constant is between 1 and 500 characters and not blank".into());
         }
         let i = self.step_index(id)?;
         let s = &self.task["steps"][i];
@@ -355,6 +412,17 @@ impl Draft {
         let Some(name) = s["value"]["input"].as_str().map(str::to_string) else {
             return Err("this step's value is already a constant".into());
         };
+        let choices = self.task["inputs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|inp| inp["name"] == name.as_str())
+            .and_then(|inp| inp["choices"].as_array().cloned());
+        if let Some(c) = choices {
+            if !c.iter().any(|x| x == value) {
+                return Err("that is not one of this input's choices".into());
+            }
+        }
         let before = used_inputs(&self.task);
         let s = &mut self.task["steps"][i];
         s["value"] = json!({ "constant": value, "confirmed_no_personal_data": true });

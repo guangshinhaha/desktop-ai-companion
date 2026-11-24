@@ -446,3 +446,74 @@ fn a_constant_value_is_never_copied_into_a_summary_even_after_its_step_is_delete
     assert!(validate(&body, &dir).0);
     assert!(!decrypted_dump(&dir).contains(SECRET));
 }
+
+fn saved_valid(t: Value, dir: &Path) -> Result<bool, String> {
+    let mut s = open(dir);
+    let d = Draft::from_json(&t.to_string(), None).unwrap();
+    d.save(&mut s, "officer", NOW)?;
+    Ok(validate(&s.task_body("tsk_ab12cd34", 1).unwrap().unwrap(), dir).0)
+}
+
+#[test]
+fn a_summary_never_ends_up_empty() {
+    let dir = tmp("empty-summary");
+    let mut t = recorded();
+    t["steps"][2]["approval"]["summary"] = json!("{full_name}");
+    let mut d = Draft::from_json(&t.to_string(), None).unwrap();
+    edit(&mut d, json!({"op":"delete_step","step":"s1"})).unwrap();
+    edit(&mut d, json!({"op":"delete_step","step":"s2"})).unwrap();
+    let mut s = open(&dir);
+    d.save(&mut s, "officer", NOW).unwrap();
+    assert!(validate(&s.task_body("tsk_ab12cd34", 1).unwrap().unwrap(), &dir).0);
+    // A blank constant is refused outright.
+    let mut d = draft();
+    assert!(edit(&mut d, json!({"op":"mark_constant","step":"s1","value":"   ","confirmed_no_personal_data":true})).is_err());
+}
+
+#[test]
+fn a_hand_made_recording_that_breaks_the_format_is_refused_at_save() {
+    let dir = tmp("tampered");
+    let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        ("task id", Box::new(|t| t["id"] = json!("../evil"))),
+        ("step id", Box::new(|t| t["steps"][0]["id"] = json!("zzz"))),
+        ("action", Box::new(|t| t["steps"][0]["action"] = json!("rm_rf"))),
+        ("press with a value", Box::new(|t| t["steps"][2]["value"] = json!({"input":"email"}))),
+        ("extra field", Box::new(|t| t["extra"] = json!(1))),
+        ("platform", Box::new(|t| t["platform"] = json!("linux"))),
+        ("summary not a string", Box::new(|t| t["steps"][2]["approval"]["summary"] = json!(5))),
+        ("bad input name", Box::new(|t| t["inputs"][0]["name"] = json!("Bad Name"))),
+    ];
+    for (what, f) in cases {
+        let mut t = recorded();
+        f(&mut t);
+        assert!(saved_valid(t, &dir).is_err(), "{what} was saved");
+    }
+    assert_eq!(saved_valid(recorded(), &dir), Ok(true));
+}
+
+#[test]
+fn a_constant_for_a_choice_input_must_be_one_of_its_choices() {
+    let mut t = recorded();
+    t["inputs"][0] = json!({"name":"full_name","type":"choice","source":"ask","choices":["a","b"]});
+    let mut d = Draft::from_json(&t.to_string(), None).unwrap();
+    assert!(edit(&mut d, json!({"op":"mark_constant","step":"s1","value":"zzz","confirmed_no_personal_data":true})).is_err());
+    edit(&mut d, json!({"op":"mark_constant","step":"s1","value":"a","confirmed_no_personal_data":true})).unwrap();
+}
+
+#[test]
+fn old_drafts_are_swept_at_start_and_an_existing_folder_is_made_private() {
+    let dir = tmp("sweep");
+    let drafts = dir.join("drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&drafts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(drafts.join("draft-old.json"), "{}").unwrap();
+    std::fs::write(drafts.join("keep.txt"), "x").unwrap();
+    let bin = fake_executor(&dir, &recorded().to_string(), true);
+    let rec = recording::start(&bin, "com.google.Chrome", &drafts).unwrap();
+    assert!(!drafts.join("draft-old.json").exists(), "leftover drafts are swept at the next start");
+    assert!(drafts.join("keep.txt").exists(), "only draft files are touched");
+    assert_eq!(std::fs::metadata(&drafts).unwrap().permissions().mode() & 0o777, 0o700);
+    wait_ready(&dir);
+    let _ = recording::stop(rec);
+}

@@ -13,6 +13,7 @@
     let view = null;
     let error = "";
     let openConstant = null; // step id whose fixed-value form is open
+    let authorText = null; // what the officer typed in "Saved by", kept across redraws
 
     function el(tag, props, ...kids) {
       const e = doc.createElement(tag);
@@ -115,9 +116,11 @@
         mount.appendChild(el("p", { attrs: { role: "alert" } }, error || "Nothing to review."));
         return;
       }
-      const author = el("input", { type: "text", value: view.author || "", attrs: { "aria-label": "Your name or officer id", "data-role": "author", autocomplete: "off" } });
+      const author = el("input", { type: "text", value: authorText ?? (view.author || ""), attrs: { "aria-label": "Your name or officer id", "data-role": "author", autocomplete: "off" },
+        on: { input: (ev) => { authorText = ev.target.value; } } });
       const save = el("button", { type: "button", textContent: "Save task", attrs: { "data-role": "save" },
         on: { click: async () => {
+          authorText = author.value;
           const r = await send("review_save", { author: author.value });
           if (r.ok) { view = null; mount.replaceChildren(el("p", { attrs: { role: "status" } }, "Saved as version " + r.out.version + ".")); }
         } } });
