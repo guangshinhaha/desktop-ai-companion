@@ -20,6 +20,8 @@ run schema npm test
 
 # The shell's tests are headless (no window, no tray). They ping the real executor, so build it first.
 # Needs Rust (rustup) on PATH; the macOS CI runner has it.
+# The two real-keychain tests are #[ignore]d so CI never touches the login keychain. Locally:
+#   cd shell/src-tauri && cargo test --test store -- --ignored
 echo "==> shell (cargo test)"
 if ! command -v cargo >/dev/null; then
   echo "cargo not found: install Rust (brew install rustup && rustup-init -y)"

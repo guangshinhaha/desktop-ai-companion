@@ -1,5 +1,7 @@
-//! Store tests. Synthetic data only. Keys are injected or a throwaway keychain item that is
-//! deleted at the end of the test. Tests that attack the audit table use a second plain
+//! Store tests. Synthetic data only. Keys are injected, or come from an in-memory keychain
+//! backend. The two tests that use the real macOS keychain are `#[ignore]`d so CI never touches
+//! a (possibly locked or prompting) login keychain; run them on a Mac you are signed in to with
+//! `cd shell/src-tauri && cargo test --test store -- --ignored`. Every test has a hard timeout. Tests that attack the audit table use a second plain
 //! connection (same key, no recursive_triggers) so they do not depend on the Store's own setup.
 
 use companion_shell::store::*;
@@ -7,6 +9,21 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 const DAY: i64 = 86_400;
+
+/// Runs a test body on its own thread and fails fast if it does not finish, so a blocked
+/// keychain call cannot hold CI for the job timeout.
+fn guarded<F: FnOnce() + Send + 'static>(secs: u64, f: F) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(Ok(())) => {}
+        Ok(Err(p)) => std::panic::resume_unwind(p),
+        Err(_) => panic!("test timed out after {secs}s (blocked keychain call?)"),
+    }
+}
 
 fn tmp(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -307,7 +324,12 @@ fn errors_do_not_carry_values() {
 }
 
 #[test]
+#[ignore = "touches the real login keychain; run locally with -- --ignored"]
 fn the_key_comes_from_the_keychain_and_is_stable() {
+    guarded(60, the_key_comes_from_the_keychain_and_is_stable_body);
+}
+
+fn the_key_comes_from_the_keychain_and_is_stable_body() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -339,8 +361,72 @@ impl KeySource for NoKey {
     }
 }
 
+/// In-memory keychain: same add-only/duplicate semantics, a pause between the read and the add
+/// to force the race.
+struct MemKeychain(std::sync::Mutex<Option<Vec<u8>>>);
+impl KeychainBackend for MemKeychain {
+    fn get(&self) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().clone()
+    }
+    fn add(&self, data: &[u8]) -> AddOutcome {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut g = self.0.lock().unwrap();
+        if g.is_some() {
+            return AddOutcome::Duplicate;
+        }
+        *g = Some(data.to_vec());
+        AddOutcome::Added
+    }
+}
+struct Shared(std::sync::Arc<MemKeychain>);
+impl KeySource for Shared {
+    fn key_and_origin(&self) -> Result<(Key, bool)> {
+        key_via(&*self.0)
+    }
+}
+
 #[test]
+fn concurrent_first_opens_end_with_one_key_in_memory() {
+    guarded(60, || {
+        use std::sync::{Arc, Barrier};
+        let kc = Arc::new(MemKeychain(std::sync::Mutex::new(None)));
+        let n = 8;
+        let barrier = Arc::new(Barrier::new(n));
+        let dirs: Vec<PathBuf> = (0..n).map(|i| tmp(&format!("memrace{i}"))).collect();
+        let handles: Vec<_> = dirs
+            .iter()
+            .cloned()
+            .map(|d| {
+                let (b, kc) = (barrier.clone(), kc.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    Store::open(&d.join("s.db"), &Shared(kc)).map(|_| ()).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(results.iter().all(|r| r.is_ok()), "first opens: {results:?}");
+        // Every file opens with the one stored key: none was keyed with a loser's key.
+        assert!(dirs.iter().all(|d| Store::open(&d.join("s.db"), &Shared(kc.clone())).is_ok()));
+    });
+}
+
+#[test]
+fn a_wrong_length_or_failing_keychain_is_an_error_not_a_new_key() {
+    let bad = MemKeychain(std::sync::Mutex::new(Some(vec![1, 2, 3])));
+    assert!(key_via(&bad).is_err());
+    let fresh = MemKeychain(std::sync::Mutex::new(None));
+    assert!(key_via(&fresh).unwrap().1, "first call creates");
+    assert!(!key_via(&fresh).unwrap().1, "second call reads");
+}
+
+#[test]
+#[ignore = "touches the real login keychain; run locally with -- --ignored"]
 fn concurrent_first_opens_end_with_one_key() {
+    guarded(60, concurrent_first_opens_end_with_one_key_body);
+}
+
+fn concurrent_first_opens_end_with_one_key_body() {
     use std::sync::{Arc, Barrier};
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
