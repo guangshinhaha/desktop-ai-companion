@@ -63,7 +63,10 @@ Every milestone description has these parts, so `/shinstack:coordinate` can run 
 
 ## Commands
 
-TODO: no code yet. Add real scripts here once the stack is chosen.
+- Test everything: `scripts/test.sh` (runs every package, exits non-zero if any fails).
+- Needs Swift 6 (Xcode) and Node 24+ (TypeScript runs via Node type stripping; no install step yet).
+- One package: `cd executor-macos && swift test`, or `cd <stand-in|harness|schema> && npm test`.
+- CI: `.github/workflows/test.yml` runs `scripts/test.sh` on a macOS runner for every PR.
 
 ## Scope (from the PRD)
 
