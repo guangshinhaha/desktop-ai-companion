@@ -135,7 +135,9 @@ public final class AXApp {
         var label = s(1) ?? s(2)
         if label == nil, let t = vals[5], CFGetTypeID(t as CFTypeRef) == AXUIElementGetTypeID() {
             let te = t as! AXUIElement
-            label = string(te, kAXTitleAttribute) ?? string(te, kAXValueAttribute)
+            // The linked label element's text, but only if it is static text (never a field's value).
+            label = string(te, kAXTitleAttribute)
+            if label == nil, string(te, kAXRoleAttribute) == kAXStaticTextRole { label = string(te, kAXValueAttribute) }
         }
         if label == nil { label = s(4) }
         // Only static text is read for its text. A field's value is never read.
