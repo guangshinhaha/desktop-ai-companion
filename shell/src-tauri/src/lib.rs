@@ -5,6 +5,7 @@ pub mod executor;
 pub mod recording;
 pub mod review;
 pub mod store;
+pub mod usage;
 
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::sync::Mutex;
