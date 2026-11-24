@@ -7,6 +7,10 @@ Merges no product code. Scripts are in `spike/`.
 
 Excel for Mac is not installed on the test Mac. Only Numbers 15 (`com.apple.iWork.Numbers`) was. Nothing below shows that Excel exposes cells the same way. The first Done-when item (Excel for Mac through `AXUIElement`) is **not met**. It needs a Mac with Excel, so it is a `hands-on` follow-up (see "Untested").
 
+## Scope change (Shin, via the coordinator)
+
+Excel is out of the measured set. The measured set is Numbers (through AX) and the on-disk file read. Google Sheets in Chrome was added as a target, because Google Drive and Workspace is the more relevant one for officers. **Google Sheets was not tested**: see "Google Sheets in Chrome" below.
+
 ## Method
 
 - Mac: the test MacBook (not a SEED laptop), macOS 26 (Darwin 25.6.0), Accessibility and Screen Recording granted to the terminal (`AXIsProcessTrusted() = true`). Screen unlocked throughout (`CGSSessionScreenIsLocked=0`, checked before each run).
@@ -79,6 +83,12 @@ whole process, cold, 3 runs: real 0.06 s each (Python start-up dominates)
 
 Both are far below the 100 ms step budget. Speed does not decide this. What decides it is below.
 
+## Google Sheets in Chrome: untested, needs Shin sign-in
+
+Not measured. On the test Mac, Chrome was running with no open window, so there was no signed-in Google Sheets session to read. Chrome profiles do hold a Chrome sign-in, but I could not tell which account they are, and creating a new sheet writes to a remote Google account. The repo sets `shinstack-mode.shared: ask`, so I did not open a profile or create a sheet. Shin signs in (and confirms the account) before this can run.
+
+Plan once signed in: create a new sheet from `stand-in/data/staff.csv` only (synthetic), read cells from Chrome's accessibility tree (`AXWebArea`, `AXDOMIdentifier`), and time it like Numbers. Expected risk, not measured: Sheets draws its grid on a canvas, so cells may be absent from the AX tree unless Sheets' accessibility mode is on. Until measured, the pick below says nothing about Sheets.
+
 ## The pick
 
 **Read the file for list runs and for any `read` source that names a file. Use AX only for the one thing the file cannot give: the cell the officer has selected in the open app.**
@@ -104,9 +114,14 @@ Phase 0 task (stand-in provisioning app, synthetic data):
 - Use the file read (`staff.csv` or `.xlsx`) for the spreadsheet half of the task. Do not make Phase 0 depend on Excel being installed or on spreadsheet AX. The SEED MacBook may not have Excel in any case.
 - If the Phase 0 video should show the officer copying from an open sheet, that is a Phase 1 item and needs the Excel test below first.
 
+## Later
+
+GovSuite is the government version of Word, PowerPoint and Docs. It is to be integrated later and was not tested now.
+
 ## Untested, and what would settle it
 
-- **Excel for Mac, all of it.** Whether it exposes `AXTable` or `AXCell` at all, where the text sits (`AXValue` or `AXTitle`), whether it gives the A1 address (Excel has a Name Box, an `AXTextField` that may carry it), selection, and the timing. Needs Excel on a Mac. Hands-on for Shin or a Mac with Office. Rerun `spike/ax_dump.swift` and `spike/ax_select.swift` with the bundle id `com.microsoft.Excel`, which only needs that string changed.
+- **Google Sheets in Chrome, all of it** (see above; needs Shin's sign-in).
+- **Excel for Mac, all of it** (now out of the measured set by Shin's call; Excel was not tested). Whether it exposes `AXTable` or `AXCell` at all, where the text sits (`AXValue` or `AXTitle`), whether it gives the A1 address (Excel has a Name Box, an `AXTextField` that may carry it), selection, and the timing. Needs Excel on a Mac. Hands-on for Shin or a Mac with Office. Rerun `spike/ax_dump.swift` and `spike/ax_select.swift` with the bundle id `com.microsoft.Excel`, which only needs that string changed.
 - Whether the tree wake-up is required for Excel, and for Numbers on other macOS versions.
 - A real mouse click or keyboard selection in Numbers, and `AXObserver` selection notifications.
 - Large sheets: this file has 6 rows. AX time grows with cells read; Excel with 10,000 rows is untested. Use `AXVisibleCells` and the parameterised `AXCellForColumnAndRow` (the call returned success, the value was not inspected).
