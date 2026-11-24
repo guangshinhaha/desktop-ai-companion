@@ -13,6 +13,7 @@ func fail(_ msg: String, code: Int32 = 1) -> Never {
 let usage = """
 usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name>] [--author <id>]
        executor-macos resolve --descriptor <file> [--app <bundle id>] [--window <title text>] [--ceiling <seconds>]
+       executor-macos serve   (JSON-RPC over stdio, one message per line; methods: ping)
        executor-macos replay <task.json> --inputs <file> [--pid <n>] [--approval-file <file>] [--ceiling <seconds>]
   --app      bundle id of the running app (default com.google.Chrome)
   --window   pick the window whose title contains this text (default: the focused window)
@@ -21,6 +22,7 @@ usage: executor-macos record --out <file> [--app <bundle id>] [--name <task name
 
 var args = Array(CommandLine.arguments.dropFirst())
 let command = args.first
+if command == "serve" { RPC.serve(); exit(0) }
 if command == "replay" { runReplay(Array(args.dropFirst())) }
 guard command == "resolve" || command == "record" else { fail(usage) }
 args.removeFirst()

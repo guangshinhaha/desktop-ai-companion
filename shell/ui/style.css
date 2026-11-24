@@ -1,0 +1,6 @@
+:root { color-scheme: light dark; }
+html, body { margin: 0; height: 100%; background: Canvas; }
+body { display: flex; align-items: center; padding: 0 16px; font: 16px -apple-system, system-ui, sans-serif; }
+input { width: 100%; box-sizing: border-box; padding: 12px 14px; font: inherit; color: CanvasText;
+        background: transparent; border: 1px solid GrayText; border-radius: 8px; outline: none; }
+input:focus { border-color: Highlight; }
