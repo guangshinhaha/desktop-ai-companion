@@ -36,6 +36,30 @@ Companion rules:
 10. Each PRD phase is a milestone. A milestone ends with `/shinstack:uat` after its issues merge. It is not done until that has run. Issues whose Done when ends in a Live check stay open until it passes.
 11. A phase's exit is a continue / narrow / stop call against PRD Section 10. That call is Shin's: report the evidence and stop.
 12. A milestone's order (in its description) wins over oldest-first.
+13. Only Shin can finish a `hands-on` issue (live check, real accounts or config, a decision). Unattended runs skip it, and a PR for it uses `Refs #N`, never `Closes`.
+14. `discovery` means not decided: run the spike or get the product call before building. A spike ends in a note in `docs/decisions/` and merges no product code.
+15. Each milestone has one `epic` issue: the goal, what we build, and its sub-issues (GitHub sub-issues). The epic closes when the milestone's UAT has run and Shin has made the phase call.
+
+### Labels
+
+| Label | Means |
+|---|---|
+| `ready` | Shin's permission to build. Only Phase 0 issues carry it until the next phase is groomed |
+| `risk:none` to `risk:high` | Review tier (rules 3 to 6) |
+| `hands-on` | Only Shin can finish it (rule 13) |
+| `discovery` | Spike or product call first (rule 14) |
+| `consult-shin` | An advisor pick made while Shin was away, waiting for Shin's review (rule 9) |
+| `epic` | A milestone's parent issue (rule 15) |
+
+### Milestone description
+
+Every milestone description has these parts, so `/shinstack:coordinate` can run it and `/shinstack:uat` can end it:
+
+- **Goal:** one line.
+- **In** and **Out**.
+- **Order (beats oldest-first):** issue numbers, with why each comes where it does.
+- **Hands-on (Shin):** what only Shin can do, and when.
+- **Unattended run:** the exit command `gh issue list --milestone "<name>" --state open --search "-label:hands-on -label:epic"` prints nothing once the agent-doable issues merge. Then `/shinstack:uat`; Shin closes the milestone. Escape hatch: `/goal clear`.
 
 ## Commands
 
