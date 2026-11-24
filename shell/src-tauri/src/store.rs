@@ -54,13 +54,17 @@ impl Key {
 
 /// Where the key comes from. The shell uses [`Keychain`]; tests inject a fixed key.
 pub trait KeySource {
-    fn key(&self) -> Result<Key>;
+    /// The key, and whether this call created it (first use).
+    fn key_and_origin(&self) -> Result<(Key, bool)>;
+    fn key(&self) -> Result<Key> {
+        Ok(self.key_and_origin()?.0)
+    }
 }
 
 pub struct Fixed(pub [u8; 32]);
 impl KeySource for Fixed {
-    fn key(&self) -> Result<Key> {
-        Ok(Key(self.0))
+    fn key_and_origin(&self) -> Result<(Key, bool)> {
+        Ok((Key(self.0), false))
     }
 }
 
@@ -82,22 +86,49 @@ impl Keychain {
     }
 }
 
+/// errSecDuplicateItem
+const DUPLICATE_ITEM: i32 = -25299;
+
+impl Keychain {
+    fn read(&self) -> Option<Result<Key>> {
+        let existing =
+            security_framework::passwords::get_generic_password(&self.service, &self.account).ok()?;
+        Some(
+            <[u8; 32]>::try_from(existing)
+                .map(Key)
+                .map_err(|_| StoreError::Key("stored key has the wrong length".into())),
+        )
+    }
+}
+
 impl KeySource for Keychain {
-    fn key(&self) -> Result<Key> {
-        use security_framework::passwords::{get_generic_password, set_generic_password};
-        if let Ok(existing) = get_generic_password(&self.service, &self.account) {
-            let arr: [u8; 32] = existing
-                .try_into()
-                .map_err(|_| StoreError::Key("stored key has the wrong length".into()))?;
-            return Ok(Key(arr));
+    /// Get, else create with an add-only call. If two first opens race, one add succeeds and the
+    /// other gets a duplicate error and reads the winner's key, so both end with the same key.
+    fn key_and_origin(&self) -> Result<(Key, bool)> {
+        use core_foundation::data::CFData;
+        use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass};
+        if let Some(k) = self.read() {
+            return Ok((k?, false));
         }
         let mut fresh = [0u8; 32];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut fresh))
             .map_err(|e| StoreError::Key(e.to_string()))?;
-        set_generic_password(&self.service, &self.account, &fresh)
-            .map_err(|e| StoreError::Key(e.to_string()))?;
-        Ok(Key(fresh))
+        let added = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data: CFData::from_buffer(&fresh),
+        })
+        .set_service(&self.service)
+        .set_account_name(&self.account)
+        .add();
+        match added {
+            Ok(()) => Ok((Key(fresh), true)),
+            Err(e) if e.code() == DUPLICATE_ITEM => match self.read() {
+                Some(k) => Ok((k?, false)),
+                None => Err(StoreError::Key("key item vanished during creation".into())),
+            },
+            Err(e) => Err(StoreError::Key(e.to_string())),
+        }
     }
 }
 
@@ -108,6 +139,21 @@ pub fn default_path() -> Option<std::path::PathBuf> {
         std::path::PathBuf::from(home)
             .join("Library/Application Support/sg.gov.grl.companion/store.db"),
     )
+}
+
+/// Creates the parent directory as 0700 and the database file as 0600 before SQLite touches it.
+/// SQLite gives its journal and WAL files the database file's mode.
+fn private_dir_and_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let io = |e: std::io::Error| StoreError::Db(e.to_string());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(io)?;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(io(e)),
+    }
 }
 
 /// An audit record to append. `shown` holds the approved values (decision 0005); the file is
@@ -131,11 +177,16 @@ const SCHEMA_VERSION: i64 = 1;
 
 impl Store {
     pub fn open(path: &Path, keys: &dyn KeySource) -> Result<Store> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| StoreError::Db(e.to_string()))?;
+        // Key first: if it fails, nothing is created on disk.
+        let (key, key_is_new) = keys.key_and_origin()?;
+        // An empty store file next to a key that already existed is a damaged store, not a new
+        // one; opening it as fresh would silently start a second history.
+        if !key_is_new && std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
+            return Err(StoreError::Db("store file is empty but a key exists (delete the empty file to start fresh)".into()));
         }
+        private_dir_and_file(path)?;
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", keys.key()?.pragma())?;
+        conn.pragma_update(None, "key", key.pragma())?;
         // Forces SQLCipher to decrypt page 1: a wrong key fails here, not later.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
         conn.pragma_update(None, "recursive_triggers", true)?;

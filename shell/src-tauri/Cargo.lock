@@ -366,6 +366,7 @@ dependencies = [
 name = "companion-shell"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
  "rusqlite",
  "security-framework",
  "serde_json",

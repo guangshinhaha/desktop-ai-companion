@@ -23,6 +23,7 @@ serde_json = "1"
 rusqlite = { version = "0.43.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 security-framework = "3.7.0"
 sha2 = "0.11.1"
+core-foundation = "0.10.1"
 
 [profile.release]
 opt-level = "s"

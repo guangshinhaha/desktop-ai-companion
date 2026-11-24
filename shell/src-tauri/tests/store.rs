@@ -331,3 +331,75 @@ fn the_key_comes_from_the_keychain_and_is_stable() {
         std::panic::resume_unwind(p);
     }
 }
+
+struct NoKey;
+impl KeySource for NoKey {
+    fn key_and_origin(&self) -> Result<(Key, bool)> {
+        Err(StoreError::Key("no key".into()))
+    }
+}
+
+#[test]
+fn concurrent_first_opens_end_with_one_key() {
+    use std::sync::{Arc, Barrier};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let service = format!("sg.gov.grl.companion.test-race-{}-{nanos}", std::process::id());
+    let n = 8;
+    let barrier = Arc::new(Barrier::new(n));
+    let dirs: Vec<PathBuf> = (0..n).map(|i| tmp(&format!("race{i}"))).collect();
+    let handles: Vec<_> = dirs
+        .iter()
+        .cloned()
+        .map(|d| {
+            let (b, service) = (barrier.clone(), service.clone());
+            std::thread::spawn(move || {
+                let kc = Keychain { service, account: "throwaway".into() };
+                b.wait();
+                Store::open(&d.join("s.db"), &kc).map(|_| ()).map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let kc = Keychain { service, account: "throwaway".into() };
+    // Every file opens with the one key now in the keychain: none was keyed with a loser's key.
+    let reopened: Vec<bool> =
+        dirs.iter().map(|d| Store::open(&d.join("s.db"), &kc).is_ok()).collect();
+    kc.delete().unwrap();
+    assert!(results.iter().all(|r| r.is_ok()), "first opens: {results:?}");
+    assert!(reopened.iter().all(|ok| *ok), "all stores share one key: {reopened:?}");
+}
+
+#[test]
+fn a_key_failure_leaves_nothing_on_disk() {
+    let d = tmp("nokey");
+    let dir = d.join("sub");
+    assert!(Store::open(&dir.join("s.db"), &NoKey).is_err());
+    assert!(!dir.exists(), "no directory or zero-byte file after a key failure");
+}
+
+#[test]
+fn an_empty_store_file_with_an_existing_key_is_an_error() {
+    let d = tmp("empty");
+    std::fs::write(d.join("s.db"), b"").unwrap();
+    assert!(Store::open(&d.join("s.db"), &Fixed([1u8; 32])).is_err());
+    assert_eq!(std::fs::metadata(d.join("s.db")).unwrap().len(), 0, "left untouched");
+}
+
+#[test]
+fn the_directory_is_private_and_the_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp("perm");
+    let dir = d.join("app");
+    let mut s = Store::open(&dir.join("s.db"), &Fixed([1u8; 32])).unwrap();
+    s.append_audit(&entry(1, "a")).unwrap();
+    s.save_task("t", "n", "{}", 1).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    for f in std::fs::read_dir(&dir).unwrap() {
+        let f = f.unwrap().path();
+        assert_eq!(mode(&f), 0o600, "{}", f.display());
+    }
+}
