@@ -521,11 +521,12 @@ final class ReplayerTests: XCTestCase {
         XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
     }
 
-    func testFailedActionWithPassingChecksContinues_AndFailedActionWithoutThemStops() throws {
+    func testFailedActionStopsEvenWhenTheCheckAlreadyPasses() throws {
         let t = try makeTask(), h = host()
         h.pressResult = .failed("AX error -25204")
         h.onPress = { _, h in h.tree = createdPage() }
-        XCTAssertEqual(try replayer(t, h, answers: ["y"]).0.run().outcome, .finished)
+        guard case .diverged(_, let w1) = try replayer(t, h, answers: ["y"]).0.run().outcome else { return XCTFail() }
+        XCTAssertTrue(w1.contains("action failed"))
 
         let h2 = host()
         h2.pressResult = .failed("AX error -25204")
@@ -594,6 +595,37 @@ final class WaitingTests: XCTestCase {
         let r: Waiting.Result<Int> = Waiting.until(ceiling: 30, wait: { _ in waited = true }, now: { 0 }, poll: { .done(1) })
         guard case .done(1) = r else { return XCTFail() }
         XCTAssertFalse(waited)
+    }
+}
+
+// Interrogate round 1, adversary B.
+final class ReplayHardeningTests: XCTestCase {
+    func testDialogTextWithARunValueIsNeverPrinted() throws {
+        let t = try makeTask(), h = FakeHost()
+        let dlg = UINode(role: "AXGroup", children: [UINode(role: "AXStaticText", label: "Create account for Aiden")], subrole: "AXApplicationDialog")
+        h.tree = UINode(role: "AXWindow", label: "x", children: provisioningForm().children + [dlg])
+        let r = Replayer(task: t, inputs: try makeInputs(t, name: "Aiden"), host: h,
+                         gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }), log: { _ in })
+        guard case .diverged(_, let why) = r.run().outcome else { return XCTFail() }
+        XCTAssertFalse(why.contains("Aiden"))
+    }
+
+    func testTaskTimeoutCannotLengthenTheRunsCeiling() throws {
+        let t = try makeTask { steps(&$0) { $0[2]["timeout_seconds"] = 3600 } }
+        let h = FakeHost(); h.tree = provisioningForm(); h.onPress = { _, _ in }
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h,
+                         gate: ApprovalGate(source: ScriptedApproval(["y"]), out: { _ in }), ceiling: 2, log: { _ in })
+        _ = r.run()
+        XCTAssertLessThanOrEqual(h.clock, 2.01)
+    }
+
+    func testMalformedTimeoutAnchorsAndHugeTasksAreRefused() {
+        for bad in [true, "abc", NSNull()] as [Any] {
+            XCTAssertThrowsError(try makeTask { steps(&$0) { $0[0]["timeout_seconds"] = bad } }, "\(bad)")
+        }
+        let many = (0..<40).map { "a\($0)" }
+        XCTAssertThrowsError(try makeTask { steps(&$0) { $0[0]["target"] = ["role": "AXTextField", "anchors": many] } })
+        XCTAssertThrowsError(try ReplayTask.load(from: Data(repeating: 0x20, count: ReplayTask.maxTaskBytes + 1)))
     }
 }
 

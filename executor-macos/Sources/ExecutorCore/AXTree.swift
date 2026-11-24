@@ -58,7 +58,9 @@ public final class AXApp {
             let candidates = running.filter(hasWindow)
             if candidates.count > 1 { throw Failure.ambiguous(bundleId, candidates.map(\.processIdentifier).sorted()) }
         }
-        guard let app = running.first(where: { wanted != nil ? $0.processIdentifier == wanted : hasWindow($0) }) ?? running.first else {
+        // A replay never falls back to a process it could not show has a window.
+        guard let app = running.first(where: { wanted != nil ? $0.processIdentifier == wanted : hasWindow($0) })
+                ?? (requireUnique ? nil : running.first) else {
             throw Failure.notRunning(bundleId)
         }
         pid = app.processIdentifier
@@ -105,7 +107,12 @@ public final class AXApp {
     /// Blocks until the app sends an accessibility event, or `timeout` seconds pass.
     public func wait(_ timeout: TimeInterval) {
         signal.fired = false
+        // A one-shot timer at the deadline keeps the run loop alive when there is no observer source
+        // (AXObserverCreate failed); without one, the call returns at once and the caller spins.
+        let timer = CFRunLoopTimerCreateWithHandler(nil, CFAbsoluteTimeGetCurrent() + timeout, 0, 0, 0) { _ in }
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, .defaultMode)
         _ = CFRunLoopRunInMode(.defaultMode, timeout, true)
+        CFRunLoopTimerInvalidate(timer)
     }
 
     /// A snapshot of the chosen window, or nil when the app has no window yet.

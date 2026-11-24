@@ -48,7 +48,8 @@ public final class Replayer {
 
         for (i, step) in task.steps.enumerated() {
             log("step \(step.id): \(step.say)")
-            let stepCeiling = step.timeoutSeconds ?? ceiling
+            // The run's ceiling caps a step's own timeout; a task cannot lengthen the run.
+            let stepCeiling = min(step.timeoutSeconds ?? ceiling, ceiling)
 
             // 1. Find the element. Two matches or none is a divergence, never a guess.
             var match: Match
@@ -89,13 +90,9 @@ public final class Replayer {
             // 4. Wait for the checks.
             switch acted {
             case .failed(let why):
-                // An action can report failure after taking effect (a press that navigates). Look once, without waiting.
-                if case .none = checksFailure(step, root: host.snapshot()) {
-                    log("  action reported \(why), but the checks pass")
-                } else {
-                    let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
-                    return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
-                }
+                // A failed action stops the run even if a check already passes: that check never proved the action happened.
+                let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
+                return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
             case .ok:
                 if let why = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
                     return report(.diverged(step: step.id, reason: why), at: i)
@@ -229,16 +226,15 @@ public final class Replayer {
 
     static let dialogRoles: Set<String> = ["AXDialog", "AXSheet", "AXPopover"]
 
-    /// A dialog on screen that the step did not expect. Described by role and, when it is plain fixed
-    /// text, its title; never by anything that could be data.
+    /// A dialog on screen that the step did not expect. Described by role only, never by its text.
     func unexpectedDialog(in root: UINode, step: ReplayTask.Step) -> String? {
         let expected = step.expect.contains { c in
             c.target.map { $0.role.map(Self.dialogRoles.contains) ?? false } ?? false
         }
         if expected { return nil }
         for n in [root] + root.descendants where Self.isDialog(n) {
-            let title = ExpectProposer.stable(n.label) ?? n.descendants.lazy.compactMap { ExpectProposer.stable($0.role == "AXStaticText" ? $0.label : nil) }.first
-            return "a dialog" + (title.map { " (\"\($0)\")" } ?? "")
+            // Never quote the dialog's text: it can hold a value from this run (a name, an email).
+            return "a dialog"
         }
         return nil
     }

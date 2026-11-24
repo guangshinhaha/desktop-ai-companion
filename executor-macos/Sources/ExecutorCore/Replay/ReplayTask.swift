@@ -112,6 +112,7 @@ public struct ReplayTask {
     // MARK: parsing
 
     public static func load(from data: Data) throws -> ReplayTask {
+        guard data.count <= maxTaskBytes else { throw Invalid("task file is larger than \(maxTaskBytes) bytes") }
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw Invalid("task file must hold a JSON object")
         }
@@ -169,6 +170,7 @@ public struct ReplayTask {
               let target = try? Descriptor.load(from: JSONSerialization.data(withJSONObject: ["target": t])) else {
             throw Invalid("\(w) needs a usable target")
         }
+        if (target.anchors?.count ?? 0) > maxAnchors { throw Invalid("\(w) target has more than \(maxAnchors) anchors") }
         // Passwords are never an input (PRD R-2): the recorder turns them into a precondition.
         if target.role == "AXSecureTextField" { throw Invalid("\(w) targets a password field, which replay never fills") }
         var value: ValueRef?
@@ -187,7 +189,7 @@ public struct ReplayTask {
             undoable = (a["undoable"] as? Bool) ?? false
         }
         let step = Step(id: id, say: say, action: action, target: target, value: value, expect: checks, consequential: cons,
-                        approvalSummary: summary, undoable: undoable, timeoutSeconds: (s["timeout_seconds"] as? NSNumber)?.doubleValue)
+                        approvalSummary: summary, undoable: undoable, timeoutSeconds: try parseTimeout(s["timeout_seconds"], where: w))
         // A gated step with no summary is allowed: the card says so and still shows what will be done.
         if let sum = summary {
             for name in placeholders(in: sum) where !declared.contains(name) {
@@ -197,6 +199,18 @@ public struct ReplayTask {
         if let t = step.timeoutSeconds, !(t > 0 && t <= 3600) { throw Invalid("\(w) timeout_seconds must be above 0 and at most 3600") }
         return step
     }
+
+    /// Absent is fine. Present must be a real number, not a bool, string or null.
+    static func parseTimeout(_ v: Any?, where w: String) throws -> Double? {
+        guard let v else { return nil }
+        guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else {
+            throw Invalid("\(w) timeout_seconds must be a number")
+        }
+        return n.doubleValue
+    }
+
+    static let maxAnchors = 16
+    static let maxTaskBytes = 1_000_000
 
     static func parseValue(_ v: Any, declared: Set<String>, where w: String) throws -> ValueRef {
         guard let o = v as? [String: Any] else { throw Invalid("\(w) has a value that is not {input} or {constant}") }
@@ -221,6 +235,7 @@ public struct ReplayTask {
             guard let d = try? Descriptor.load(from: JSONSerialization.data(withJSONObject: ["target": t])) else {
                 throw Invalid("\(w) has a check with an unusable target")
             }
+            if (d.anchors?.count ?? 0) > maxAnchors { throw Invalid("\(w) has a check target with more than \(maxAnchors) anchors") }
             target = d
         }
         var value: ValueRef?
