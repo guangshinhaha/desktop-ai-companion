@@ -20,6 +20,8 @@ public final class CaptureSession {
     public func handle(_ type: CGEventType, _ event: CGEvent) {
         switch type {
         case .leftMouseDown:
+            // The second click of a double-click is the same press.
+            guard event.getIntegerValueField(.mouseEventClickState) <= 1 else { return }
             guard let el = source.element(at: event.location), inTargetApp(el) else { return }
             guard let t = Classifier.classify(el) else { return }
             // A click on a field only focuses it. A step starts when the officer types.
@@ -31,11 +33,16 @@ public final class CaptureSession {
             let flags = event.flags
             let code = event.getIntegerValueField(.keyboardEventKeycode)
             let isSubmit = Classifier.isSubmitKey(keyCode: code)
-            let isText = Classifier.isTextKey(keyCode: code, command: flags.contains(.maskCommand), control: flags.contains(.maskControl))
-            guard isText || isSubmit else { return }
+            let cmd = flags.contains(.maskCommand)
+            let isPaste = Classifier.isPasteKey(keyCode: code, command: cmd)
+            let isText = Classifier.isTextKey(keyCode: code, command: cmd, control: flags.contains(.maskControl))
+            guard isText || isSubmit || isPaste else { return }
             guard let el = source.focusedElement(), inTargetApp(el) else { return }
             guard let t = Classifier.classify(el) else { return }
+            // Space or Return on a focused button activates it, the same as a click.
+            if t.kind == .press { if Classifier.isActivationKey(keyCode: code) { builder.pressed(t) }; return }
             if isSubmit { if t.kind == .text { uncapturedSubmitKeys += 1 }; return }
+            // A paste fills a field the same as typing does. Its content is never read.
             if t.kind == .text || t.kind == .secure || t.kind == .select { builder.typed(into: t) }
         default:
             return

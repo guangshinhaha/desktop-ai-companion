@@ -36,6 +36,7 @@ public final class Recorder {
     let session: CaptureSession
     private var signalSources: [DispatchSourceSignal] = []
     private var stopped = false
+    private var woken: [(AXUIElement, String)] = []
 
     public init(_ options: Options) {
         self.options = options
@@ -58,9 +59,16 @@ public final class Recorder {
             throw Failure.notRunning(options.appBundle)
         }
         // Browsers build the page's accessibility tree only when asked (same two writes as AXApp.wake).
+        // Turned back off on stop when this run turned them on, so an idle browser is left as found.
         let el = AXUIElementCreateApplication(app.processIdentifier)
-        _ = AXUIElementSetAttributeValue(el, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        _ = AXUIElementSetAttributeValue(el, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        for attr in ["AXEnhancedUserInterface", "AXManualAccessibility"] {
+            var v: CFTypeRef?
+            let wasOn = AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success && (v as? Bool) == true
+            if !wasOn {
+                _ = AXUIElementSetAttributeValue(el, attr as CFString, kCFBooleanTrue)
+                woken.append((el, attr))
+            }
+        }
     }
 
     /// Blocks until stop. Returns the file's step count.
@@ -81,7 +89,7 @@ public final class Recorder {
         // Both are already off here (stop() ran). Write the file.
         guard session.builder.stepCount > 0 else { throw Failure.noSteps }
         let data = try session.builder.json()
-        try data.write(to: URL(fileURLWithPath: options.out), options: .atomic)
+        try Self.writePrivate(data, to: options.out)
         if session.uncapturedSubmitKeys > 0 {
             log("note: Return pressed in a field \(session.uncapturedSubmitKeys) time(s) is not recorded; click the button instead.")
         }
@@ -94,6 +102,8 @@ public final class Recorder {
         stopped = true
         tap.stop()
         indicator.hide()
+        for (el, attr) in woken { _ = AXUIElementSetAttributeValue(el, attr as CFString, kCFBooleanFalse) }
+        woken = []
         signalSources.forEach { $0.cancel() }
         signalSources = []
         NSApplication.shared.stop(nil)
@@ -104,5 +114,23 @@ public final class Recorder {
         }
     }
 
-    func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+    /// Owner-only, and never over an existing file.
+    nonisolated static func writePrivate(_ data: Data, to path: String) throws {
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "cannot create \(path): \(String(cString: strerror(errno)))"])
+        }
+        defer { close(fd) }
+        var off = 0
+        try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            while off < buf.count {
+                let n = write(fd, buf.baseAddress! + off, buf.count - off)
+                if n < 0 { throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "write failed: \(String(cString: strerror(errno)))"]) }
+                off += n
+            }
+        }
+    }
+
+    /// A closed stderr (terminal gone) must not abort the process.
+    func log(_ s: String) { fputs(s + "\n", stderr) }
 }

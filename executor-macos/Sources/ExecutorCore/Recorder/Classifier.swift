@@ -29,6 +29,30 @@ public enum Classifier {
         role == secureRole || subrole == secureRole
     }
 
+    /// A text field that names itself a password but is not exposed as secure is treated as one.
+    /// Wrong in the safe direction: the field is skipped and becomes a precondition.
+    public static func looksLikePassword(label: String?, domId: String?) -> Bool {
+        let hay = [label, domId].compactMap { $0 }.joined(separator: " ").lowercased()
+        return ["password", "passcode", "passwd", "pwd", "kata laluan"].contains(where: hay.contains)
+    }
+
+    static let personalPatterns = [
+        "[STFGMstfgm][0-9]{7}[A-Za-z]",                 // NRIC / FIN
+        "[0-9]{6,}",                                    // long digit runs (phone, ids)
+        "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+",             // email address
+    ]
+
+    /// Labels and ids come from the page, so one can carry a person's data (a link named after a
+    /// citizen). A label that contains an NRIC, an email or a long number is dropped. A name alone
+    /// cannot be detected; the review screen (#26) is where the officer sees every label.
+    public static func scrub(_ s: String?) -> String? {
+        guard var t = s?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+        for p in personalPatterns where t.range(of: p, options: .regularExpression) != nil { return nil }
+        // Braces mean "input reference" in a summary; a label never gets to be one.
+        t = t.replacingOccurrences(of: "{", with: "(").replacingOccurrences(of: "}", with: ")")
+        return t.count > maxLabel ? String(t.prefix(maxLabel)) : t
+    }
+
     public static func kind(role: String?, subrole: String?) -> TargetKind? {
         if isSecure(role: role, subrole: subrole) { return .secure }
         guard let role else { return nil }
@@ -47,13 +71,17 @@ public enum Classifier {
             let role = cur.string("AXRole")
             let subrole = cur.string("AXSubrole")
             if let kind = kind(role: role, subrole: subrole), let role {
+                let domId = scrub(cur.string("AXDOMIdentifier"))
                 if kind == .secure {
-                    // Name and role only. No path walk, nothing else is touched.
-                    let d = Descriptor(role: role, label: label(of: cur, role: role), domId: cur.string("AXDOMIdentifier"))
+                    // Name and role only: title or linked label, never a placeholder. No path walk.
+                    let d = Descriptor(role: role, label: label(of: cur, role: role, secure: true), domId: domId)
                     return Target(kind: .secure, descriptor: d)
                 }
-                let d = Descriptor(role: role, label: label(of: cur, role: role), domId: cur.string("AXDOMIdentifier"),
-                                   path: path(to: cur, role: role))
+                let lbl = label(of: cur, role: role, secure: false)
+                if kind == .text, looksLikePassword(label: lbl, domId: domId) {
+                    return Target(kind: .secure, descriptor: Descriptor(role: role, label: lbl, domId: domId))
+                }
+                let d = Descriptor(role: role, label: lbl, domId: domId, path: path(to: cur, role: role))
                 return Target(kind: kind, descriptor: d)
             }
             if role == "AXWindow" || role == "AXWebArea" { return nil }
@@ -62,25 +90,19 @@ public enum Classifier {
         return nil
     }
 
-    static func clip(_ s: String) -> String {
-        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.count > maxLabel ? String(t.prefix(maxLabel)) : t
-    }
-
     /// Title, description, the linked label element, then placeholder. Same order as the resolver's snapshot.
-    static func label(of el: ElementReading, role: String) -> String? {
+    static func label(of el: ElementReading, role: String, secure: Bool) -> String? {
         var l = el.string("AXTitle") ?? el.string("AXDescription")
         if l == nil, let t = el.element("AXTitleUIElement") {
             l = t.string("AXTitle") ?? t.staticText()
         }
-        if l == nil { l = el.string("AXPlaceholderValue") }
-        if l == nil, ["AXButton", "AXLink", "AXMenuButton", "AXTab"].contains(role) {
+        if l == nil, !secure { l = el.string("AXPlaceholderValue") }
+        if l == nil, !secure, ["AXButton", "AXLink", "AXMenuButton", "AXTab"].contains(role) {
             for c in el.children().prefix(5) {
                 if c.string("AXRole") == "AXStaticText", let t = c.staticText() { l = t; break }
             }
         }
-        guard let l, !clip(l).isEmpty else { return nil }
-        return clip(l)
+        return scrub(l)
     }
 
     /// `["AXWebArea", "AXTextField:2"]`: the web area (if any), then the Nth element of this role below
@@ -120,7 +142,11 @@ public enum Classifier {
         53,                     // escape
         114, 115, 116, 117, 119, 121, // help, home, page up, forward delete, end, page down
         123, 124, 125, 126,     // arrows
+        122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90, // F1-F20
     ]
+
+    public static func isActivationKey(keyCode: Int64) -> Bool { keyCode == 49 || isSubmitKey(keyCode: keyCode) }
+    public static func isPasteKey(keyCode: Int64, command: Bool) -> Bool { command && keyCode == 9 }
 
     public static func isTextKey(keyCode: Int64, command: Bool, control: Bool) -> Bool {
         !command && !control && !nonTextKeyCodes.contains(keyCode)

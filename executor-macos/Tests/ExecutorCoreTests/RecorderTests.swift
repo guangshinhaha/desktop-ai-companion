@@ -310,4 +310,99 @@ final class RecorderTests: XCTestCase {
         XCTAssertEqual(EventTap.mask,
                        (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.keyDown.rawValue))
     }
+
+    // MARK: found by the interrogation
+
+    func testLabelsWithPersonalDataPatternsAreDropped() throws {
+        let f = Form(); let (s, src) = session(f)
+        let link = FakeEl("AXLink", label: "Tan Wei Ming S1234567A", domId: "row-S7654321B", log: f.log)
+        let mail = FakeEl("AXButton", label: "Mail zq@school.example.test", log: f.log)
+        let phone = FakeEl("AXTextField", label: "Call 91234567", log: f.log)
+        press(s, src, link, at: CGPoint(x: 1, y: 1))
+        press(s, src, mail, at: CGPoint(x: 2, y: 2))
+        type(s, src, into: phone, "z")
+        let text = try json(s).text
+        for v in ["S1234567A", "S7654321B", "Tan Wei", "zq@school", "91234567"] {
+            XCTAssertFalse(text.contains(v), v)
+        }
+    }
+
+    func testBraceInLabelCannotBecomeAnInputReference() throws {
+        let f = Form(); let (s, src) = session(f)
+        press(s, src, FakeEl("AXButton", label: "Export {csv}", log: f.log), at: CGPoint(x: 1, y: 1))
+        let step = (try json(s).obj["steps"] as! [[String: Any]])[0]
+        XCTAssertFalse((step["approval"] as! [String: Any])["summary"] as! String == "" )
+        XCTAssertFalse(((step["approval"] as! [String: Any])["summary"] as! String).contains("{csv}"))
+    }
+
+    func testFieldNamedPasswordWithoutSecureSubroleIsStillAPrecondition() throws {
+        let f = Form(); let (s, src) = session(f)
+        let pw = FakeEl("AXTextField", label: "Password", domId: "password", log: f.log)
+        type(s, src, into: pw, "hunter2")
+        let byId = FakeEl("AXTextField", domId: "user-pwd", log: f.log)
+        type(s, src, into: byId, "x")
+        XCTAssertEqual(s.builder.stepCount, 0)
+        XCTAssertEqual(s.builder.preconditionCount, 2)
+        XCTAssertFalse(try json(s).text.contains("hunter2"))
+    }
+
+    func testSecureFieldNeverReadsPlaceholderOrPathOrValue() throws {
+        let f = Form(); let (s, src) = session(f)
+        let pw = FakeEl("AXTextField", ["AXPlaceholderValue": "Your NRIC is the default"], subrole: "AXSecureTextField",
+                        domId: "pw", log: f.log)
+        let g = FakeEl("AXGroup", log: f.log, kids: [pw]); _ = g
+        type(s, src, into: pw, "z")
+        let asked = Set(f.log.requests.filter { $0.role == "AXTextField" }.map { $0.attribute })
+        XCTAssertFalse(asked.contains("AXPlaceholderValue"))
+        XCTAssertFalse(asked.contains("AXValue"))
+        XCTAssertFalse(asked.contains("AXChildren"))
+        XCTAssertFalse(try json(s).text.contains("NRIC"))
+    }
+
+    func testDoubleClickIsOnePress() {
+        let f = Form(); let (s, src) = session(f)
+        src.byPoint.append((CGPoint(x: 3, y: 3), f.create))
+        let c1 = click(at: CGPoint(x: 3, y: 3)); c1.setIntegerValueField(.mouseEventClickState, value: 1)
+        let c2 = click(at: CGPoint(x: 3, y: 3)); c2.setIntegerValueField(.mouseEventClickState, value: 2)
+        s.handle(.leftMouseDown, c1); s.handle(.leftMouseDown, c2)
+        XCTAssertEqual(s.builder.stepCount, 1)
+    }
+
+    func testSpaceOrReturnOnAFocusedButtonIsAPress() throws {
+        let f = Form(); let (s, src) = session(f)
+        src.focused = f.create
+        s.handle(.keyDown, keyCodeEvent(49))
+        XCTAssertEqual(s.builder.stepCount, 1)
+        s.handle(.keyDown, keyCodeEvent(0))   // a letter on a button does nothing
+        XCTAssertEqual(s.builder.stepCount, 1)
+        XCTAssertEqual((try json(s).obj["steps"] as! [[String: Any]])[0]["consequential"] as? String, "yes")
+    }
+
+    func testPasteIntoAFieldIsAStepAndFunctionKeysAreNot() throws {
+        let f = Form(); let (s, src) = session(f)
+        src.focused = f.name
+        s.handle(.keyDown, keyCodeEvent(122))   // F1
+        XCTAssertEqual(s.builder.stepCount, 0)
+        s.handle(.keyDown, keyCodeEvent(9, flags: .maskCommand))   // cmd-v
+        XCTAssertEqual(s.builder.stepCount, 1)
+        XCTAssertEqual(((try json(s).obj["steps"] as! [[String: Any]])[0]["value"] as! [String: String]), ["input": "full_name"])
+    }
+
+    func testEmptyNameAndAuthorFallBack() throws {
+        let b = TaskBuilder(appBundle: "com.google.Chrome", name: " ", author: "")
+        XCTAssertEqual(b.name, "Recorded task")
+        XCTAssertEqual(b.author, "officer")
+    }
+
+    func testOutputFileIsOwnerOnlyAndNeverOverwrites() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rec-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("t.json").path
+        try Recorder.writePrivate(Data("{}".utf8), to: path)
+        let mode = (try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as! NSNumber).intValue
+        XCTAssertEqual(mode & 0o077, 0, "group/other can read the recording")
+        XCTAssertThrowsError(try Recorder.writePrivate(Data("x".utf8), to: path))
+        XCTAssertEqual(try String(contentsOfFile: path, encoding: .utf8), "{}")
+    }
 }

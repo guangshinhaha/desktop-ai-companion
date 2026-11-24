@@ -33,7 +33,7 @@ var ceiling = 30.0
 var i = 0
 @MainActor func value(_ flag: String) -> String {
     i += 1
-    guard i < args.count else { fail("\(flag) needs a value\n\(usage)") }
+    guard i < args.count, !args[i].hasPrefix("--") else { fail("\(flag) needs a value\n\(usage)") }
     return args[i]
 }
 while i < args.count {
@@ -54,8 +54,11 @@ while i < args.count {
     i += 1
 }
 if command == "record" {
-    guard let out else { fail("--out is required\n\(usage)") }
-    guard file == nil, window == nil else { fail("record takes --out, --app, --name and --author\n\(usage)") }
+    guard let out, !out.isEmpty else { fail("--out is required\n\(usage)") }
+    guard !taskName.trimmingCharacters(in: .whitespaces).isEmpty, !author.trimmingCharacters(in: .whitespaces).isEmpty else {
+        fail("--name and --author must not be empty")
+    }
+    guard !args.contains("--ceiling"), file == nil, window == nil else { fail("record takes --out, --app, --name and --author\n\(usage)") }
     do {
         _ = try Recorder(Recorder.Options(out: out, appBundle: bundle, name: taskName, author: author)).run()
         exit(0)

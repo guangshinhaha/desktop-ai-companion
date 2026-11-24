@@ -27,8 +27,8 @@ public final class TaskBuilder {
                 id: String? = nil, created: Date = Date()) {
         self.appBundle = appBundle
         self.appKey = Self.snake(appBundle.split(separator: ".").last.map(String.init) ?? "app", fallback: "app")
-        self.name = name
-        self.author = author
+        self.name = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Recorded task" : name
+        self.author = author.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "officer" : author
         self.id = id ?? "tsk_" + String((0..<8).map { _ in "0123456789abcdef".randomElement()! })
         self.created = created
     }
