@@ -277,7 +277,7 @@ The companion service checks each request against the route's classification cei
 
 | State | Allowed | Target |
 |---|---|---|
-| Idle | Shell process asleep; executor process not running | Near-zero CPU. Shell memory target set after the first Tauri build, then held |
+| Idle | Shell process asleep; executor process not running | 0.0% CPU on average over 60 s. Shell memory held at or under 20 MB physical footprint (`footprint <pid>`, canvas closed, no web view process). Set from #24: first Tauri build measured 11 MB on a dev Mac (RSS 61 MB, which counts shared system libraries). Canvas open adds a web content process of about 30 MB RSS and takes the shell to 17 MB footprint. #25 re-measures on a SEED Mac |
 | Recording | One listen-only event tap; accessibility queries on each event | No input lag the officer can notice on the target laptop |
 | Replay | Accessibility observers on the target app only | Step overhead (resolve plus check, excluding the app's own response time) under 300 ms on SEED. Measured on a slower machine before the pilot |
 
