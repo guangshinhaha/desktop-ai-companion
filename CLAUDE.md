@@ -1,11 +1,13 @@
 # Desktop AI Companion (working title)
 
 A thin desktop companion for Singapore public officers, built by GRL (GovTech).
-It covers Desk's jobs (draft, summarise, research) through the GovTech Harness,
-and does the operating work Desk can't: the officer records a task once, and the
+It does the operating work Desk can't: the officer records a task once, and the
 companion replays it by driving the real app's UI, verifying each step and
-pausing for a named officer's approval before consequential steps. Spec:
-`docs/prd.docx` (canonical), text copy in `docs/prd.md`.
+pausing for a named officer's approval before consequential steps. It also
+drafts and summarises, built in as an interim until it consolidates with Desk.
+Spec: `docs/prd.md` (source; regenerate `docs/prd.docx` with
+`python3 scripts/md2docx.py docs/prd.md docs/prd.docx`). Technical
+design: `docs/td.md`.
 
 shinstack-mode: auto
 shinstack-mode.deploy: ask
@@ -41,12 +43,18 @@ TODO: no code yet. Add real scripts here once the stack is chosen.
 
 ## Scope (from the PRD)
 
-- GRL builds: recorder client, replay executor, task library, approval
-  experience, orchestrator. Everything else integrates (Harness, MCP gateway,
-  GovBrain, Muninn, Assistant Desk governance). Don't rebuild any of those.
-- Current phase: Phase 0, one task recorded and replayed on a SEED MacBook,
-  captured on video. Nothing may depend on COMET access.
-- Every feature must improve recording, replay or the library until Phase 2 ends.
+- GRL builds: recorder, replay executor, task library, approval experience,
+  thin orchestrator. Drafting, audit and the library store are interim builds
+  behind adapters, consolidated with Desk, Harness, Muninn and Assistant Desk
+  later. Reuse their inner-source code where access is granted; never depend on
+  that access until it is.
+- Model calls go only through one adapter, to a route cleared for the data's
+  classification. The client never holds model credentials.
+- Current phase: Phase 0, one task recorded and replayed on a SEED MacBook
+  against a stand-in app with synthetic data, captured on video. No model, no
+  server. Nothing may depend on COMET access.
+- Until Phase 2 ends, every feature must improve recording, replay or the
+  library. The one exception is drafting and summarising.
 
 ## Performance rules (laggy managed laptops)
 
