@@ -152,6 +152,10 @@ final class ReplayTaskTests: XCTestCase {
         XCTAssertThrowsError(try makeTask { steps(&$0) { $0[0]["value"] = "Aiden Tan" } })
     }
 
+    func testPasswordFieldTargetIsRefused() {
+        XCTAssertThrowsError(try makeTask { steps(&$0) { $0[0]["target"] = ["role": "AXSecureTextField", "label": "Password"] } })
+    }
+
     func testTwoAppsAreRefused() {
         XCTAssertThrowsError(try makeTask { $0["apps"] = [["key": "chrome", "bundle": "a"], ["key": "x", "bundle": "b"]] })
     }

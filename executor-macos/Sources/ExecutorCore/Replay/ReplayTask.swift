@@ -124,6 +124,8 @@ public struct ReplayTask {
               let target = try? Descriptor.load(from: JSONSerialization.data(withJSONObject: ["target": t])) else {
             throw Invalid("\(w) needs a usable target")
         }
+        // Passwords are never an input (PRD R-2): the recorder turns them into a precondition.
+        if target.role == "AXSecureTextField" { throw Invalid("\(w) targets a password field, which replay never fills") }
         var value: ValueRef?
         if let v = s["value"] { value = try parseValue(v, declared: declared, where: w) }
         switch action {
