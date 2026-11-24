@@ -289,8 +289,8 @@ impl Draft {
     }
 
     /// Drops inputs that a step used before an edit and none uses now, and fixes the approval
-    /// summaries that named them (`replacement` for a constant, else the token is removed).
-    fn settle(&mut self, before: &BTreeSet<String>, replacement: &BTreeMap<String, String>) {
+    /// summaries that named them (the token is removed; a value is never copied into a summary).
+    fn settle(&mut self, before: &BTreeSet<String>) {
         let after = used_inputs(&self.task);
         let gone: Vec<String> = before.difference(&after).cloned().collect();
         if gone.is_empty() {
@@ -302,10 +302,9 @@ impl Draft {
         for s in self.task["steps"].as_array_mut().into_iter().flatten() {
             let Some(mut sum) = s["approval"]["summary"].as_str().map(str::to_string) else { continue };
             for g in &gone {
-                sum = match replacement.get(g) {
-                    Some(r) => sum.replace(&format!("{{{g}}}"), &no_braces(r)),
-                    None => remove_token(&sum, g),
-                };
+                // The token is removed, never replaced by a value: a constant's text lives in its
+                // own step and nowhere else, so deleting that step deletes the value.
+                sum = remove_token(&sum, g);
             }
             s["approval"]["summary"] = json!(sum.trim());
         }
@@ -318,7 +317,7 @@ impl Draft {
         }
         let before = used_inputs(&self.task);
         self.task["steps"].as_array_mut().unwrap().remove(i);
-        self.settle(&before, &BTreeMap::new());
+        self.settle(&before);
         Ok(())
     }
 
@@ -364,9 +363,7 @@ impl Draft {
                 *c = json!({ "kind": "value_equals", "constant": value, "confirmed_no_personal_data": true });
             }
         }
-        let mut rep = BTreeMap::new();
-        rep.insert(name, value.to_string());
-        self.settle(&before, &rep);
+        self.settle(&before);
         Ok(())
     }
 

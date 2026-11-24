@@ -431,3 +431,18 @@ fn iso_dates_are_right() {
     assert_eq!(iso_utc(1_709_251_199), "2024-02-29T23:59:59Z");
     assert_eq!(iso_utc(1_795_000_000), "2026-11-18T11:06:40Z");
 }
+
+#[test]
+fn a_constant_value_is_never_copied_into_a_summary_even_after_its_step_is_deleted() {
+    let dir = tmp("summary-leak");
+    let mut d = draft();
+    edit(&mut d, json!({"op":"mark_constant","step":"s1","value":SECRET,"confirmed_no_personal_data":true})).unwrap();
+    assert!(step(&d.view(), "s4").to_string().find(SECRET).is_none(), "not copied while the step exists");
+    edit(&mut d, json!({"op":"delete_step","step":"s1"})).unwrap();
+    let mut store = open(&dir);
+    let (id, v) = d.save(&mut store, "officer", NOW).unwrap();
+    let body = store.task_body(&id, v).unwrap().unwrap();
+    assert!(!body.contains(SECRET), "the value left with its step");
+    assert!(validate(&body, &dir).0);
+    assert!(!decrypted_dump(&dir).contains(SECRET));
+}
