@@ -10,11 +10,17 @@ public final class AXApp {
     public enum Failure: Error, CustomStringConvertible {
         case notTrusted
         case notRunning(String)
+        /// More than one process runs this bundle id and no pid was given. A replay never guesses which.
+        case ambiguous(String, [pid_t])
+        case pidNotThisApp(pid_t, String)
         public var description: String {
             switch self {
             case .notTrusted:
                 return "Accessibility permission is not granted to this process (System Settings > Privacy & Security > Accessibility)"
             case .notRunning(let b): return "no running app with bundle id \(b)"
+            case .ambiguous(let b, let pids):
+                return "ambiguous: \(pids.count) processes run \(b) (pids \(pids.map(String.init).joined(separator: ", "))); pass --pid"
+            case .pidNotThisApp(let p, let b): return "pid \(p) is not a running \(b)"
             }
         }
     }
@@ -31,7 +37,10 @@ public final class AXApp {
     final class Signal { var fired = false }
 
     /// `observe: false` skips the notification subscription, for a caller that only takes snapshots.
-    public init(bundleId: String, windowTitleContains: String? = nil, observe: Bool = true) throws {
+    /// `pid` names one process. It must run `bundleId`. With `requireUnique` and no `pid`, more than one
+    /// process with a window is an error instead of a pick (a replay targets one specific process).
+    public init(bundleId: String, windowTitleContains: String? = nil, observe: Bool = true,
+                pid wanted: pid_t? = nil, requireUnique: Bool = false) throws {
         guard AXIsProcessTrusted() else { throw Failure.notTrusted }
         // More than one process can share a bundle id (a second browser profile). Take the one with a window.
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
@@ -43,7 +52,15 @@ public final class AXApp {
                   let ws = v as? [AnyObject] else { return false }
             return !ws.isEmpty
         }
-        guard let app = running.first(where: hasWindow) ?? running.first else {
+        if let wanted {
+            guard running.contains(where: { $0.processIdentifier == wanted }) else { throw Failure.pidNotThisApp(wanted, bundleId) }
+        } else if requireUnique {
+            let candidates = running.filter(hasWindow)
+            if candidates.count > 1 { throw Failure.ambiguous(bundleId, candidates.map(\.processIdentifier).sorted()) }
+        }
+        // A replay never falls back to a process it could not show has a window.
+        guard let app = running.first(where: { wanted != nil ? $0.processIdentifier == wanted : hasWindow($0) })
+                ?? (requireUnique ? nil : running.first) else {
             throw Failure.notRunning(bundleId)
         }
         pid = app.processIdentifier
@@ -90,7 +107,12 @@ public final class AXApp {
     /// Blocks until the app sends an accessibility event, or `timeout` seconds pass.
     public func wait(_ timeout: TimeInterval) {
         signal.fired = false
+        // A one-shot timer at the deadline keeps the run loop alive when there is no observer source
+        // (AXObserverCreate failed); without one, the call returns at once and the caller spins.
+        let timer = CFRunLoopTimerCreateWithHandler(nil, CFAbsoluteTimeGetCurrent() + timeout, 0, 0, 0) { _ in }
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, .defaultMode)
         _ = CFRunLoopRunInMode(.defaultMode, timeout, true)
+        CFRunLoopTimerInvalidate(timer)
     }
 
     /// A snapshot of the chosen window, or nil when the app has no window yet.
@@ -121,7 +143,7 @@ public final class AXApp {
     private func build(_ el: AXUIElement, depth: Int, count: inout Int) -> UINode {
         count += 1
         let attrs = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, "AXDOMIdentifier",
-                     kAXPlaceholderValueAttribute, kAXTitleUIElementAttribute, kAXChildrenAttribute]
+                     kAXPlaceholderValueAttribute, kAXTitleUIElementAttribute, kAXChildrenAttribute, kAXSubroleAttribute]
         var raw: CFArray?
         var vals: [Any?] = Array(repeating: nil, count: attrs.count)
         if AXUIElementCopyMultipleAttributeValues(el, attrs as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
@@ -151,7 +173,7 @@ public final class AXApp {
                 kids.append(build(c, depth: depth + 1, count: &count))
             }
         }
-        return UINode(role: role, label: label, domId: s(3), children: kids, handle: el)
+        return UINode(role: role, label: label, domId: s(3), children: kids, handle: el, subrole: s(7))
     }
 
     private func string(_ el: AXUIElement, _ attr: String) -> String? {

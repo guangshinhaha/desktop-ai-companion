@@ -9,9 +9,12 @@ public final class UINode {
     public internal(set) weak var parent: UINode?
     /// The live element behind the snapshot (an `AXUIElement` in the macOS adapter).
     public let handle: Any?
+    /// The accessibility subrole (`AXDialog`, `AXApplicationDialog`), where the app gives one.
+    public let subrole: String?
 
     public init(role: String, label: String? = nil, domId: String? = nil,
-                children: [UINode] = [], handle: Any? = nil) {
+                children: [UINode] = [], handle: Any? = nil, subrole: String? = nil) {
+        self.subrole = subrole
         self.role = role; self.label = label; self.domId = domId
         self.children = children; self.handle = handle
         for c in children { c.parent = self }
