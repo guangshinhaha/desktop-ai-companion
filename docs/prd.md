@@ -383,6 +383,7 @@ Each phase ends in a decision, not just a delivery: continue, narrow or stop, ju
 | Stand-in apps flatter replay | Replay works on the stand-in apps and fails on the real workflow | The real-workflow reliability bar is the Phase 1 gate. Stand-in results never count as Phase 1 evidence |
 | Solo capacity | One pilot cannot carry the client, executor, recorder, chat, library and audit | Strict build order. Chat stays thin. Research and wider memory are deferred. Narrowing criterion in Section 10 |
 | Model and Harness dependency | Route limits or roadmap changes constrain the product | One model adapter. Phase 0 needs no model |
+| Consumer agents set the expectation | Officers compare the companion with Grok Bot, Muse or Dots, which do a task from a plain request with no recording, and find record-once slow | Recording a task takes one normal run of it. From Phase 1, the router offers to record any task it has no recording for. Phase 3 adds MCP tools and bounded recovery. The approval gate is never relaxed to close the gap. See Appendix B |
 
 ## 13. Open questions and decisions needed
 
@@ -426,3 +427,28 @@ A Katonic white paper dated 21 November 2026 makes the matching governance point
 Inside GovTech, the Employee Digital HR Concierge is the reference implementation for the Harness pattern: an officer-facing interface, an agent on the GovTech Harness, downstream systems reached through an MCP gateway, and each turn assembled from instructions, user profile, available tools and conversation history. The companion adds the desktop client and the recorded replay.
 
 For readers new to the products: Desk is GovTech's AI workspace for drafting, deciding and delivering, with model routing by task and workflow automation, available to every officer. Pair is the chat assistant, with about 98,500 monthly users and clearance for data up to Restricted / Sensitive Normal. The Assistant Desk suite adds governance around agents: a registry of who owns each agent and what it does, customisable rules, sanctioned tools, hygiene checks, and controls such as blocking file deletion and external email.
+
+### Why not Grok Bot, Muse or Dots
+
+Three consumer agents launched between August and September 2026 do the operating job this PRD targets: SpaceXAI's Grok Bot, Meta's Muse and OpenAI's Dots. A reviewer will ask why an agency should not use one of them. The notes below come from launch announcements and news coverage, not vendor documentation.
+
+- **Grok Bot** (SpaceXAI, 11 August 2026). Each bot gets its own cloud computer, signs into the user's apps and websites, and works through them by vision, clicking and typing like a person. It keeps running when the user's device is off.
+- **Muse** (Meta, 8 September 2026). A personal agent with a Mac app that works on the user's files, mail, calendar and notes from a cloud virtual machine. It asks before sensitive actions. Control of macOS apps and a realtime avatar were announced for later.
+- **Dots** (OpenAI, 29 September 2026). Always-on agents inside ChatGPT that take tasks, connect to the user's apps and can control the user's computer. Several can run at once.
+
+After Phase 3, the companion matches them on one job, operating applications for the officer. It does not match them on features.
+
+| Job | Grok Bot, Muse, Dots | The companion after Phase 3 |
+|---|---|---|
+| Operate applications for the user | From a plain request, with no demonstration | Recorded tasks, plus MCP tools from Phase 3 |
+| Do a task it was never shown | Yes | No, by design |
+| Work in the background with the laptop closed | Yes, on a vendor cloud computer | No. Replay runs on the officer's device |
+| Mail, calendar and personal connectors | Built in | Through the MCP gateway only (Phase 3) |
+| Drafting and chat | The vendor's frontier models | A model route cleared for the data |
+| Same result on every run, each step checked | No. Vision interprets the screen each time | Yes (Section 7.3) |
+| Approval before a commit, with a tamper-evident audit trail | Partial. Muse asks before sensitive actions | Yes (Section 7.6) |
+| The officer's credentials stay on government devices | No. The vendor's cloud signs into the user's apps | Yes |
+| Values redacted at capture, data sent only to a cleared route | No | Yes (Section 9) |
+| A team library and handover to a successor | No | Yes (Phase 2) |
+
+The position is the same job in a form an agency can approve. The design that makes these agents capable is the one that keeps them off a government device: the user's logins sit in a vendor's cloud, and screen contents go to the vendor's models. Recording a task once is the price the companion pays for repeatable runs, an audit trail and an approval gate. The risk this creates is in Section 12.
