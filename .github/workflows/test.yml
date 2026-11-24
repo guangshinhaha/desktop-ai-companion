@@ -1,0 +1,25 @@
+name: test
+# Runs scripts/test.sh (every package) on macOS for each PR. Separate from the
+# gantry-managed ci.yml, which this file does not edit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  test:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: swift --version && node --version
+      - run: scripts/test.sh
