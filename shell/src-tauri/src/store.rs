@@ -89,46 +89,74 @@ impl Keychain {
 /// errSecDuplicateItem
 const DUPLICATE_ITEM: i32 = -25299;
 
-impl Keychain {
-    fn read(&self) -> Option<Result<Key>> {
-        let existing =
-            security_framework::passwords::get_generic_password(&self.service, &self.account).ok()?;
-        Some(
-            <[u8; 32]>::try_from(existing)
+/// Outcome of an add-only keychain write.
+pub enum AddOutcome {
+    Added,
+    /// The item already exists (another first open won the race).
+    Duplicate,
+    Failed(String),
+}
+
+/// The two keychain calls the key logic needs. [`Keychain`] uses the real macOS keychain;
+/// tests inject an in-memory backend so CI never touches a keychain.
+pub trait KeychainBackend {
+    fn get(&self) -> Option<Vec<u8>>;
+    /// Add-only: must never overwrite an existing item.
+    fn add(&self, data: &[u8]) -> AddOutcome;
+}
+
+/// Get, else create with an add-only call. If two first opens race, one add succeeds and the
+/// other gets a duplicate outcome and reads the winner's key, so both end with the same key.
+pub fn key_via(backend: &dyn KeychainBackend) -> Result<(Key, bool)> {
+    let read = |b: &dyn KeychainBackend| {
+        b.get().map(|v| {
+            <[u8; 32]>::try_from(v)
                 .map(Key)
-                .map_err(|_| StoreError::Key("stored key has the wrong length".into())),
-        )
+                .map_err(|_| StoreError::Key("stored key has the wrong length".into()))
+        })
+    };
+    if let Some(k) = read(backend) {
+        return Ok((k?, false));
+    }
+    let mut fresh = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut fresh))
+        .map_err(|e| StoreError::Key(e.to_string()))?;
+    match backend.add(&fresh) {
+        AddOutcome::Added => Ok((Key(fresh), true)),
+        AddOutcome::Duplicate => match read(backend) {
+            Some(k) => Ok((k?, false)),
+            None => Err(StoreError::Key("key item vanished during creation".into())),
+        },
+        AddOutcome::Failed(m) => Err(StoreError::Key(m)),
     }
 }
 
-impl KeySource for Keychain {
-    /// Get, else create with an add-only call. If two first opens race, one add succeeds and the
-    /// other gets a duplicate error and reads the winner's key, so both end with the same key.
-    fn key_and_origin(&self) -> Result<(Key, bool)> {
+impl KeychainBackend for Keychain {
+    fn get(&self) -> Option<Vec<u8>> {
+        security_framework::passwords::get_generic_password(&self.service, &self.account).ok()
+    }
+    fn add(&self, data: &[u8]) -> AddOutcome {
         use core_foundation::data::CFData;
         use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass};
-        if let Some(k) = self.read() {
-            return Ok((k?, false));
-        }
-        let mut fresh = [0u8; 32];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut fresh))
-            .map_err(|e| StoreError::Key(e.to_string()))?;
         let added = ItemAddOptions::new(ItemAddValue::Data {
             class: ItemClass::generic_password(),
-            data: CFData::from_buffer(&fresh),
+            data: CFData::from_buffer(data),
         })
         .set_service(&self.service)
         .set_account_name(&self.account)
         .add();
         match added {
-            Ok(()) => Ok((Key(fresh), true)),
-            Err(e) if e.code() == DUPLICATE_ITEM => match self.read() {
-                Some(k) => Ok((k?, false)),
-                None => Err(StoreError::Key("key item vanished during creation".into())),
-            },
-            Err(e) => Err(StoreError::Key(e.to_string())),
+            Ok(()) => AddOutcome::Added,
+            Err(e) if e.code() == DUPLICATE_ITEM => AddOutcome::Duplicate,
+            Err(e) => AddOutcome::Failed(e.to_string()),
         }
+    }
+}
+
+impl KeySource for Keychain {
+    fn key_and_origin(&self) -> Result<(Key, bool)> {
+        key_via(self)
     }
 }
 

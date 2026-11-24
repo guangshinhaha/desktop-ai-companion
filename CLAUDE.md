@@ -64,6 +64,7 @@ Every milestone description has these parts, so `/shinstack:coordinate` can run 
 ## Commands
 
 - Test everything: `scripts/test.sh` (runs every package, exits non-zero if any fails).
+- Real-keychain store tests (ignored in CI, run on a signed-in Mac): `cd shell/src-tauri && cargo test --test store -- --ignored`.
 - Needs Swift 6 (Xcode), Node 24+ (TypeScript runs via Node type stripping; no install step yet) and Rust (`brew install rustup`, `rustup-init -y`) for `shell/`.
 - Shell: `cd shell/src-tauri && cargo build --release`; run `target/release/companion-shell` (menu bar, Cmd+Shift+Space opens the canvas). `--ping-executor` does the sidecar ping headless; set `EXECUTOR_BIN` to the executor binary.
 - One package: `cd executor-macos && swift test`, or `cd <stand-in|harness|schema> && npm test`.
