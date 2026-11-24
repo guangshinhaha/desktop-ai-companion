@@ -1,0 +1,16 @@
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 20px 24px; font: 15px/1.45 -apple-system, system-ui, sans-serif; background: Canvas; color: CanvasText; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 15px; margin: 20px 0 6px; }
+ul, ol { padding-left: 20px; }
+li { margin: 8px 0; }
+input[type="text"], select { font: inherit; padding: 6px 8px; border: 1px solid GrayText; border-radius: 6px; background: transparent; color: inherit; }
+input[type="text"]:focus, select:focus, button:focus-visible { outline: 2px solid Highlight; outline-offset: 1px; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.flag { margin-top: 4px; padding: 2px 8px; border-radius: 4px; border-left: 4px solid GrayText; }
+.flag.unknown { border-left-color: #b45309; }
+.flag.consequential { border-left-color: #b91c1c; }
+.constant { margin-top: 8px; display: grid; gap: 6px; }
+[role="alert"] { color: #b91c1c; font-weight: 600; }

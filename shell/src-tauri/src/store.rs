@@ -289,6 +289,45 @@ impl Store {
         Ok(next)
     }
 
+    /// Saves a task as the next version and appends its `task_saved` audit record in the same
+    /// transaction, so a task never exists without its record or the reverse. `build` gets the
+    /// version number and returns the body; an error from it rolls everything back. The audit
+    /// record names the task and officer only, never a value.
+    pub fn save_task_audited(
+        &mut self,
+        id: &str,
+        name: &str,
+        officer: &str,
+        now: i64,
+        build: impl FnOnce(i64) -> Result<String>,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        let next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM tasks WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let body = build(next)?;
+        tx.execute(
+            "INSERT INTO tasks (id, version, name, body, saved_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, next, name, body, now],
+        )?;
+        let reference = format!("{id}@{next}");
+        let e = AuditEntry {
+            at: now,
+            officer,
+            event: "task_saved",
+            task: Some(&reference),
+            run: None,
+            item: None,
+            step: None,
+            shown: None,
+        };
+        append_in(&tx, &e)?;
+        tx.commit()?;
+        Ok(next)
+    }
+
     pub fn task_versions(&self, id: &str) -> Result<Vec<i64>> {
         let mut st = self.conn.prepare("SELECT version FROM tasks WHERE id = ?1 ORDER BY version")?;
         let rows = st.query_map([id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
