@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "node provisioning/server.ts",
+    "generate": "node data/generate.ts",
     "test": "node --test"
   }
 }
