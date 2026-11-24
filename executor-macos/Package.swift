@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v13)],
     targets: [
         .target(name: "ExecutorCore"),
+        .executableTarget(name: "executor-macos", dependencies: ["ExecutorCore"]),
         .testTarget(name: "ExecutorCoreTests", dependencies: ["ExecutorCore"]),
     ]
 )
