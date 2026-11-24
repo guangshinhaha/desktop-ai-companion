@@ -2,6 +2,7 @@
 //! so an idle shell holds no web view. No network calls.
 
 pub mod executor;
+pub mod store;
 
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
