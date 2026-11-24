@@ -26,8 +26,10 @@ jobs:
       contents: read
       pull-requests: read
     # gantry:optional
-    # with:
+    # gantry's node job needs a root package.json; test.yml runs the Node tests
+    # through scripts/test.sh instead.
+    with:
+      node: false
     #   runs-on: '["self-hosted","gantry"]'   # once your runner is up
     #   e2e: true
-    #   node: false   # if this repo's own workflow runs its tests
     #   codegen-command: pnpm prisma generate   # fail when committed generated files are stale
