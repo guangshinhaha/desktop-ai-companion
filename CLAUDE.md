@@ -24,7 +24,7 @@ Sessions here follow shinstack (the plugin must be installed) like a factory lin
 
 Companion rules:
 
-1. Work only issues labelled `ready`, oldest first, one at a time.
+1. Work only issues labelled `ready`, oldest first. Up to 3 builds run at once (Shin, 24 Nov), each in its own worktree, only on issues whose dependencies have merged and that touch different areas of the code. Verifiers and CI don't count toward the 3.
 2. Intake gate: if the issue has no testable "Done when" list, comment what's missing and stop.
 3. Tier comes from the issue's `risk:none|low|medium|high` label. If it has no `risk:` label, pick a tier, say which and why, and add the label.
 4. Anything touching recording capture, redaction, stored recordings, the approval gate, the audit trail, or OS permissions (screen recording, accessibility) is at least `risk:high`.
