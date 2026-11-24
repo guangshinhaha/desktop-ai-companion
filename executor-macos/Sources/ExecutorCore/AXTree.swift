@@ -52,23 +52,32 @@ public final class AXApp {
                   let ws = v as? [AnyObject] else { return false }
             return !ws.isEmpty
         }
-        if let wanted {
-            guard running.contains(where: { $0.processIdentifier == wanted }) else { throw Failure.pidNotThisApp(wanted, bundleId) }
-        } else if requireUnique {
-            let candidates = running.filter(hasWindow)
-            if candidates.count > 1 { throw Failure.ambiguous(bundleId, candidates.map(\.processIdentifier).sorted()) }
-        }
-        // A replay never falls back to a process it could not show has a window.
-        guard let app = running.first(where: { wanted != nil ? $0.processIdentifier == wanted : hasWindow($0) })
-                ?? (requireUnique ? nil : running.first) else {
-            throw Failure.notRunning(bundleId)
-        }
-        pid = app.processIdentifier
+        pid = try Self.choose(bundleId: bundleId, running: running.map(\.processIdentifier), wanted: wanted,
+                              requireUnique: requireUnique, hasWindow: { p in running.first { $0.processIdentifier == p }.map(hasWindow) ?? false })
         element = AXUIElementCreateApplication(pid)
         self.windowTitleContains = windowTitleContains
         AXUIElementSetMessagingTimeout(element, 2)
         wake()
         if observe { subscribe() }
+    }
+
+    /// Which process to read. `wanted` must be one of `running`. Without it, `requireUnique` makes
+    /// more than one process with a window an error instead of a pick. A replay never falls back to
+    /// a process it could not show has a window.
+    static func choose(bundleId: String, running: [pid_t], wanted: pid_t?, requireUnique: Bool,
+                       hasWindow: (pid_t) -> Bool) throws -> pid_t {
+        if let wanted {
+            guard running.contains(wanted) else { throw Failure.pidNotThisApp(wanted, bundleId) }
+            return wanted
+        }
+        if requireUnique {
+            let candidates = running.filter(hasWindow)
+            if candidates.count > 1 { throw Failure.ambiguous(bundleId, candidates.sorted()) }
+            guard let only = candidates.first else { throw Failure.notRunning(bundleId) }
+            return only
+        }
+        guard let p = running.first(where: hasWindow) ?? running.first else { throw Failure.notRunning(bundleId) }
+        return p
     }
 
     /// Browsers build the page's tree lazily. These two writes ask them to. Errors are expected
