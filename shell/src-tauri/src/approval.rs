@@ -4,6 +4,9 @@
 //! request and waits for each answer:
 //!   `approval.request {card}`  -> the officer decides; the answer is `{approved: bool}`.
 //!   `audit.append {event, step?, shown?, item?}` -> written through the store's API; the answer is `{seq}`.
+//!   `recover.request {request}` -> passed to the companion service's `POST /recover` (#34); the answer is the
+//!   service's answer object. Only a masked request (`values: "masked"`) goes: the shell never clears values.
+//!   No service, a refusal or a bad reply is an error, and the executor then asks the officer.
 //! The officer, the task reference, the run id and the time are the shell's: the executor cannot set them.
 //! No answer is never a yes: if the executor ends, or the officer's window closes, the run stops.
 //! Nothing here logs, prints or puts a value in an error.
@@ -116,11 +119,17 @@ pub fn drive<R: BufRead, W: Write>(
     now: &dyn Fn() -> i64,
     decide: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<Value, String> {
-    drive_with(reader, writer, store, ctx, start_id, now, decide, &mut |_| {}, &mut Observed::default(), &mut NoObserver)
+    drive_with(reader, writer, store, ctx, start_id, now, decide, &mut |_| {}, &mut Observed::default(), &mut NoObserver, &mut |_| None)
+}
+
+/// A recovery request the shell will pass on: an object of kind `recover` with its values masked.
+fn recovery_request_ok(r: &Value) -> bool {
+    r.is_object() && r["kind"] == "recover" && r["values"] == "masked"
 }
 
 /// `drive`, also passing each `run.progress` notification to `on_progress` and noting what it saw.
-/// A notification has no id and gets no reply.
+/// A notification has no id and gets no reply. `recover` sends a recovery request to the service and returns its
+/// answer, or None.
 #[allow(clippy::too_many_arguments)]
 pub fn drive_with<R: BufRead, W: Write>(
     reader: R,
@@ -133,6 +142,7 @@ pub fn drive_with<R: BufRead, W: Write>(
     on_progress: &mut dyn FnMut(&Value),
     seen: &mut Observed,
     obs: &mut dyn ItemObserver,
+    recover: &mut dyn FnMut(&Value) -> Option<Value>,
 ) -> Result<Value, String> {
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
@@ -221,6 +231,17 @@ pub fn drive_with<R: BufRead, W: Write>(
                 obs.approval_asked(store);
                 let approved = decide(&card);
                 reply(writer, &id, json!({ "approved": approved }))?;
+            }
+            "recover.request" => {
+                let request = &params["request"];
+                if !recovery_request_ok(request) {
+                    reply_err(writer, &id, -32602, "not a masked recovery request")?;
+                    continue;
+                }
+                match recover(request) {
+                    Some(answer) => reply(writer, &id, answer)?,
+                    None => reply_err(writer, &id, -32000, "no recovery answer")?,
+                }
             }
             _ => reply_err(writer, &id, -32601, "Method not found")?,
         }
@@ -370,7 +391,10 @@ pub fn run_replay_observed(
         (hooks.on_start)(handle.clone());
         // A card is never put up once the officer has stopped the run.
         let mut guarded = |card: &Value| if handle.stop_asked() { false } else { decide(card) };
-        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen, obs)
+        // Recovery goes to the companion service, if one is set up; otherwise the executor asks the officer.
+        let service = crate::chat::HttpService::from_env().ok();
+        let mut recover = |r: &Value| service.as_ref().and_then(|s| s.recover(r));
+        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen, obs, &mut recover)
     })();
     // Closing our end tells the executor to exit; an error ends it now.
     let finished = child.lock().ok().and_then(|mut g| g.take());
@@ -520,6 +544,57 @@ mod tests {
         let r = drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1, &mut |_| true);
         assert_eq!(replies(&out)[0]["error"]["code"], -32601);
         assert!(r.unwrap_err().contains("refused"));
+    }
+
+    fn drive_recovering(input: String, recover: &mut dyn FnMut(&Value) -> Option<Value>) -> (Vec<Value>, Result<Value, String>) {
+        let (mut s, _d) = store();
+        let mut out = Vec::new();
+        let r = drive_with(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1, &mut |_| true, &mut |_| {}, &mut Observed::default(), &mut NoObserver, recover);
+        (replies(&out), r)
+    }
+
+    fn recover_line(request: Value) -> String {
+        line(json!({"jsonrpc":"2.0","id":"x1","method":"recover.request","params":{"request":request}}))
+            + &line(json!({"jsonrpc":"2.0","id":1,"result":{"outcome":"finished"}}))
+    }
+
+    #[test]
+    fn a_recovery_request_goes_to_the_service_and_its_answer_back_to_the_executor() {
+        let req = json!({"kind":"recover","classification":"official-open","values":"masked","step":{"id":"s2"},"tree":{"ref":"n1"}});
+        let mut sent = Vec::new();
+        let (out, r) = drive_recovering(recover_line(req.clone()), &mut |b| { sent.push(b.clone()); Some(json!({"answer":"retry"})) });
+        assert_eq!(sent, vec![req]);
+        assert_eq!(out[0]["id"], "x1");
+        assert_eq!(out[0]["result"], json!({"answer":"retry"}));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn no_answer_from_the_service_is_an_error_never_an_answer() {
+        let req = json!({"kind":"recover","classification":"official-open","values":"masked","step":{},"tree":{}});
+        let (out, _) = drive_recovering(recover_line(req), &mut |_| None);
+        assert!(out[0].get("result").is_none());
+        assert!(out[0]["error"].is_object());
+    }
+
+    #[test]
+    fn a_request_that_is_not_a_masked_recovery_request_is_never_sent() {
+        // The shell never clears values for a route, so a request with values included is refused here.
+        for req in [json!(null), json!("x"), json!({"kind":"chat","values":"masked"}), json!({"kind":"recover","values":"included"}), json!({"kind":"recover"})] {
+            let mut called = false;
+            let (out, _) = drive_recovering(recover_line(req.clone()), &mut |_| { called = true; Some(json!({"answer":"retry"})) });
+            assert!(!called, "{req}");
+            assert!(out[0]["error"].is_object(), "{req}");
+        }
+    }
+
+    #[test]
+    fn drive_without_a_service_refuses_recovery() {
+        let (mut s, _d) = store();
+        let mut out = Vec::new();
+        let input = recover_line(json!({"kind":"recover","values":"masked"}));
+        drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1, &mut |_| true).unwrap();
+        assert!(replies(&out)[0]["error"].is_object());
     }
 
     #[test]

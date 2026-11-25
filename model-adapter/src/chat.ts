@@ -12,14 +12,14 @@ export type ChatOptions = {
   idleTimeoutMs?: number;
 };
 
-class TimeoutError extends Error {
+export class TimeoutError extends Error {
   constructor() {
     super("timed out");
     this.name = "TimeoutError";
   }
 }
 
-class ClientGoneError extends Error {
+export class ClientGoneError extends Error {
   constructor() {
     super("client gone");
     this.name = "AbortError";
@@ -29,12 +29,12 @@ class ClientGoneError extends Error {
 // Error names are fixed here. A route or request can set Error.name to anything, so never log it raw.
 const KNOWN_ERRORS = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "AbortError", "TimeoutError", "BadRequestError", "CeilingError"]);
 
-function errClass(err: unknown): string {
+export function errClass(err: unknown): string {
   return err instanceof Error && KNOWN_ERRORS.has(err.name) ? err.name : "Error";
 }
 
 /** Resolve with `p`, or reject when `signal` aborts or `ms` passes. Always clears its timer and listener. */
-function guard<T>(p: Promise<T>, signal: AbortSignal, ms: number): Promise<T> {
+export function guard<T>(p: Promise<T>, signal: AbortSignal, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => done(() => reject(new ClientGoneError()));
     const timer = setTimeout(() => done(() => reject(new TimeoutError())), ms);
@@ -49,7 +49,7 @@ function guard<T>(p: Promise<T>, signal: AbortSignal, ms: number): Promise<T> {
   });
 }
 
-async function readBody(req: IncomingMessage, signal: AbortSignal, ms: number): Promise<string> {
+export async function readBody(req: IncomingMessage, signal: AbortSignal, ms: number): Promise<string> {
   const read = (async () => {
     let size = 0;
     const parts: Buffer[] = [];
@@ -64,7 +64,7 @@ async function readBody(req: IncomingMessage, signal: AbortSignal, ms: number): 
   return guard(read, signal, ms);
 }
 
-function send(res: ServerResponse, status: number, body: unknown) {
+export function send(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }

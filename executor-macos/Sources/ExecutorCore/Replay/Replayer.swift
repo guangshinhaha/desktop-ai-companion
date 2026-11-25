@@ -36,8 +36,10 @@ public struct ReplayProgress: Equatable {
 
 /// Replays a task step by step (PRD E-1, E-4; TD 5.2, 5.3, 7.1).
 /// For each step: find the element, ask the officer first if the step may commit, act through an
-/// accessibility action, then wait for the step's checks. Any surprise stops the run. It never retries,
-/// never clicks through an unexpected dialog and never guesses between two matching elements.
+/// accessibility action, then wait for the step's checks. It never guesses between two matching elements.
+/// Without a `recovery` source any surprise stops the run. With one (#34), a divergence asks for help within
+/// strict bounds (see `recover`); recovery never approves, never acts on anything consequential, and never
+/// runs for a step that needs approval once its action was taken.
 public final class Replayer {
     public static let defaultCeiling: TimeInterval = 30
 
@@ -50,12 +52,16 @@ public final class Replayer {
     let audit: AuditSink?
     let control: RunControl?
     let progress: ((ReplayProgress) -> Void)?
+    let recovery: RecoverySource?
+    let recoveryPolicy: RecoveryPolicy
 
     public init(task: ReplayTask, inputs: RunInputs, host: ReplayHost, gate: ApprovalGate,
                 ceiling: TimeInterval = Replayer.defaultCeiling, audit: AuditSink? = nil,
-                control: RunControl? = nil, progress: ((ReplayProgress) -> Void)? = nil, log: @escaping (String) -> Void) {
+                control: RunControl? = nil, recovery: RecoverySource? = nil, recoveryPolicy: RecoveryPolicy = RecoveryPolicy(),
+                progress: ((ReplayProgress) -> Void)? = nil, log: @escaping (String) -> Void) {
         self.task = task; self.inputs = inputs; self.host = host; self.gate = gate
         self.ceiling = ceiling; self.audit = audit; self.control = control; self.progress = progress; self.log = log
+        self.recovery = recovery; self.recoveryPolicy = recoveryPolicy
     }
 
     /// The step whose approval is in the trail but whose action has not been taken. A stop in that gap says so.
@@ -127,13 +133,23 @@ public final class Replayer {
             // The run's ceiling caps a step's own timeout; a task cannot lengthen the run.
             let stepCeiling = min(step.timeoutSeconds ?? ceiling, ceiling)
 
-            // 1. Find the element. Two matches or none is a divergence, never a guess.
+            let hold: () -> Void = { self.control?.holdWhilePaused(onPause: { self.progress?(here(.paused)) }, onResume: { self.progress?(here(.resumed)) }) }
+
+            // 1. Find the element. Two matches is a divergence, never a guess. None, or a dialog in the way,
+            // may be recovered: nothing has been done for this step yet.
             var match: Match
             switch findTarget(step, ceiling: stepCeiling) {
             case .success(let m): match = m
             case .failure(let d):
                 if d.stopped { return stopReport(at: i) }
-                return report(.diverged(step: step.id, reason: d.reason), at: i, interfaceChanged: d.interface)
+                guard recovery != nil, !d.reason.hasPrefix(Self.ambiguousPrefix) else {
+                    return report(.diverged(step: step.id, reason: d.reason), at: i, interfaceChanged: d.interface)
+                }
+                switch recover(step, divergence: d.reason, hold: hold, resume: { self.findTarget(step, ceiling: stepCeiling) }) {
+                case .recovered(let m): match = m
+                case .stopped: return stopReport(at: i)
+                case .gaveUp(let why): return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: d.interface)
+                }
             }
             log("  found: \(ApprovalGate.safe(match.locator.summary))")
 
@@ -189,7 +205,20 @@ public final class Replayer {
             case .ok:
                 if let (why, interface) = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
                     if stopAsked { return stopReport(at: i, actionDone: true) }
-                    return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: interface)
+                    // A gated step's action may have taken effect: it is never recovered or retried. The officer looks.
+                    guard recovery != nil, !gated else {
+                        return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: interface)
+                    }
+                    // Recovery waits for the checks again; it never does the step's action a second time.
+                    let recheck: () -> Swift.Result<Void, Divergence> = {
+                        guard let (w, iface) = self.awaitChecks(step, ceiling: stepCeiling, gated: false) else { return .success(()) }
+                        return .failure(Divergence(reason: w, stopped: self.stopAsked, interface: iface))
+                    }
+                    switch recover(step, divergence: why, hold: hold, resume: recheck) {
+                    case .recovered: break
+                    case .stopped: return stopReport(at: i, actionDone: true)
+                    case .gaveUp(let w): return report(.diverged(step: step.id, reason: w), at: i, interfaceChanged: interface)
+                    }
                 }
             }
             done.append(step.id)
@@ -197,6 +226,95 @@ public final class Replayer {
             log("  done: \(ApprovalGate.safe(step.id))")
         }
         return ReplayReport(outcome: .finished, completed: done, notRun: [])
+    }
+
+    // MARK: recovery
+
+    enum RecoveryEnd<T> { case recovered(T), stopped, gaveUp(String) }
+
+    /// Up to three attempts on one step (TD 5.4), then the officer. Each attempt: look at the window, build the
+    /// request (the one builder), ask, check the answer, record it, and only then act. A recovery act is written
+    /// to the trail as `recovered` before it is done; a refused answer as `step_diverged`. A stop is honoured
+    /// before asking, after the answer, and before acting; a pause holds before each attempt.
+    func recover<T>(_ step: ReplayTask.Step, divergence first: String, hold: () -> Void,
+                    resume: () -> Swift.Result<T, Divergence>) -> RecoveryEnd<T> {
+        guard let recovery else { return .gaveUp(first) }
+        let officer = "The officer is asked to look."
+        var last = first
+        let max = RecoveryPolicy.maxAttempts
+        for attempt in 1...max {
+            hold()
+            if stopAsked { return .stopped }
+            guard let root = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }
+            let built: RecoveryRequest.Built
+            switch RecoveryRequest.build(step: step, task: task, inputs: inputs, root: root, divergence: ApprovalGate.safe(last),
+                                         attempt: attempt, policy: recoveryPolicy, readValue: { self.host.value(of: $0) }) {
+            case .failure(let r): return .gaveUp("\(first). Recovery was not asked: \(r.reason). \(officer)")
+            case .success(let b): built = b
+            }
+            log("  recovery: asking (attempt \(attempt) of \(max))")
+            let reply = recovery.ask(built.json)
+            if stopAsked { return .stopped }
+            guard let reply else { return .gaveUp("\(last). Recovery gave no answer. \(officer)") }
+            let head = "Recovery at step \(step.id) (attempt \(attempt) of \(max))"
+            func refused(_ why: String) -> String? {
+                // The refusal is a record too. No record, no further attempt.
+                if let audit, !audit.record(AuditEvent(.stepDiverged, step: step.id, shown: ApprovalGate.safe("\(head): the answer was refused: \(why). Nothing was done."))) {
+                    return "\(first). The audit trail could not be written; nothing was done. \(officer)"
+                }
+                return nil
+            }
+            func written(_ shown: String) -> Bool {
+                guard let audit else { return true }
+                return audit.record(AuditEvent(.recovered, step: step.id, shown: ApprovalGate.safe(shown)))
+            }
+            switch RecoveryAnswer.parse(reply, step: step, task: task) {
+            case .failure(let rej):
+                if let stop = refused(rej.reason) { return .gaveUp(stop) }
+                if rej.malformed { return .gaveUp("\(last). Recovery's answer was not usable (\(rej.reason)). \(officer)") }
+                last = "recovery's answer was refused: \(rej.reason)"
+                continue
+            case .success(.askOfficer(let why)):
+                return .gaveUp("\(last). Recovery asked for the officer: \(why)")
+            case .success(.retry):
+                guard written("\(head): wait for the step again. Why: \(last).") else {
+                    return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
+                }
+            case .success(.act(let kind, let ref)):
+                guard let now = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }
+                let node: UINode
+                switch RecoveryAnswer.check(kind, ref: ref, built: built, step: step, task: task, now: now) {
+                case .failure(let rej):
+                    if let stop = refused(rej.reason) { return .gaveUp(stop) }
+                    last = "recovery's answer was refused: \(rej.reason)"
+                    continue
+                case .success(let n): node = n
+                }
+                let what = kind == .press ? "press" : "type the step's own input into"
+                guard written("\(head): \(what) \(node.role) \"\(node.label ?? "")\". Why: \(last).") else {
+                    return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
+                }
+                if stopAsked { return .stopped }
+                let result: ActionResult
+                switch kind {
+                case .press: result = host.press(node)
+                case .setValue:
+                    guard let ref = step.value, let v = inputs.resolve(ref) else { return .gaveUp("\(first). No value for this step. \(officer)") }
+                    result = host.setValue(node, to: v.reveal())
+                }
+                if case .failed(let why) = result { return .gaveUp("\(first). Recovery's action failed (\(why)). \(officer)") }
+            }
+            switch resume() {
+            case .success(let t):
+                log("  recovered")
+                return .recovered(t)
+            case .failure(let d):
+                if d.stopped || stopAsked { return .stopped }
+                if d.reason.hasPrefix(Self.ambiguousPrefix) { return .gaveUp(d.reason) }
+                last = d.reason
+            }
+        }
+        return .gaveUp("\(last). Recovery was tried \(max) times on this step. \(officer)")
     }
 
     // MARK: finding

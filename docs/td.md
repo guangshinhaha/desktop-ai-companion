@@ -208,6 +208,18 @@ The model returns one of three answers:
 
 The executor rejects any `act` that targets a consequential element, types a value other than the step's own input, or leaves the recorded app. After three recovery attempts on one step, it asks the officer.
 
+How it is built (#34). One function builds the request (`RecoveryRequest.build` in `executor-macos/Sources/ExecutorCore/Replay/Recovery.swift`), following decision 0003's table. Password fields are never read. Field values are masked unless `replay.start` says the route is cleared (`values_cleared`, which nothing sets before #19). Any label holding one of the run's input values goes as `[masked]`. A run with no `classification` in `replay.start` sends nothing, because unknown counts as above the ceiling. The request goes over RPC as `recover.request {request}`. The shell passes only masked requests to the service's `POST /recover` (`model-adapter/src/recover.ts`), which checks the ceiling before the route and passes on only a well-formed answer. Today's only route is the stub, and it answers `ask_officer`.
+
+The executor checks every answer itself, whatever the service sent:
+
+- A malformed answer fails closed: the officer is asked at once.
+- An `act` may press only a labelled button, disclosure triangle or tab, or type the step's own input into the step's own field. It is checked against the window as it is now.
+- It is refused if the element reads like a commit, is the target of any step that needs approval, is a link or a password field, or names another app.
+- A refusal is recorded as `step_diverged` and counts as an attempt.
+- `recovered` is recorded before the action, and a failed write stops the run.
+- A step that needs approval is never recovered once it has acted, because its action may have taken effect. Recovery never answers an approval card.
+- A Stop or pause before, during or after the request is honoured, and the answer is then never acted on.
+
 ## 6. List runs (E-5)
 
 A list run executes one task once per row of a spreadsheet (CSV, read locally; Excel is out for now, see decision 0006). The officer maps columns to inputs before the run starts. Each row moves through these states:
@@ -258,7 +270,7 @@ Each record carries the hash of the one before it, so a missing or edited record
 
 **Decided (decision 0005):** the record stores the values the officer approved, encrypted, in the local audit store only. Retention defaults to 7 years (2555 days), as config. A central copy comes with #29.
 
-How it is built. The shell owns the store and the officer's identity. The executor asks over the stdio JSON-RPC (`audit.append`, `approval.request`) and the shell writes the record through the store's API; the executor cannot set the officer, task, run or time. `approved` is written before the action runs, and a failed write stops the run. `executor-macos verify-audit` reads the shell's JSONL export on stdin and exits 0 when the chain is intact, or 5 naming the sequence number of the first bad or missing record. The `recovered`, `item_marked_by_officer`, `task_shared` and `task_handed_over` events are allowed by the store but have no producer yet.
+How it is built. The shell owns the store and the officer's identity. The executor asks over the stdio JSON-RPC (`audit.append`, `approval.request`) and the shell writes the record through the store's API; the executor cannot set the officer, task, run or time. `approved` is written before the action runs, and a failed write stops the run. `executor-macos verify-audit` reads the shell's JSONL export on stdin and exits 0 when the chain is intact, or 5 naming the sequence number of the first bad or missing record. Recovery (5.4) produces `recovered`. The `item_marked_by_officer`, `task_shared` and `task_handed_over` events are allowed by the store but have no producer yet.
 
 Progress and stop (#28). The executor sends `run.progress` notifications (`started`, `done`, `paused`, `resumed`, with `step`, `say`, `index`, `total`); the shell draws them in a progress window. The shell sends `replay.pause`, `replay.resume` and `replay.stop` as notifications (no id, no reply), each a whole line written at once. The executor reads them without a second thread: it polls stdin between steps and every 0.1 s while a step waits, so a stop cancels a waiting step within 500 ms and leaves the app as it is. Pause holds between steps; end of input while paused means stop. A stop is written as `run_stopped` (the step it came at, what completed, what did not) and then `run_finished` "stopped", not as a rejection. A stop while an approval card is open answers it no; an approval followed by a stop before the action is not recorded as approved. A stop never cancels an `audit.append` wait (only the officer's question): the record is written, then the run stops. A stop between `approved` and the action is recorded in `run_stopped` as "approval recorded, action not taken". The shell sends a stop pressed before the executor exists only after `replay.start`, and puts up no card once a stop is asked. A pause pressed while a card is open holds the approved step until resume. If the executor has not ended the run 2 s after a stop, the shell ends the process and writes `run_stopped` and `run_finished` itself, saying the executor was ended and naming the step in flight, whose effect is unknown. The stop shortcut (Cmd+Shift+Period) is registered only while a run is on.
 
