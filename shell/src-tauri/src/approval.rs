@@ -78,6 +78,8 @@ pub struct Observed {
     pub done: Vec<String>,
     pub stop_recorded: bool,
     pub finish_recorded: bool,
+    /// The step that had started and not finished when the last notification came.
+    pub in_flight: Option<String>,
 }
 
 /// Serves the executor's requests until it answers `replay.start` (`start_id`). Returns that result.
@@ -132,7 +134,12 @@ pub fn drive_with<R: BufRead, W: Write>(
                 if params["state"] == "done" {
                     if let Some(s) = params["step"].as_str() {
                         seen.done.push(s.to_string());
+                        if seen.in_flight.as_deref() == Some(s) {
+                            seen.in_flight = None;
+                        }
                     }
+                } else if params["state"] == "started" {
+                    seen.in_flight = params["step"].as_str().map(str::to_string);
                 }
                 on_progress(params);
             }
@@ -219,14 +226,19 @@ pub fn record_forced_stop(
         .as_array()
         .map(|a| a.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    let not_run: Vec<&str> = all.iter().filter(|s| !seen.done.contains(s)).map(String::as_str).collect();
+    let flying = seen.in_flight.as_deref();
+    let not_run: Vec<&str> = all.iter().filter(|s| !seen.done.contains(s) && Some(s.as_str()) != flying).map(String::as_str).collect();
     let list = |v: &[&str]| if v.is_empty() { "none".to_string() } else { v.join(", ") };
     let done: Vec<&str> = seen.done.iter().map(String::as_str).collect();
-    let shown = format!(
+    let mut shown = format!(
         "Stopped by the officer. The executor did not end the run in time and was ended. Completed: {}. Not run: {}.",
         list(&done),
         list(&not_run)
     );
+    // The step in flight may have been acted on: the record does not call it not run.
+    if let Some(s) = flying {
+        shown.push_str(&format!(" In flight when it was ended: {s} (whether its action was taken is unknown)."));
+    }
     let mut rows: Vec<(&str, &str)> = Vec::new();
     if !seen.stop_recorded {
         rows.push(("run_stopped", shown.as_str()));
@@ -290,7 +302,6 @@ pub fn run_replay_with(
         },
         grace: hooks.stop_grace,
     };
-    (hooks.on_start)(handle.clone());
     let mut seen = Observed::default();
     let now = || {
         std::time::SystemTime::now()
@@ -300,7 +311,12 @@ pub fn run_replay_with(
     };
     let result = (|| {
         send_line(&mut writer, start_request(1, task, inputs, pid))?;
-        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, decide, &mut *hooks.on_progress, &mut seen)
+        // The controls are handed over only now. A stop pressed before this is sent after `replay.start`
+        // (the executor drops a control line that arrives before it), so it still stops the run.
+        (hooks.on_start)(handle.clone());
+        // A card is never put up once the officer has stopped the run.
+        let mut guarded = |card: &Value| if handle.stop_asked() { false } else { decide(card) };
+        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen)
     })();
     // Closing our end tells the executor to exit; an error ends it now.
     let finished = child.lock().ok().and_then(|mut g| g.take());

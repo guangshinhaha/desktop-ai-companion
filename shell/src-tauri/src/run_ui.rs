@@ -18,8 +18,20 @@ pub fn stop_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Period)
 }
 
+/// The run slot, even if a run panicked while holding it: a poisoned lock must not leave the slot stuck.
+fn with_slot<T>(app: &AppHandle, f: impl FnOnce(&mut Option<ActiveRun>) -> T) -> T {
+    let session = app.state::<Session>();
+    let mut g = session.run.lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut g)
+}
+
 fn view_of(app: &AppHandle) -> Option<Value> {
-    app.state::<Session>().run.lock().ok().and_then(|r| r.as_ref().map(|r| r.progress.view()))
+    with_slot(app, |s| s.as_ref().map(|r| r.progress.view()))
+}
+
+/// Whether the officer has asked to stop the run on screen.
+pub fn stop_asked(app: &AppHandle) -> bool {
+    with_slot(app, |s| s.as_ref().is_some_and(|r| r.stop_requested()))
 }
 
 fn publish(app: &AppHandle) {
@@ -42,58 +54,77 @@ fn open_window(app: &AppHandle) {
 }
 
 /// Starts tracking a run. Refuses if one is already on: one replay at a time.
-pub fn begin(app: &AppHandle, progress: Progress) -> Result<(), String> {
-    {
-        let session = app.state::<Session>();
-        let mut slot = session.run.lock().map_err(|_| "busy")?;
-        if slot.as_ref().is_some_and(|r| r.is_live()) {
-            return Err("a replay is already running".into());
+/// The returned guard ends the run if dropped without `finish`, so a panic cannot leave the slot taken
+/// or the shortcut registered.
+pub fn begin(app: &AppHandle, mut progress: Progress) -> Result<RunGuard, String> {
+    // Failing to register (another app holds it) leaves the window's Stop button and Escape; the view says so.
+    let registered = app.global_shortcut().register(stop_shortcut()).is_ok();
+    progress.set_shortcut(registered);
+    let taken = with_slot(app, |s| {
+        if s.as_ref().is_some_and(|r| r.is_live()) {
+            return true;
         }
-        *slot = Some(ActiveRun::new(progress));
+        *s = Some(ActiveRun::new(progress));
+        false
+    });
+    if taken {
+        // Not ours: leave the first run's shortcut as it is.
+        return Err("a replay is already running".into());
     }
-    // Failing to register (another app holds it) leaves the window's Stop button and key.
-    let _ = app.global_shortcut().register(stop_shortcut());
     open_window(app);
     publish(app);
-    Ok(())
+    let handle = app.clone();
+    Ok(RunGuard(Some(crate::progress::OnDrop::new(Box::new(move || end(&handle, &Err("the run ended unexpectedly".into())))))))
+}
+
+pub struct RunGuard(Option<crate::progress::OnDrop<Box<dyn FnOnce() + Send>>>);
+
+impl RunGuard {
+    /// The run is over with this result. Disarms the guard.
+    pub fn finish(mut self, app: &AppHandle, result: &Result<Value, String>) {
+        if let Some(g) = self.0.as_mut() {
+            g.disarm();
+        }
+        end(app, result);
+    }
 }
 
 /// The executor is running: hand its controls to the run.
 pub fn attach(app: &AppHandle, handle: RunHandle) {
-    if let Ok(mut slot) = app.state::<Session>().run.lock() {
-        if let Some(r) = slot.as_mut() {
+    with_slot(app, |s| {
+        if let Some(r) = s.as_mut() {
             r.attach(handle);
         }
-    }
+    });
 }
 
 pub fn on_progress(app: &AppHandle, params: &Value) {
-    if let Ok(mut slot) = app.state::<Session>().run.lock() {
-        if let Some(r) = slot.as_mut() {
+    with_slot(app, |s| {
+        if let Some(r) = s.as_mut() {
             r.progress.apply(params);
         }
-    }
+    });
     publish(app);
 }
 
 /// The run is over: show its report, and let go of the stop shortcut and the executor's controls.
 pub fn end(app: &AppHandle, result: &Result<Value, String>) {
-    if let Ok(mut slot) = app.state::<Session>().run.lock() {
-        if let Some(r) = slot.as_mut() {
+    with_slot(app, |s| {
+        if let Some(r) = s.as_mut() {
             r.progress.finish(result);
             r.handle = None;
         }
-    }
+    });
     let _ = app.global_shortcut().unregister(stop_shortcut());
     publish(app);
 }
 
 fn with_run(app: &AppHandle, f: impl FnOnce(&mut ActiveRun)) {
-    if let Ok(mut slot) = app.state::<Session>().run.lock() {
-        if let Some(r) = slot.as_mut() {
+    with_slot(app, |s| {
+        if let Some(r) = s.as_mut() {
             f(r);
         }
-    }
+    });
     publish(app);
 }
 

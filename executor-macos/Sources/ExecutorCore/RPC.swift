@@ -119,14 +119,17 @@ public enum RPC {
 
         /// The answer's `result`, or nil for an error, end of input, or a malformed answer. Lines for other
         /// ids are not answers and are skipped.
-        func ask(_ method: String, _ params: [String: Any]) -> [String: Any]? {
+        /// A stop ends the wait only when `cancellable` (the officer's question). An audit append is always
+        /// waited for: the trail must hold the record, and a stop is then handled by the run, not mistaken
+        /// for a failed write.
+        func ask(_ method: String, _ params: [String: Any], cancellable: Bool = false) -> [String: Any]? {
             n += 1
             let id = "x\(n)"
             output(RPC.encode(["jsonrpc": "2.0", "id": id, "method": method, "params": params]))
             while let line = input() {
                 // A stop, pause or resume sent while the officer is being asked. A stop is a no to the question.
                 if control?.apply(line: line) == true {
-                    if control?.state == .stopped { return nil }
+                    if cancellable && control?.state == .stopped { return nil }
                     continue
                 }
                 guard let o = RPC.parse(line), o["id"] as? String == id, o["method"] == nil else { continue }
@@ -141,7 +144,7 @@ public enum RPC {
         init(talk: Conversation) { self.talk = talk }
         func nextAnswer() -> String? { nil }
         func answer(for card: ApprovalCard) -> String? {
-            guard let r = talk.ask("approval.request", ["card": card.json]) else { return nil }
+            guard let r = talk.ask("approval.request", ["card": card.json], cancellable: true) else { return nil }
             // Only the JSON value true. A string, a number or a missing field is a no.
             if let a = r["approved"] as? NSNumber, CFGetTypeID(a) == CFBooleanGetTypeID(), a.boolValue { return "y" }
             return "n"

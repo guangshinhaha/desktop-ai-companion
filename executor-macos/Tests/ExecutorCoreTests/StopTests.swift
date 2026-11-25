@@ -266,6 +266,70 @@ final class StopTests: XCTestCase {
 
     func formHostForRPC() -> FakeHost { formHost() }
 
+    /// Runs a replay over the wire. `intercept` sees each request the executor sends and may return a line to
+    /// deliver before the usual answer (a stop, say); the question is then answered as the shell would.
+    func serveRun(_ h: FakeHost, intercept: @escaping (_ method: String, _ params: [String: Any]) -> String?) throws -> [[String: Any]] {
+        var out: [String] = []
+        var queue = [String(decoding: try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": "replay.start",
+            "params": ["task": taskJSON(), "inputs": ["full_name": "Aiden Tan", "email": "a@x.example.test"]]]), as: UTF8.self)]
+        var answered = Set<String>()
+        RPC.serve(input: {
+            if !queue.isEmpty { return queue.removeFirst() }
+            guard let last = out.last, let o = RPC.parse(last), let method = o["method"] as? String, let id = o["id"] as? String else { return nil }
+            let params = o["params"] as? [String: Any] ?? [:]
+            if !answered.contains(id) {
+                answered.insert(id)
+                if let line = intercept(method, params) { return line }
+            }
+            if method == "approval.request" { return RPC.encode(["jsonrpc": "2.0", "id": id, "result": ["approved": true]]) }
+            return RPC.encode(["jsonrpc": "2.0", "id": id, "result": ["seq": 1]])
+        }, output: { out.append($0) }, hostFactory: { _, _ in h })
+        return out.compactMap(RPC.parse)
+    }
+
+    func events(_ msgs: [[String: Any]]) -> [String] {
+        msgs.filter { $0["method"] as? String == "audit.append" }.compactMap { ($0["params"] as? [String: Any])?["event"] as? String }
+    }
+
+    func testAStopWhileRunStartedIsBeingRecordedIsAStopNotARefusal() throws {
+        let h = formHost()
+        let msgs = try serveRun(h) { m, p in m == "audit.append" && p["event"] as? String == "run_started" ? Self.stopLine : nil }
+        let result = msgs.last { $0["id"] as? Int == 1 }?["result"] as? [String: Any]
+        XCTAssertEqual(result?["outcome"] as? String, "stopped")
+        XCTAssertEqual(events(msgs), ["run_started", "run_stopped", "run_finished"])
+        XCTAssertTrue(h.actions.isEmpty)
+    }
+
+    func testAStopWhileTheApprovalIsBeingRecordedDoesNotLeaveAnApprovalForAnActionNeverTaken() throws {
+        let h = formHost()
+        let msgs = try serveRun(h) { m, p in m == "audit.append" && p["event"] as? String == "approved" ? Self.stopLine : nil }
+        let result = msgs.last { $0["id"] as? Int == 1 }?["result"] as? [String: Any]
+        XCTAssertEqual(result?["outcome"] as? String, "stopped")
+        XCTAssertEqual(events(msgs), ["run_started", "approved", "run_stopped", "run_finished"])
+        XCTAssertFalse(h.actions.contains("press:Create account"))
+        let stop = msgs.compactMap { $0["params"] as? [String: Any] }.first { $0["event"] as? String == "run_stopped" }
+        XCTAssertTrue((stop?["shown"] as? String ?? "").contains("approval for step s3 was recorded and its action was not taken"), "\(String(describing: stop))")
+    }
+
+    func testAPausePressedWhileTheCardIsOpenHoldsTheApprovedActionUntilResumed() throws {
+        let h = formHost()
+        var src: ScriptedApproval?
+        var atResume: (actions: Int, approved: Bool)?
+        let audit = RecordingAudit()
+        audit.host = h
+        let t = try makeTask()
+        let s = ScriptedApproval(["y"]); src = s
+        let ctl = RunControl(poll: once(Self.pauseLine) { (src?.asked ?? 0) > 0 }, block: {
+            atResume = (h.actions.filter { $0.hasPrefix("press") }.count, audit.kinds.contains(.approved))
+            return Self.resumeLine
+        })
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: s, out: { _ in }), audit: audit, control: ctl, log: { _ in }).run()
+        XCTAssertEqual(r.outcome, .finished)
+        XCTAssertEqual(atResume?.actions, 0, "the approved press waits while paused")
+        XCTAssertEqual(atResume?.approved, false, "and is not recorded as approved until it can run")
+    }
+
     // MARK: reading lines
 
     func testLineReaderPollsWithoutWaitingAndKeepsPartialLines() throws {

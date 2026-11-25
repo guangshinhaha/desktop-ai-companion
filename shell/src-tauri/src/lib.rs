@@ -221,10 +221,10 @@ async fn replay_start(
             .unwrap_or(0);
         let run = format!("run_{nanos:x}");
         // The progress view, its Pause and Stop, and the stop shortcut, for as long as the run lasts.
-        run_ui::begin(&app, progress::Progress::new(&run, &task))?;
+        let guard = run_ui::begin(&app, progress::Progress::new(&run, &task))?;
         if let Err(e) = store.start_run(&run, &task_id, version, "shell", now_secs()) {
             let e = e.to_string();
-            run_ui::end(&app, &Err(e.clone()));
+            guard.finish(&app, &Err(e.clone()));
             return Err(e);
         }
         let ctx = approval::RunContext { officer, task_ref: format!("{task_id}@{version}"), run: run.clone() };
@@ -232,16 +232,25 @@ async fn replay_start(
         let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(&app, p);
         let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
         let result = approval::run_replay_with(&executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
+            // A card is never put up for a run the officer has stopped.
+            if run_ui::stop_asked(&app) {
+                return false;
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             let label = format!("approval-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
             if let Ok(mut p) = app.state::<Session>().approval.lock() {
                 *p = Some(PendingApproval { card: card.clone(), answer: tx, label: label.clone() });
             }
-            open_approval_window(&app, &label);
+            // Checked again now the card is pending: a stop from here on answers it, and one just before is seen here.
+            if run_ui::stop_asked(&app) {
+                answer_approval(&app, Some(&label), false);
+            } else {
+                open_approval_window(&app, &label);
+            }
             // No timeout: waiting is not consent. A closed window or a dropped sender is a no.
             rx.recv().unwrap_or(false)
         }, &mut hooks);
-        run_ui::end(&app, &result);
+        guard.finish(&app, &result);
         let status = match &result {
             Ok(r) if r["outcome"] == "finished" => "finished",
             Ok(r) if r["outcome"] == "refused" => "refused",

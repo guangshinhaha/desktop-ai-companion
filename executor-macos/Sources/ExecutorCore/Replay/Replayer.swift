@@ -53,6 +53,8 @@ public final class Replayer {
         self.ceiling = ceiling; self.audit = audit; self.control = control; self.progress = progress; self.log = log
     }
 
+    /// The step whose approval is in the trail but whose action has not been taken. A stop in that gap says so.
+    private var approvedNotActed: String?
     private var cancelled: (() -> Bool)? { control.map { c in { c.isStopped } } }
     private var stopAsked: Bool { control?.isStopped ?? false }
 
@@ -76,6 +78,7 @@ public final class Replayer {
                 // Step ids and counts only. This is the record of the stop (PRD C-4).
                 func list(_ ids: [String]) -> String { ids.isEmpty ? "none" : ids.joined(separator: ", ") }
                 var shown = "Stopped by the officer at step \(step). Completed: \(list(report.completed)). Not run: \(list(report.notRun))."
+                if let s = approvedNotActed { shown += " The approval for step \(s) was recorded and its action was not taken." }
                 if actionDone { shown += " The step's action was done and its check was not confirmed." }
                 _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
                 outcome = "stopped"
@@ -141,11 +144,15 @@ public final class Replayer {
                     _ = audit?.record(AuditEvent(.rejected, step: step.id, shown: shown))
                     return report(.notApproved(step: step.id), at: i)
                 case .approved(let a):
+                    // A pause pressed while the card was open holds here, before the approval is recorded,
+                    // so nothing the officer approved is acted on while the run is paused.
+                    control?.holdWhilePaused(onPause: { progress?(here(.paused)) }, onResume: { progress?(here(.resumed)) })
                     if stopAsked { return stopReport(at: i) }
                     // The record comes before the action. No record, no action.
                     if let audit, !audit.record(AuditEvent(.approved, step: step.id, shown: shown)) {
                         return report(.diverged(step: step.id, reason: "the audit trail could not be written; nothing was done for this step"), at: i)
                     }
+                    approvedNotActed = step.id
                     approval = a
                 }
                 // The officer may have taken a while. Look again, once, and act only on what is there now.
@@ -166,6 +173,7 @@ public final class Replayer {
 
             // 3. Act. Last look at the stop: after this, nothing is done for a step the officer stopped.
             if stopAsked { return stopReport(at: i) }
+            approvedNotActed = nil
             let acted = perform(step, on: match.node, approval: approval)
             // 4. Wait for the checks.
             switch acted {

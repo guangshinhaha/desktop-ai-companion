@@ -114,6 +114,45 @@ test("task text is shown as text, never as markup", async () => {
   assert.match(mount.textContent, /<img src=x/);
 });
 
+function stoppedView(report) {
+  return view({
+    state: "stopped", over: true, current: null,
+    steps: [
+      { id: "s1", say: "Type into Full name", status: "done" },
+      { id: "s2", say: "Press Create account", status: "stopped" },
+      { id: "s3", say: "Check the confirmation", status: "todo" },
+    ],
+    report: { outcome: "stopped", completed: ["s1"], not_run: ["s2", "s3"], step: "s2", ...report },
+  });
+}
+
+test("a stop after the action says the step may have taken effect, and does not say the app was left as it is", async () => {
+  const { ui, mount } = setup(stoppedView({ action_done: true }));
+  await ui.load();
+  assert.match(role(mount, "outcome")[0].textContent, /Step s2 may have taken effect/);
+  assert.doesNotMatch(role(mount, "outcome")[0].textContent, /Nothing further was done/);
+  assert.match(role(mount, "acted")[0].textContent, /action was done and its check was not confirmed/);
+  assert.equal(role(mount, "not-run")[0].textContent, "Not done: s3");
+  assert.equal(role(mount, "left-as-is").length, 0);
+});
+
+test("an executor that had to be ended mid-step is shown as stopped with the step's effect unknown", async () => {
+  const { ui, mount } = setup(stoppedView({ action_done: "unknown", reason: "the executor ended before the run finished" }));
+  await ui.load();
+  assert.match(role(mount, "acted")[0].textContent, /whether its action happened is unknown/);
+  assert.equal(role(mount, "left-as-is").length, 0);
+  assert.equal(role(mount, "not-run")[0].textContent, "Not done: s3");
+});
+
+test("when the system-wide shortcut could not be registered the hint says so", async () => {
+  const { ui, mount } = setup(view({ shortcut: false }));
+  await ui.load();
+  assert.match(role(mount, "hint")[0].textContent, /not available/);
+  const ok = setup(view({ shortcut: true }));
+  await ok.ui.load();
+  assert.match(role(ok.mount, "hint")[0].textContent, /Cmd\+Shift\+Period\.$/);
+});
+
 test("an error from the shell is shown, not swallowed", async () => {
   const mount = new Node("main");
   const ui = createProgress(fakeDoc, async (c) => { if (c === "progress_current") return view(); throw new Error("gone"); }, mount);

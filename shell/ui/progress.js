@@ -43,6 +43,17 @@
       return ids.length ? ids.join(", ") : "none";
     }
 
+    // The step the stop may have caught after its action: done, or not known. Otherwise nothing was acted on.
+    function actedStep(r) {
+      return r && view.state === "stopped" && (r.action_done === true || r.action_done === "unknown") && r.step ? r.step : null;
+    }
+
+    function outcomeText() {
+      const acted = actedStep(view.report);
+      if (acted) return "Stopped. Step " + acted + " may have taken effect.";
+      return OVER[view.state] || "The run ended.";
+    }
+
     function draw() {
       mount.replaceChildren();
       if (!view) {
@@ -59,16 +70,22 @@
         const label = { running: "Running", pausing: "Pausing after this step", paused: "Paused", stopping: "Stopping" }[view.state] || view.state;
         mount.appendChild(el("p", { attrs: { "data-role": "state" } }, label));
       } else {
-        mount.appendChild(el("p", { attrs: { "data-role": "outcome" } }, OVER[view.state] || "The run ended."));
+        mount.appendChild(el("p", { attrs: { "data-role": "outcome" } }, outcomeText()));
       }
       mount.appendChild(el("ol", { attrs: { "data-role": "steps" } },
         ...view.steps.map((s) => el("li", { attrs: { "data-status": s.status } }, MARK[s.status] + " " + s.say))));
       if (view.over && view.report) {
         const r = view.report;
+        const acted = actedStep(r);
         mount.appendChild(el("p", { attrs: { "data-role": "completed" } }, "Completed: " + names(r.completed || [])));
-        mount.appendChild(el("p", { attrs: { "data-role": "not-run" } }, "Not done: " + names(r.not_run || [])));
+        // A step that may have been acted on is not listed as not done.
+        mount.appendChild(el("p", { attrs: { "data-role": "not-run" } }, "Not done: " + names((r.not_run || []).filter((id) => id !== acted))));
+        if (acted) {
+          const how = r.action_done === true ? "its action was done and its check was not confirmed" : "whether its action happened is unknown";
+          mount.appendChild(el("p", { className: "flag", attrs: { "data-role": "acted" } }, "Step " + acted + ": " + how + ". Check the app before running again."));
+        }
         if (r.reason) mount.appendChild(el("p", { attrs: { "data-role": "reason" } }, "Reason: " + r.reason));
-        if (view.state === "stopped") {
+        if (view.state === "stopped" && !acted) {
           mount.appendChild(el("p", { attrs: { "data-role": "left-as-is" } }, "The app was left as it is."));
         }
       } else if (!view.over) {
@@ -85,7 +102,9 @@
           on: { click: () => send("run_stop") },
         }, stopping ? "Stopping" : "Stop");
         mount.appendChild(el("div", { className: "actions" }, pause, stop));
-        mount.appendChild(el("p", { attrs: { "data-role": "hint" } }, "Stop: Escape or Cmd+Shift+Period."));
+        mount.appendChild(el("p", { attrs: { "data-role": "hint" } }, view.shortcut === false
+          ? "Stop: the Stop button or Escape in this window. The system-wide shortcut (Cmd+Shift+Period) is not available."
+          : "Stop: Escape or Cmd+Shift+Period."));
       }
       if (error) mount.appendChild(el("p", { attrs: { role: "alert", "data-role": "error" } }, error));
     }

@@ -57,6 +57,48 @@ impl Write for SharedWriter {
     }
 }
 
+/// Text from a task or the executor, made safe to show: control, format (bidi override, zero width),
+/// separator and private-use characters become `\u{XXXX}`, as on the approval card, so a step's text
+/// cannot move the cursor or reorder what the officer reads.
+pub fn safe_text(s: &str) -> String {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c as u32,
+                0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x8E2 | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E
+                | 0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE000..=0xF8FF | 0xF0000..=0x10FFFF | 0xE0000..=0xE007F)
+    };
+    s.chars().map(|c| if hidden(c) { format!("\\u{{{:X}}}", c as u32) } else { c.to_string() }).collect()
+}
+
+fn clean(v: &mut Value) {
+    match v {
+        Value::String(s) => *s = safe_text(s),
+        Value::Array(a) => a.iter_mut().for_each(clean),
+        Value::Object(o) => o.values_mut().for_each(clean),
+        _ => {}
+    }
+}
+
+/// Runs `f` when dropped, unless `disarm`ed. Used so a run that panics still gives back its slot and shortcut.
+pub struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        OnDrop(Some(f))
+    }
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 pub fn control_line(method: &str) -> String {
     format!("{}\n", json!({ "jsonrpc": "2.0", "method": method }))
 }
@@ -139,6 +181,8 @@ pub struct Progress {
     current: Option<Value>,
     pause_asked: bool,
     report: Option<Value>,
+    /// Whether the system-wide stop shortcut is registered. The window's own Stop and Escape always work.
+    shortcut: bool,
 }
 
 const TERMINAL: [&str; 6] = ["finished", "stopped", "diverged", "not_approved", "refused", "ended"];
@@ -166,7 +210,16 @@ impl Progress {
             current: None,
             pause_asked: false,
             report: None,
+            shortcut: true,
         }
+    }
+
+    pub fn set_shortcut(&mut self, registered: bool) {
+        self.shortcut = registered;
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.state == "stopping"
     }
 
     pub fn is_over(&self) -> bool {
@@ -239,7 +292,16 @@ impl Progress {
             return;
         }
         let done_now: Vec<String> = self.steps.iter().filter(|s| s.2 == Mark::Done).map(|s| s.0.clone()).collect();
+        let flying: Option<String> = self.steps.iter().find(|s| s.2 == Mark::Current).map(|s| s.0.clone());
         let (outcome, completed, not_run, at, mark, extra) = match result {
+            // The officer stopped it and the executor had to be ended: a stop, not a failure. The step in flight
+            // may have been acted on, so it is not called "not done" without saying that it is unknown.
+            Err(e) if self.state == "stopping" => {
+                let not_run: Vec<String> =
+                    self.steps.iter().filter(|s| s.2 != Mark::Done && Some(&s.0) != flying.as_ref()).map(|s| s.0.clone()).collect();
+                let action = if flying.is_some() { json!("unknown") } else { json!(false) };
+                ("stopped", done_now.clone(), not_run, flying.clone(), Mark::Stopped, json!({ "reason": e, "step": flying, "action_done": action }))
+            }
             Ok(r) => {
                 let outcome = match r["outcome"].as_str() {
                     Some(o @ ("finished" | "stopped" | "diverged" | "not_approved" | "refused")) => o,
@@ -276,7 +338,7 @@ impl Progress {
 
     pub fn view(&self) -> Value {
         let state = if self.pause_asked && self.state == "running" { "pausing" } else { self.state.as_str() };
-        json!({
+        let mut v = json!({
             "run": self.run,
             "task": self.task,
             "state": state,
@@ -284,7 +346,11 @@ impl Progress {
             "current": self.current,
             "steps": self.steps.iter().map(|s| json!({ "id": s.0, "say": s.1, "status": s.2.name() })).collect::<Vec<_>>(),
             "report": self.report,
-        })
+            "shortcut": self.shortcut,
+        });
+        // Step text comes from the task and the executor: shown escaped, never as it arrived.
+        clean(&mut v);
+        v
     }
 }
 
@@ -304,6 +370,11 @@ impl ActiveRun {
 
     pub fn is_live(&self) -> bool {
         !self.progress.is_over()
+    }
+
+    /// True once the officer has asked to stop, whether or not the executor has been told yet.
+    pub fn stop_requested(&self) -> bool {
+        self.stop_wanted || self.progress.is_stopping() || self.handle.as_ref().is_some_and(|h| h.stop_asked())
     }
 
     pub fn pause(&mut self) {
@@ -433,6 +504,65 @@ mod tests {
         r.progress.finish(&Ok(json!({ "outcome": "stopped", "step": "s1", "completed": [], "not_run": ["s1"] })));
         r.stop();
         assert_eq!(r.progress.view()["state"], "stopped");
+    }
+
+    #[test]
+    fn step_text_is_escaped_before_it_reaches_the_window() {
+        let t = json!({ "name": "Task\u{202E}name", "steps": [ { "id": "s1", "say": "Press\u{1b}[2J\u{200B}Create\nnow" } ] });
+        let mut p = Progress::new("r", &t);
+        p.apply(&json!({ "state": "started", "step": "s1", "say": "A\u{2067}B", "index": 1, "total": 1 }));
+        let v = p.view();
+        assert_eq!(v["task"], "Task\\u{202E}name");
+        assert_eq!(v["steps"][0]["say"], "Press\\u{1B}[2J\\u{200B}Create\\u{A}now");
+        assert_eq!(v["current"]["say"], "A\\u{2067}B");
+        assert_eq!(safe_text("plain text, ok"), "plain text, ok");
+    }
+
+    #[test]
+    fn an_executor_ended_after_a_stop_is_a_stop_with_the_step_in_flight_unknown() {
+        let mut p = Progress::new("r", &task());
+        p.apply(&ev("started", "s1", 1));
+        p.apply(&ev("done", "s1", 1));
+        p.apply(&ev("started", "s2", 2));
+        p.note_stop_asked();
+        p.finish(&Err("the executor ended before the run finished".into()));
+        let v = p.view();
+        assert_eq!(v["state"], "stopped");
+        assert_eq!(marks(&p), ["done", "stopped", "todo"]);
+        assert_eq!(v["report"]["step"], "s2");
+        assert_eq!(v["report"]["action_done"], "unknown");
+        assert_eq!(v["report"]["completed"], json!(["s1"]));
+        assert_eq!(v["report"]["not_run"], json!(["s3"]));
+    }
+
+    #[test]
+    fn a_missing_shortcut_is_in_the_view_and_a_stop_is_seen_by_the_run() {
+        let mut p = Progress::new("r", &task());
+        assert_eq!(p.view()["shortcut"], true);
+        p.set_shortcut(false);
+        assert_eq!(p.view()["shortcut"], false);
+        let mut r = ActiveRun::new(p);
+        assert!(!r.stop_requested());
+        r.stop();
+        assert!(r.stop_requested());
+    }
+
+    #[test]
+    fn a_run_that_panics_still_gives_back_its_slot() {
+        let released = Arc::new(Mutex::new(false));
+        let r2 = released.clone();
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = OnDrop::new(move || *r2.lock().unwrap() = true);
+            panic!("the run failed");
+        }));
+        assert!(out.is_err());
+        assert!(*released.lock().unwrap());
+        let ok = Arc::new(Mutex::new(false));
+        let o2 = ok.clone();
+        let mut g = OnDrop::new(move || *o2.lock().unwrap() = true);
+        g.disarm();
+        drop(g);
+        assert!(!*ok.lock().unwrap(), "a finished run is not ended twice");
     }
 
     #[test]

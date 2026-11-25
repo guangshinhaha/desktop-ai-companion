@@ -143,7 +143,9 @@ fn an_executor_that_does_not_stop_is_ended_and_the_shell_records_the_stop() {
     assert!(t.elapsed() < Duration::from_secs(5), "ended after the grace period, not after its 30 s sleep");
     assert_eq!(events(&store), ["run_stopped", "run_finished"]);
     let export = store.export_audit().unwrap();
-    assert!(export.contains("was ended") && export.contains("Not run: s1, s2"), "{export}");
+    assert!(export.contains("was ended") && export.contains("Not run: s2."), "{export}");
+    // The step that was running may have been acted on: it is not called "not run".
+    assert!(export.contains("In flight when it was ended: s1 (whether its action was taken is unknown)"), "{export}");
     store.verify_audit().unwrap();
 }
 
@@ -176,4 +178,65 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"outcome":"finished","completed":["s1","
     h.stop(); // the pipe is closed: nothing is sent, nothing breaks
     std::thread::sleep(Duration::from_millis(250));
     assert!(events(&store).is_empty());
+}
+
+#[test]
+fn a_stop_pressed_before_the_run_starts_is_sent_after_replay_start_not_before() {
+    let dir = tmp("early");
+    let log = dir.join("received.log");
+    // Logs the first two lines it is sent, in order, then ends the run as stopped.
+    let bin = script(
+        &dir,
+        &format!(
+            r#"read -r a
+echo "$a" | sed 's/.*"method":"\([a-z.]*\)".*/\1/' >> '{log}'
+read -r b
+echo "$b" | sed 's/.*"method":"\([a-z.]*\)".*/\1/' >> '{log}'
+echo '{{"jsonrpc":"2.0","id":1,"result":{{"outcome":"stopped","step":"s1","action_done":false,"completed":[],"not_run":["s1","s2"]}}}}'"#,
+            log = log.display()
+        ),
+    );
+    let mut store = open(&dir);
+    // The officer pressed Stop before the executor existed: the shell hands over the controls and the stop goes out at once.
+    let mut on_start = |h: RunHandle| h.stop();
+    let mut on_progress = |_p: &Value| {};
+    let mut hooks = Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: Duration::from_secs(5) };
+    run_replay_with(&bin, &mut store, &ctx(), &task(), &json!({}), None, &mut |_| false, &mut hooks).unwrap();
+    let order: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
+    assert_eq!(order, ["replay.start", "replay.stop"]);
+}
+
+#[test]
+fn no_card_is_put_up_once_the_officer_has_stopped_the_run() {
+    let dir = tmp("stale");
+    let reply = dir.join("reply.log");
+    // Reports a step, waits a moment, then asks for approval as if the stop had not reached it.
+    let bin = script(
+        &dir,
+        &format!(
+            r#"read -r start
+{STARTED}
+sleep 0.3
+echo '{{"jsonrpc":"2.0","id":"x1","method":"approval.request","params":{{"card":{{"step":"s2"}}}}}}'
+while read -r line; do
+  case "$line" in
+    *'"id":"x1"'*) echo "$line" > '{reply}'
+      echo '{{"jsonrpc":"2.0","id":1,"result":{{"outcome":"stopped","step":"s1","action_done":false,"completed":[],"not_run":["s1","s2"]}}}}'
+      exit 0;;
+  esac
+done"#,
+            reply = reply.display()
+        ),
+    );
+    let mut store = open(&dir);
+    let handle: Arc<Mutex<Option<RunHandle>>> = Arc::default();
+    let h2 = handle.clone();
+    let h3 = handle.clone();
+    let mut on_start = move |h: RunHandle| *h2.lock().unwrap() = Some(h);
+    let mut on_progress = |_p: &Value| h3.lock().unwrap().clone().unwrap().stop();
+    let mut hooks = Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: Duration::from_secs(5) };
+    let mut asked = false;
+    run_replay_with(&bin, &mut store, &ctx(), &task(), &json!({}), None, &mut |_| { asked = true; true }, &mut hooks).unwrap();
+    assert!(!asked, "the officer was never asked: the run was stopped");
+    assert!(std::fs::read_to_string(&reply).unwrap().contains(r#""approved":false"#));
 }
