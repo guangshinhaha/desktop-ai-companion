@@ -18,13 +18,18 @@ Chat (#30) and recovery (#34) need a model. Officers work with student, staff an
 
 | Field | Sent | Condition |
 |---|---|---|
-| The step's `say` line, action and descriptor | Yes | Always. Holds no values. |
-| Pruned accessibility tree of the focused window: roles, labels, structure | Yes | Always. |
+| The step's action and descriptor | Yes | Always. The descriptor follows the tree's rules: role always; label, glob and dom id only for a control-chrome role and masked if they hold an input; path as roles only; anchors only as a count. |
+| The step's `say` line, id and checks | No | Task text that can quote page content or values (narrowed in #34). |
+| Pruned accessibility tree of the focused window: roles, structure | Yes | Always. Labels and dom ids only for control chrome (buttons, toggles, form fields, the window, a sheet or dialog, a heading inside a dialog); other text is omitted (narrowed in #34). Any sent label holding a run input is masked. |
 | Field values in that tree | Masked | Sent only if the route is cleared for the data's classification. |
 | Password fields | Never | Never read, never sent. |
 | Screenshot | No | Only if the vision fallback is on and the route is cleared. Held in memory, never written to disk. |
 | Recorded input values and list rows | No | Not part of a recovery request. |
 | Credentials of any kind | Never | The client holds none. |
+
+Also sent (#34), none of it page text: the classification, the app's bundle id, the attempt number and maximum, why the step diverged as a code from a closed set (`not_found`, `dialog`, `no_window`, `find_failed`, `check_failed`, `check_failed:<kind>`, `refused`), the step's consequence flag and index, and the input's name (an identifier only). Dom ids go only on control chrome.
+
+Before #19 turns on a real route, one residual from #34 must be closed: recovery may press a dismissal-labelled button (such as "Close") inside a real dialog when that button is the commit and the dialog's text doesn't use its word ("End this session?" over "Close").
 
 A recovery request is built by one function, so this table is one place to test. The test asserts that a request built from a tree with a seeded value and a password field contains neither unless the ceiling allows the value.
 

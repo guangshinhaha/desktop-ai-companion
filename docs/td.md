@@ -196,8 +196,9 @@ Some applications do not send notifications reliably. For those apps only, and o
 
 When a step's target is not found, or its check fails at the ceiling, the executor builds a recovery request:
 
-- the step's `say` line, action and descriptor;
-- a pruned accessibility tree of the focused window: roles, labels and structure, plus field values only if the route is cleared for them (otherwise masked);
+- the step's action, index, consequence flag and descriptor (under the tree's rules); not its `say` line, id or checks;
+- why it diverged, as a fixed code;
+- a pruned accessibility tree of the focused window: roles and structure, labels only for control chrome, plus field values only if the route is cleared for them (otherwise masked);
 - a screenshot, only if the vision fallback is on and the route is cleared. It is never written to disk.
 
 The model returns one of three answers:
