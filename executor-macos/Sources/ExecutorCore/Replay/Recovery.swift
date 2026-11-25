@@ -66,6 +66,8 @@ public enum RecoveryRequest {
         "AXComboBox", "AXSecureTextField", "AXWindow", "AXSheet", "AXDialog"])
     /// Subroles that mark a dialog: its own label (its title) and its headings are chrome too.
     static let dialogSubroles: Set<String> = ["AXApplicationDialog", "AXDialog", "AXSystemDialog"]
+    /// The only roles a dialog subrole counts on: a static text or row marked as a dialog is still content.
+    static let dialogContainers: Set<String> = ["AXGroup", "AXWindow", "AXSheet", "AXDialog"]
     /// Roles sent as they are. Anything else goes as `AXUnknown`: a role string is the app's, and could carry text.
     static let knownRoles: Set<String> = chromeRoles.union(hoistable).union(rowHolders).union([
         "AXApplication", "AXWebArea", "AXScrollArea", "AXStaticText", "AXHeading", "AXImage", "AXLink", "AXToolbar",
@@ -94,7 +96,13 @@ public enum RecoveryRequest {
         for v in inputs.values.values.map({ $0.reveal() }) {
             var parts = [v] + words(v)
             if let at = v.firstIndex(of: "@") { parts.append(String(v[..<at])) }
-            for p in parts { let c = compact(p); if c.count >= 3 { long.insert(c) } else if !c.isEmpty { short.insert(c) } }
+            for p in parts {
+                let c = compact(p)
+                // Scripts written without spaces (Chinese, Japanese) have no words to match, so a short value in
+                // them is matched anywhere: a two-character name is common.
+                if c.count >= 3 || (c.count >= 2 && c.unicodeScalars.contains { !$0.isASCII }) { long.insert(c) }
+                else if !c.isEmpty { short.insert(c) }
+            }
         }
         return (long, short)
     }
@@ -131,7 +139,8 @@ public enum RecoveryRequest {
             func kids() -> [[String: Any]] {
                 guard depth < maxDepth else { if !n.children.isEmpty { truncated = true }; return [] }
                 var out: [[String: Any]] = []
-                let dialog = inDialog || n.role == "AXSheet" || n.role == "AXDialog" || dialogSubroles.contains(n.subrole ?? "")
+                let dialog = inDialog || n.role == "AXSheet" || n.role == "AXDialog"
+                    || (dialogContainers.contains(n.role) && dialogSubroles.contains(n.subrole ?? ""))
                 for (i, c) in n.children.enumerated() { out += emit(c, path: path + [i], depth: depth + 1, inDialog: dialog) }
                 return out
             }
@@ -140,7 +149,7 @@ public enum RecoveryRequest {
             refs[ref] = (n, path)
             let role = knownRoles.contains(n.role) ? n.role : "AXUnknown"
             var o: [String: Any] = ["ref": ref, "role": role]
-            let isDialog = dialogSubroles.contains(n.subrole ?? "")
+            let isDialog = dialogContainers.contains(n.role) && dialogSubroles.contains(n.subrole ?? "")
             let chrome = chromeRoles.contains(n.role) || isDialog || (n.role == "AXHeading" && inDialog)
             if chrome {
                 let (label, labelMasked) = clean(n.label)
@@ -171,8 +180,12 @@ public enum RecoveryRequest {
         }
         let tree = emit(root, path: [], depth: 0).first ?? [:]
 
-        var stepJSON: [String: Any] = ["id": step.id, "say": step.say, "action": step.action.rawValue,
-                                       "target": descriptorJSON(step.target), "consequential": step.consequential.rawValue]
+        var stepJSON: [String: Any] = ["id": step.id, "action": step.action.rawValue,
+                                       "target": descriptorJSON(step.target, clean: { clean($0) }),
+                                       "consequential": step.consequential.rawValue]
+        let (say, sayMasked) = clean(step.say)
+        if let say { stepJSON["say"] = say }
+        if sayMasked { stepJSON["say_masked"] = true }
         if case .input(let name)? = step.value { stepJSON["input"] = name }
         var json: [String: Any] = [
             "kind": "recover",
@@ -189,8 +202,28 @@ public enum RecoveryRequest {
         return .success(Built(json: json, refs: refs))
     }
 
-    static func descriptorJSON(_ d: Descriptor) -> [String: Any] {
-        guard let data = try? JSONEncoder().encode(d), let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+    /// The step's target under the tree's rules: role always; label, glob and dom id only for a chrome role, and
+    /// masked if they hold an input; the path as roles only; anchors (page text near it) never, only a count.
+    static func descriptorJSON(_ d: Descriptor, clean: (String?) -> (String?, Bool)) -> [String: Any] {
+        var o: [String: Any] = [:]
+        let role = d.role.map { knownRoles.contains($0) ? $0 : "AXUnknown" }
+        if let role { o["role"] = role }
+        if let r = d.role, chromeRoles.contains(r) {
+            for (key, text) in [("label", d.label), ("label_matches", d.labelMatches), ("dom_id", d.domId)] {
+                let (t, masked) = clean(text)
+                if let t { o[key] = t }
+                if masked { o[key + "_masked"] = true }
+            }
+        } else if d.label != nil || d.labelMatches != nil || d.domId != nil {
+            o["text_omitted"] = true
+        }
+        if let p = d.path {
+            o["path"] = p.map { seg -> String in
+                let r = String(seg.split(separator: ":", maxSplits: 1).first ?? "")
+                return knownRoles.contains(r) ? r : "AXUnknown"
+            }
+        }
+        if let a = d.anchors, !a.isEmpty { o["anchors_omitted"] = a.count }
         return o
     }
 }
@@ -271,17 +304,24 @@ public enum RecoveryAnswer: Equatable {
     static func askedAbout(_ label: String, path: [Int], root: UINode) -> Bool {
         var chain: [UINode] = [root]
         for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return true }; chain.append(n.children[i]) }
+        // Its dialog or sheet; with none (a web modal with no dialog role), the whole window.
         let around = chain.last { $0.role == "AXSheet" || $0.role == "AXDialog" || RecoveryRequest.dialogSubroles.contains($0.subrole ?? "") }
-            ?? chain.last ?? root
+            ?? root
         let word = RecoveryRequest.words(label)
         guard !word.isEmpty else { return false }
         func texts(_ n: UINode) -> [String] {
             let own = n.role == "AXButton" ? [] : [n.label].compactMap { $0 }
             return own + n.children.flatMap(texts)
         }
+        // Words match by stem, so "Closing", "closed" and "Dismissal" count as the button's word.
+        func stem(_ w: String) -> String { w.count > 3 && w.hasSuffix("e") ? String(w.dropLast()) : w }
+        let stems = word.map(stem)
         return texts(around).contains { t in
             let w = RecoveryRequest.words(t)
-            return w.count >= word.count && (0...(w.count - word.count)).contains { Array(w[$0..<($0 + word.count)]) == word }
+            guard w.count >= stems.count else { return false }
+            return (0...(w.count - stems.count)).contains { i in
+                stems.indices.allSatisfy { j in stems[j].count < 3 ? w[i + j] == stems[j] : w[i + j].hasPrefix(stems[j]) }
+            }
         }
     }
 
@@ -310,8 +350,16 @@ public enum RecoveryAnswer: Equatable {
         }
         switch kind {
         case .press:
+            // The app's own chrome (tab strip, toolbar, menu bar) can leave the recorded page: never pressed.
+            var up: UINode = root
+            for i in sent.path.dropLast() {
+                if ["AXTabGroup", "AXToolbar", "AXMenuBar", "AXMenu"].contains(up.role) { return refuse("it presses the app's own tabs, toolbar or menus, which may leave the recorded page") }
+                guard i < up.children.count else { break }
+                up = up.children[i]
+            }
+            if ["AXTabGroup", "AXToolbar", "AXMenuBar", "AXMenu"].contains(up.role) { return refuse("it presses the app's own tabs, toolbar or menus, which may leave the recorded page") }
             switch node.role {
-            case "AXDisclosureTriangle", "AXTab": break
+            case "AXDisclosureTriangle": break
             case "AXButton":
                 guard dismissals.contains(RecoveryRequest.fold(label)) else {
                     return refuse("it presses a button that is not a way to dismiss something, which may be consequential")
