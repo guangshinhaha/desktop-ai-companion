@@ -1,9 +1,26 @@
 //! Content-free usage log (#35): the adoption metric. Counts per day for a closed set of event
-//! names, nothing else. There is no text column and no API that takes a string from the caller,
-//! so an input, chat text, label or screen content cannot be written. The file is local; nothing
-//! here touches the network. The only way out is `export_to`, which the officer triggers.
+//! names, nothing else. There is no text column, and what writes the log (`record`, `Tally`) takes an
+//! [`Event`] and no string, so an input, chat text, label or screen content cannot be written.
+//! `counted_replay` holds a run's task and inputs only to pass them to the replay. The file is local;
+//! nothing here touches the network. The only way out is `export_to`, which the officer triggers.
+//!
+//! What each count means:
+//!  - `replay_started`: the executor was launched and sent the task, once per launch, for a single replay or
+//!    a list row. A retried row counts again. A run that fails before that counts nothing.
+//!  - `replay_finished`: a launch whose report said `finished`. Refused, not approved, diverged, stopped and
+//!    an executor that died count as started only.
+//!  - `list_run`: a new list run. Picking an unfinished one up is the same list run.
+//!  - `row_done`: a row a replay finished. A row the officer marked done or did by hand is not counted.
+//!  - `chat_request`: a chat turn that got a reply.
+//!
+//! Days are UTC.
 
+use crate::approval::{run_replay_observed, Hooks, ItemObserver, RunContext};
+use crate::listrun::Loaded;
+use crate::progress::RunHandle;
+use crate::store::Store;
 use rusqlite::{params, Connection};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +56,67 @@ pub fn default_path() -> Option<PathBuf> {
     crate::store::default_path().map(|p| p.with_file_name("usage.db"))
 }
 
+/// What the app's flows record into. It takes an [`Event`] and nothing else, and it never fails.
+pub struct Tally(Option<PathBuf>);
+
+impl Tally {
+    pub fn at(path: PathBuf) -> Tally {
+        Tally(Some(path))
+    }
+
+    /// The device's log ([`default_path`]).
+    pub fn device() -> Tally {
+        Tally(default_path())
+    }
+
+    /// Records nothing.
+    pub const fn off() -> Tally {
+        Tally(None)
+    }
+
+    /// Adds one to today's count. A log that cannot be written is ignored: counting never affects the app.
+    pub fn note(&self, event: Event) {
+        let Some(path) = &self.0 else { return };
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return };
+        let _ = UsageLog::open(path).and_then(|log| log.record(event, 1, now.as_secs() as i64));
+    }
+
+    /// Counts a list run the officer started. One picked up again was counted when it was new.
+    pub fn list_run_loaded(&self, loaded: &Loaded) {
+        if !loaded.resumed {
+            self.note(Event::ListRun);
+        }
+    }
+}
+
+/// `approval::run_replay_observed`, counted.
+#[allow(clippy::too_many_arguments)]
+pub fn counted_replay(
+    tally: &Tally,
+    bin: &Path,
+    store: &mut Store,
+    ctx: &RunContext,
+    task: &Value,
+    inputs: &Value,
+    pid: Option<i64>,
+    decide: &mut dyn FnMut(&Value) -> bool,
+    hooks: &mut Hooks,
+    obs: &mut dyn ItemObserver,
+) -> std::result::Result<Value, String> {
+    let on_start = &mut *hooks.on_start;
+    // Called only once the executor is up and has the task. The shell gets its handle first.
+    let mut started = |handle: RunHandle| {
+        on_start(handle);
+        tally.note(Event::ReplayStarted);
+    };
+    let mut counted = Hooks { on_start: &mut started, on_progress: &mut *hooks.on_progress, stop_grace: hooks.stop_grace };
+    let result = run_replay_observed(bin, store, ctx, task, inputs, pid, decide, &mut counted, obs);
+    if result.as_ref().is_ok_and(|report| report["outcome"] == "finished") {
+        tally.note(Event::ReplayFinished);
+    }
+    result
+}
+
 pub struct UsageLog {
     conn: Connection,
 }
@@ -62,6 +140,8 @@ impl UsageLog {
             Err(x) => return Err(s(x)),
         }
         let conn = Connection::open(path).map_err(s)?;
+        // A run writes here as it goes, so a locked log is given up on quickly (the default wait is 5 s).
+        conn.busy_timeout(std::time::Duration::from_millis(200)).map_err(s)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS usage_daily (
                day INTEGER NOT NULL, event TEXT NOT NULL, n INTEGER NOT NULL,
