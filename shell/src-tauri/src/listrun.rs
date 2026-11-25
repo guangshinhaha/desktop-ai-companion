@@ -23,6 +23,7 @@
 use crate::approval::{ItemObserver, RunContext};
 use crate::csv::{self, InputSpec};
 use crate::store::{AuditEntry, Store};
+use crate::usage::{Event, Tally};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -146,6 +147,8 @@ pub struct RunParams<'a> {
     pub from: Option<i64>,
     /// Checked before each row. True ends the run between rows; a row already started is finished or stopped first.
     pub stop: &'a dyn Fn() -> bool,
+    /// Where finished rows are counted (#35).
+    pub usage: &'a Tally,
 }
 
 /// Runs the pending rows in order. Stops at the first `diverged` or `unknown` row.
@@ -191,6 +194,7 @@ pub fn run_rows(store: &mut Store, p: &RunParams, replay: &mut ReplayRow) -> Res
         let inputs = &p.rows[(item - 1) as usize];
         let result = replay(store, &ctx, inputs, &mut Row::new(p.run, item));
         match settle(store, p.run, item, &result)? {
+            Settled::Done => p.usage.note(Event::RowDone),
             Settled::Next => {}
             Settled::Halt(state) => {
                 let _ = store.finish_run(p.run, "stopped");
@@ -209,6 +213,9 @@ pub fn run_rows(store: &mut Store, p: &RunParams, replay: &mut ReplayRow) -> Res
 }
 
 enum Settled {
+    /// The replay finished the row. The run goes on.
+    Done,
+    /// The row ended without being done. The run goes on.
     Next,
     /// The row ended `unknown` or `diverged`: the run stops here until the officer answers.
     Halt(String),
@@ -226,7 +233,7 @@ fn settle(store: &mut Store, run: &str, item: i64, result: &Result<Value, String
     match outcome {
         Some("finished") => {
             if db(store.move_run_item(run, item, &[COMMITTING, RUNNING], DONE, None))? {
-                return Ok(Settled::Next);
+                return Ok(Settled::Done);
             }
             // Finished, but the row is in a state the shell did not expect: do not call it done.
             db(store.move_run_item(run, item, &[AWAITING, PENDING], UNKNOWN, None))?;
@@ -470,6 +477,8 @@ mod tests {
     use super::*;
     use crate::store::Fixed;
 
+    static NO_LOG: Tally = Tally::off();
+
     fn store() -> Store {
         store_with_path().0
     }
@@ -490,7 +499,7 @@ mod tests {
     }
 
     fn params<'a>(rows: &'a [Value], stop: &'a dyn Fn() -> bool) -> RunParams<'a> {
-        RunParams { run: "run_1", task_ref: "tsk_x@1", officer: "Test Officer", rows, from: None, stop }
+        RunParams { run: "run_1", task_ref: "tsk_x@1", officer: "Test Officer", rows, from: None, stop, usage: &NO_LOG }
     }
 
     #[test]

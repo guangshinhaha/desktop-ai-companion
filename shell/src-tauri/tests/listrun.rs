@@ -9,6 +9,7 @@ use std::time::Duration;
 use companion_shell::csv;
 use companion_shell::listrun::{self, Answer, Outcome, RunParams};
 use companion_shell::store::{Fixed, Store};
+use companion_shell::usage::Tally;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -142,7 +143,7 @@ impl<'a> Go<'a> {
         fake["url"] = json!(self.url);
         task["fake"] = fake;
         let never = || false;
-        let p = RunParams { run: "run_1", task_ref: "tsk_p@1", officer: OFFICER, rows: &self.fx.rows, from: self.from, stop: &never };
+        let p = RunParams { run: "run_1", task_ref: "tsk_p@1", officer: OFFICER, rows: &self.fx.rows, from: self.from, stop: &never, usage: &Tally::off() };
         let mut asked = 0;
         let mut current = 0i64;
         let out = listrun::run_rows(&mut s, &p, &mut |store, ctx, inputs, obs| {
@@ -378,7 +379,7 @@ fn two_stores_cannot_run_the_same_run_and_the_second_does_not_touch_its_rows() {
     let _lease = a.lease_run("run_1").unwrap().expect("the first holder gets the run");
     let mut b = open(&fx.dir);
     let never = || false;
-    let p = RunParams { run: "run_1", task_ref: "tsk_p@1", officer: OFFICER, rows: &fx.rows, from: None, stop: &never };
+    let p = RunParams { run: "run_1", task_ref: "tsk_p@1", officer: OFFICER, rows: &fx.rows, from: None, stop: &never, usage: &Tally::off() };
     let mut called = false;
     let r = listrun::run_rows(&mut b, &p, &mut |_, _, _, _| {
         called = true;

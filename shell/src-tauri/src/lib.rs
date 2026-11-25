@@ -83,11 +83,7 @@ async fn chat_send(
             let _ = on_event.send(serde_json::json!({ "text": t }));
         };
         chat::chat_turn(&service, &store, &classification, &messages, now, &mut on_text).map_err(|e| e.to_json())?;
-        if let Some(path) = usage::default_path() {
-            if let Ok(log) = usage::UsageLog::open(&path) {
-                let _ = log.record(usage::Event::ChatRequest, 1, now);
-            }
-        }
+        usage::Tally::device().note(usage::Event::ChatRequest);
         Ok(())
     })
     .await
@@ -281,7 +277,7 @@ async fn replay_start(
         let mut on_start = |h| run_ui::attach(&app, h);
         let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(&app, p);
         let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
-        let result = approval::run_replay_with(&executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
+        let result = usage::counted_replay(&usage::Tally::device(), &executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
             // A card is never put up for a run the officer has stopped.
             if run_ui::stop_asked(&app) {
                 return false;
@@ -299,7 +295,7 @@ async fn replay_start(
             }
             // No timeout: waiting is not consent. A closed window or a dropped sender is a no.
             rx.recv().unwrap_or(false)
-        }, &mut hooks);
+        }, &mut hooks, &mut approval::NoObserver);
         guard.finish(&app, &result);
         let status = match &result {
             Ok(r) if r["outcome"] == "finished" => "finished",
@@ -604,7 +600,7 @@ fn replay_row(
     let mut on_start = |h| run_ui::attach(app, h);
     let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(app, p);
     let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
-    let result = approval::run_replay_observed(&executor::executor_path(), store, ctx, task, inputs, pid, &mut |card| ask_officer(app, card), &mut hooks, obs);
+    let result = usage::counted_replay(&usage::Tally::device(), &executor::executor_path(), store, ctx, task, inputs, pid, &mut |card| ask_officer(app, card), &mut hooks, obs);
     // The officer pressed Stop for this row: no more rows after it.
     if run_ui::stop_asked(app) {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -637,7 +633,8 @@ fn spawn_listrun(
             let task = saved_task(&store, &task_id, version)?;
             let task_ref = format!("{task_id}@{version}");
             let stopped = || stop.load(Ordering::SeqCst);
-            let params = listrun::RunParams { run: &run, task_ref: &task_ref, officer: &officer, rows: &rows, from, stop: &stopped };
+            let tally = usage::Tally::device();
+            let params = listrun::RunParams { run: &run, task_ref: &task_ref, officer: &officer, rows: &rows, from, stop: &stopped, usage: &tally };
             listrun::run_rows(&mut store, &params, &mut |store, ctx, inputs, obs| {
                 let result = replay_row(&app, store, ctx, &task, inputs, pid, &stop, obs);
                 // Each row's result counts toward the version's verification, the same as a single run (#42).
@@ -697,6 +694,7 @@ async fn listrun_start(
             }
         }
         drop(store);
+        usage::Tally::device().list_run_loaded(&loaded);
         let run = loaded.run.clone();
         spawn_listrun(app, guard, stop, end_by, loaded.run, task_id, version, loaded.rows, None, officer, pid);
         Ok(run)
