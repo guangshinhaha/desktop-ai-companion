@@ -250,13 +250,15 @@ Each record is appended to the local `audit` table and synced to the companion s
 }
 ```
 
-Events: `run_started`, `approved`, `rejected`, `step_diverged`, `recovered`, `run_finished`, `item_marked_by_officer`, `task_saved`, `task_shared`, `task_handed_over`.
+Events: `run_started`, `approved`, `rejected`, `step_diverged`, `recovered`, `run_stopped`, `run_finished`, `item_marked_by_officer`, `task_saved`, `task_shared`, `task_handed_over`.
 
 Each record carries the hash of the one before it, so a missing or edited record breaks the chain and shows up on verification.
 
 **Decided (decision 0005):** the record stores the values the officer approved, encrypted, in the local audit store only. Retention defaults to 7 years (2555 days), as config. A central copy comes with #29.
 
 How it is built. The shell owns the store and the officer's identity. The executor asks over the stdio JSON-RPC (`audit.append`, `approval.request`) and the shell writes the record through the store's API; the executor cannot set the officer, task, run or time. `approved` is written before the action runs, and a failed write stops the run. `executor-macos verify-audit` reads the shell's JSONL export on stdin and exits 0 when the chain is intact, or 5 naming the sequence number of the first bad or missing record. The `recovered`, `item_marked_by_officer`, `task_shared` and `task_handed_over` events are allowed by the store but have no producer yet.
+
+Progress and stop (#28). The executor sends `run.progress` notifications (`started`, `done`, `paused`, `resumed`, with `step`, `say`, `index`, `total`); the shell draws them in a progress window. The shell sends `replay.pause`, `replay.resume` and `replay.stop` as notifications (no id, no reply), each a whole line written at once. The executor reads them without a second thread: it polls stdin between steps and every 0.1 s while a step waits, so a stop cancels a waiting step within 500 ms and leaves the app as it is. Pause holds between steps; end of input while paused means stop. A stop is written as `run_stopped` (the step it came at, what completed, what did not) and then `run_finished` "stopped", not as a rejection. A stop while an approval card is open answers it no; an approval followed by a stop before the action is not recorded as approved. If the executor has not ended the run 2 s after a stop, the shell ends the process and writes `run_stopped` and `run_finished` itself, saying the executor was ended. The stop shortcut (Cmd+Shift+Period) is registered only while a run is on.
 
 Limit: whoever holds the store key can recompute every hash and the control row and forge a whole trail. The central copy (#29) is what closes that.
 

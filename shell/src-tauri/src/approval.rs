@@ -329,7 +329,10 @@ mod tests {
 
     fn store() -> (Store, std::path::PathBuf) {
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("companion-approval-{}-{n}", std::process::id()));
+        // A counter as well as the clock: parallel tests can read the same clock tick and share a directory.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("companion-approval-{}-{n}-{k}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         (Store::open(&dir.join("s.db"), &Fixed([7u8; 32])).unwrap(), dir)
     }
