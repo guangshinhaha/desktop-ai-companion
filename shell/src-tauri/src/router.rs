@@ -3,16 +3,40 @@
 //! the local store only; it sends nothing anywhere and holds no input value.
 
 use crate::store::Store;
+use crate::verification;
 use serde_json::{json, Value};
 
 /// The saved tasks (newest version of each) as the canvas needs them: id, version, name, and the
 /// inputs the officer must supply (`source: ask`). `column` and `read` inputs are filled by the run.
 pub fn catalog(store: &Store) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
-    for (id, version, body) in store.latest_tasks().map_err(|e| e.to_string())? {
+    for (id, latest, latest_body) in store.latest_tasks().map_err(|e| e.to_string())? {
+        // The version offered is not always the newest: after a flag the older one stays until a newer one passes (#42).
+        let st = verification::status(store, &id)?;
+        let version = st.as_ref().map_or(latest, |s| s.default_version);
+        let body = if version == latest {
+            latest_body
+        } else {
+            store.task_body(&id, version).map_err(|e| e.to_string())?.unwrap_or_default()
+        };
         let Ok(task) = serde_json::from_str::<Value>(&body) else { continue };
         let Some(name) = task["name"].as_str() else { continue };
-        out.push(json!({ "id": id, "version": version, "name": name, "inputs": ask_inputs(&task) }));
+        let mut entry = json!({ "id": id, "version": version, "name": name, "inputs": ask_inputs(&task) });
+        if let Some(s) = &st {
+            entry["status"] = json!(s.standing.as_str());
+            if s.standing == verification::Standing::NeedsVerification {
+                entry["flagged_step"] = json!(s.flagged_step);
+            }
+            // A newer recording that has not passed: offered on its own, with its own inputs, to be verified.
+            // The author's name is not in the catalog (the canvas does not need it).
+            if let Some(cv) = s.candidate_version {
+                let cb = store.task_body(&id, cv).map_err(|e| e.to_string())?;
+                if let Some(Ok(ct)) = cb.map(|b| serde_json::from_str::<Value>(&b)) {
+                    entry["candidate"] = json!({ "version": cv, "inputs": ask_inputs(&ct) });
+                }
+            }
+        }
+        out.push(entry);
     }
     Ok(out)
 }

@@ -198,6 +198,7 @@ final class ReplayAuditTests: XCTestCase {
         guard case .diverged(let step, let why) = rep.outcome else { return XCTFail("must stop") }
         XCTAssertEqual(step, "s3")
         XCTAssertTrue(why.contains("audit"))
+        XCTAssertFalse(rep.interfaceChanged, "an audit write failure is not an interface change")
         XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
         XCTAssertEqual(a.kinds, [.runStarted, .stepDiverged, .runFinished])
     }

@@ -101,7 +101,20 @@
     function offerTask(task, explicit, text) {
       flow = { kind: "offer_task", task, explicit, text };
       lastRequest = { path: "task", task: task.name, started: false };
-      local(text, `I have a saved task called "${task.name}". Run it? Say yes or no.`);
+      local(text, offerText(task));
+    }
+
+    // What the officer is told before a task runs (#42). A task that diverged because the app changed says so,
+    // and a newer recording that has not passed yet is offered on its own: "new" runs it to verify it.
+    function offerText(task) {
+      const step = /^s[0-9]+$/.test(task.flagged_step || "") ? ` at step ${task.flagged_step}` : "";
+      const cand = task.candidate && task.candidate.version ? ` A new recording of it has been saved but has not passed yet. Say "new" to run the new recording and verify it, or "yes" to run the current one.` : "";
+      if (task.status === "needs_verification") {
+        return `I have a saved task called "${task.name}", but it needs verification: it stopped${step} last time, so the app may have changed.${cand || " Run it anyway? Say yes or no."} Each step that changes something still asks you first.`;
+      }
+      if (cand) return `I have a saved task called "${task.name}".${cand}`;
+      if (task.status === "unverified") return `I have a saved task called "${task.name}". It has not finished a run yet. Run it? Say yes or no.`;
+      return `I have a saved task called "${task.name}". Run it? Say yes or no.`;
     }
 
     async function startTask() {
@@ -119,7 +132,8 @@
       busy = false;
       lastRequest.started = !!r.ok;
       lastRequest.outcome = r.ok ? r.outcome || "done" : "not started";
-      turns.push({ role: "assistant", text: r.ok ? `Finished with outcome: ${lastRequest.outcome}.` : r.message || "The task could not be started." });
+      const note = r.ok && typeof r.verification_note === "string" ? ` ${r.verification_note}` : "";
+      turns.push({ role: "assistant", text: (r.ok ? `Finished with outcome: ${lastRequest.outcome}.` : r.message || "The task could not be started.") + note });
       draw();
     }
 
@@ -145,6 +159,14 @@
       const f = flow;
       const cancel = R.norm(text) === "cancel";
       if (f.kind === "offer_task") {
+        if (f.task.candidate && f.task.candidate.version && ["new", "verify", "verify new", "run new", "the new one"].includes(R.norm(text))) {
+          // The new recording runs as its own version, with its own inputs. Only its own finished run makes it the default.
+          const c = f.task.candidate;
+          flow = { kind: "collecting", task: { id: f.task.id, name: f.task.name, version: c.version, inputs: c.inputs || [] }, values: [] };
+          turns.push({ role: "user", text });
+          draw();
+          return collect();
+        }
         if (R.isYes(text)) {
           flow = { kind: "collecting", task: f.task, values: [] };
           turns.push({ role: "user", text });

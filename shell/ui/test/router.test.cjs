@@ -49,12 +49,12 @@ const fakeDoc = { createElement: (t) => new Node(t) };
 
 function setup(tasks = TASKS) {
   const ui = { input: new Node("input"), select: new Node("select"), log: new Node("div"), status: new Node("p") };
-  const calls = { send: [], replay: [], record: [] };
+  const calls = { send: [], replay: [], record: [], versions: [] };
   const api = {
     expand() {},
     tasks: async () => tasks,
     send: async (c, m, on) => { calls.send.push(m.at(-1).content); on("Sure."); return { ok: true }; },
-    replay: async (task, inputs, officer) => { calls.replay.push({ task: task.id, inputs: { ...inputs }, officer }); return { ok: true, outcome: "finished" }; },
+    replay: async (task, inputs, officer) => { calls.versions.push(task.version); calls.replay.push({ task: task.id, inputs: { ...inputs }, officer }); return { ok: true, outcome: "finished" }; },
     record: async (bundle) => { calls.record.push(bundle); return { ok: true }; },
   };
   const chat = createChat(fakeDoc, api, ui);
@@ -92,6 +92,44 @@ test("starting a task with inputs asks for each one in turn, and runs only when 
   assert.deepEqual(calls.replay, [{ task: "tsk_a", inputs: { full_name: "Test Person", role: "Admin" }, officer: "Test Officer" }]);
   assert.ok(!log().includes("Test Person"), "typed values are not echoed into the log");
   assert.ok(!calls.send.length, "values never went to chat");
+});
+
+const FLAGGED = [{
+  id: "tsk_f", version: 1, name: "File test form", status: "needs_verification", flagged_step: "s3", inputs: [{ name: "case_ref", type: "text" }],
+  candidate: { version: 2, inputs: [{ name: "case_ref", type: "text" }, { name: "reason", type: "text" }] },
+}];
+
+test("a flagged task says it needs verification, and which step, before it is offered to run (#42)", async () => {
+  const { say, last, calls } = setup(FLAGGED);
+  await say("run File test form");
+  assert.match(last(), /needs verification/);
+  assert.match(last(), /step s3/);
+  assert.match(last(), /new/);
+  assert.equal(calls.replay.length, 0);
+});
+
+test("'new' runs the new recording as its own version with its own inputs; 'yes' runs the current one (#42)", async () => {
+  const a = setup(FLAGGED);
+  await a.say("run File test form");
+  await a.say("new");
+  await a.say("Test Officer");
+  assert.match(a.last(), /case ref/);
+  await a.say("C-1");
+  assert.match(a.last(), /reason/, "the new recording's inputs are asked");
+  await a.say("Test reason");
+  assert.deepEqual(a.calls.versions, [2]);
+  const b = setup(FLAGGED);
+  await b.say("run File test form");
+  await b.say("yes");
+  await b.say("Test Officer");
+  await b.say("C-1");
+  assert.deepEqual(b.calls.versions, [1]);
+});
+
+test("an unverified task says it has not finished a run, never 'ok' (#42)", async () => {
+  const { say, last } = setup([{ id: "tsk_u", version: 1, name: "Fresh task", status: "unverified", inputs: [] }]);
+  await say("run Fresh task");
+  assert.match(last(), /not finished a run/);
 });
 
 test("no default or guessed value: a blank or off-list answer asks again and nothing runs", async () => {
