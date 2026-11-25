@@ -11,6 +11,7 @@ final class FakeHost: ReplayHost {
     var waits: [TimeInterval] = []
     var fields: [String: String] = [:]          // dom id -> value
     var onPress: ((UINode, FakeHost) -> Void)?
+    var onSet: ((UINode, FakeHost) -> Void)?
     var pressResult: ActionResult = .ok
     var reselectClears = false
     var chooseIgnored = false
@@ -36,6 +37,7 @@ final class FakeHost: ReplayHost {
     func setValue(_ node: UINode, to text: String) -> ActionResult {
         actions.append("set:\(node.domId ?? "-")")
         if let id = node.domId { fields[id] = text }
+        onSet?(node, self)
         return .ok
     }
     func choose(_ node: UINode, option: String) -> ActionResult {
@@ -550,6 +552,37 @@ final class ReplayerTests: XCTestCase {
         XCTAssertEqual(step, "s3")
         XCTAssertTrue(why.contains("may or may not have taken effect"))
         XCTAssertTrue(rep.interfaceChanged, "a check that never held is an interface change")
+    }
+
+    func testWindowGoneBeforeAStepIsNotAnInterfaceChange() throws {
+        let t = try makeTask(), h = host()
+        h.tree = nil
+        let (r, _) = try replayer(t, h, answers: ["y"], ceiling: 3)
+        let rep = r.run()
+        guard case .diverged = rep.outcome else { return XCTFail("\(rep.outcome)") }
+        XCTAssertFalse(rep.interfaceChanged, "a closed window or a quit app is not the interface changing")
+    }
+
+    func testWindowGoneBetweenStepsIsNotAnInterfaceChange() throws {
+        let t = try makeTask(), h = host()
+        h.onPress = { _, _ in }
+        // The window closes after the second step's field was filled: the next target has no window to be in.
+        h.onSet = { _, h in h.tree = nil }
+        let (r, _) = try replayer(t, h, answers: ["y"], ceiling: 3)
+        let rep = r.run()
+        guard case .diverged = rep.outcome else { return XCTFail("\(rep.outcome)") }
+        XCTAssertFalse(rep.interfaceChanged)
+    }
+
+    func testWindowGoneAfterTheApprovedPressIsNotAnInterfaceChange() throws {
+        let t = try makeTask(), h = host()
+        h.onPress = { _, h in h.tree = nil }
+        let (r, _) = try replayer(t, h, answers: ["y"], ceiling: 3)
+        let rep = r.run()
+        guard case .diverged(let step, let why) = rep.outcome else { return XCTFail("\(rep.outcome)") }
+        XCTAssertEqual(step, "s3")
+        XCTAssertTrue(why.contains("no window"), why)
+        XCTAssertFalse(rep.interfaceChanged, "the app closing after the press is not the interface changing")
     }
 
     func testUnexpectedDialogStopsAndIsNeverClicked() throws {

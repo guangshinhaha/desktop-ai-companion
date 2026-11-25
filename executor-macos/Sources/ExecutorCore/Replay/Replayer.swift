@@ -205,8 +205,10 @@ public final class Replayer {
     static let ambiguousPrefix = "ambiguous: "
 
     func findTarget(_ step: ReplayTask.Step, ceiling: TimeInterval) -> Swift.Result<Match, Divergence> {
+        var sawWindow = false // no window at all is not an interface change: the officer closed it, or the app quit
         let r: Waiting.Result<Match> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
-            guard let root = host.snapshot() else { return .keepWaiting }
+            guard let root = host.snapshot() else { sawWindow = false; return .keepWaiting }
+            sawWindow = true
             if let d = unexpectedDialog(in: root, step: step) { return .stop("\(d) is open before the step; nothing was clicked") }
             switch Resolver.resolve(step.target, in: root) {
             case .found(let m): return .done(m)
@@ -216,7 +218,7 @@ public final class Replayer {
         }
         switch r {
         case .done(let m): return .success(m)
-        case .ceiling: return .failure(Divergence(reason: "element not found within \(Int(ceiling)) s", interface: true))
+        case .ceiling: return .failure(Divergence(reason: "element not found within \(Int(ceiling)) s", interface: sawWindow))
         case .stopped(let why): return .failure(Divergence(reason: why, interface: why.hasPrefix(Self.ambiguousPrefix)))
         case .cancelled: return .failure(Divergence(reason: "stopped by the officer", stopped: true))
         }
@@ -260,8 +262,10 @@ public final class Replayer {
     /// Waits until every check of the step passes. Returns nil on success, or why not.
     func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval, gated: Bool) -> (String, Bool)? {
         var last = "no window"
+        var sawWindow = false // a window that is gone is not an interface change
         let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
-            guard let root = host.snapshot() else { return .keepWaiting }
+            guard let root = host.snapshot() else { sawWindow = false; return .keepWaiting }
+            sawWindow = true
             guard let failing = checksFailure(step, root: root) else { return .done(()) }
             // A passing check wins over a dialog that the step expects; otherwise a new dialog is a stop.
             if let d = unexpectedDialog(in: root, step: step) { return .stop("unexpected dialog: \(d) appeared and was not clicked. The step's action was done and the dialog is still open; recovery is Phase 1") }
@@ -272,7 +276,7 @@ public final class Replayer {
         case .done: return nil
         case .ceiling:
             let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
-            return ("check not met within \(Int(ceiling)) s: \(last)." + tail, true)
+            return ("check not met within \(Int(ceiling)) s: \(last)." + tail, sawWindow)
         case .stopped(let why): return (why, false)
         case .cancelled: return ("stopped by the officer", false)
         }
