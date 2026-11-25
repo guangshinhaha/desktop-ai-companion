@@ -156,6 +156,7 @@ fn append_event_refuses_names_outside_the_td_list() {
         "approved",
         "rejected",
         "step_diverged",
+        "run_stopped",
         "recovered",
         "run_finished",
         "item_marked_by_officer",
@@ -165,6 +166,6 @@ fn append_event_refuses_names_outside_the_td_list() {
     ] {
         s.append_event(&mk(ok)).unwrap();
     }
-    assert_eq!(s.audit_count().unwrap(), 10);
+    assert_eq!(s.audit_count().unwrap(), 11);
     s.verify_audit().unwrap();
 }

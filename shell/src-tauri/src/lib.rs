@@ -6,8 +6,10 @@ pub mod approval;
 pub mod chat;
 pub mod executor;
 pub mod extract;
+pub mod progress;
 pub mod recording;
 pub mod review;
+mod run_ui;
 pub mod store;
 pub mod usage;
 
@@ -124,6 +126,8 @@ struct Session {
     draft: Mutex<Option<review::Draft>>,
     recording: Mutex<Option<recording::Recording>>,
     approval: Mutex<Option<PendingApproval>>,
+    /// The replay on screen, or the last one's report.
+    run: Mutex<Option<progress::ActiveRun>>,
 }
 
 /// The card on screen and where the officer's answer goes. One at a time: a run asks one question at a time.
@@ -216,18 +220,37 @@ async fn replay_start(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let run = format!("run_{nanos:x}");
-        store.start_run(&run, &task_id, version, "shell", now_secs()).map_err(|e| e.to_string())?;
+        // The progress view, its Pause and Stop, and the stop shortcut, for as long as the run lasts.
+        let guard = run_ui::begin(&app, progress::Progress::new(&run, &task))?;
+        if let Err(e) = store.start_run(&run, &task_id, version, "shell", now_secs()) {
+            let e = e.to_string();
+            guard.finish(&app, &Err(e.clone()));
+            return Err(e);
+        }
         let ctx = approval::RunContext { officer, task_ref: format!("{task_id}@{version}"), run: run.clone() };
-        let result = approval::run_replay(&executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
+        let mut on_start = |h| run_ui::attach(&app, h);
+        let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(&app, p);
+        let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
+        let result = approval::run_replay_with(&executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
+            // A card is never put up for a run the officer has stopped.
+            if run_ui::stop_asked(&app) {
+                return false;
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             let label = format!("approval-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
             if let Ok(mut p) = app.state::<Session>().approval.lock() {
                 *p = Some(PendingApproval { card: card.clone(), answer: tx, label: label.clone() });
             }
-            open_approval_window(&app, &label);
+            // Checked again now the card is pending: a stop from here on answers it, and one just before is seen here.
+            if run_ui::stop_asked(&app) {
+                answer_approval(&app, Some(&label), false);
+            } else {
+                open_approval_window(&app, &label);
+            }
             // No timeout: waiting is not consent. A closed window or a dropped sender is a no.
             rx.recv().unwrap_or(false)
-        });
+        }, &mut hooks);
+        guard.finish(&app, &result);
         let status = match &result {
             Ok(r) if r["outcome"] == "finished" => "finished",
             Ok(r) if r["outcome"] == "refused" => "refused",
@@ -371,9 +394,14 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_shortcuts([shortcut])
                 .expect("register shortcut")
-                .with_handler(|app, _s, event| {
+                .with_handler(|app, s, event| {
                     if event.state == ShortcutState::Pressed {
-                        toggle_canvas(app);
+                        // The stop shortcut is registered only while a replay runs.
+                        if *s == run_ui::stop_shortcut() {
+                            run_ui::stop_active(app);
+                        } else {
+                            toggle_canvas(app);
+                        }
                     }
                 })
                 .build(),
@@ -393,6 +421,10 @@ pub fn run() {
             approval_current,
             approval_answer,
             replay_start,
+            run_ui::progress_current,
+            run_ui::run_pause,
+            run_ui::run_resume,
+            run_ui::run_stop,
             audit_verify
         ])
         .setup(|app| {

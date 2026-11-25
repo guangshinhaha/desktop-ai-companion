@@ -8,15 +8,19 @@
 //! No answer is never a yes: if the executor ends, or the officer's window closes, the run stops.
 //! Nothing here logs, prints or puts a value in an error.
 
+use crate::progress::{RunHandle, SharedWriter, STOP_GRACE};
 use crate::store::{AuditEntry, Store};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Events the executor may append. The shell's own events (`task_saved` and the rest) are not among them.
-pub const EXECUTOR_EVENTS: [&str; 6] =
-    ["run_started", "approved", "rejected", "step_diverged", "recovered", "run_finished"];
+pub const EXECUTOR_EVENTS: [&str; 7] =
+    ["run_started", "approved", "rejected", "step_diverged", "run_stopped", "recovered", "run_finished"];
 
 /// Longest `shown` or `step` text taken from the executor.
 const MAX_FIELD: usize = 16 * 1024;
@@ -54,14 +58,28 @@ pub fn start_request(id: u64, task: &Value, inputs: &Value, pid: Option<i64>) ->
     json!({ "jsonrpc": "2.0", "id": id, "method": "replay.start", "params": params }).to_string()
 }
 
+/// One `write_all` per line: the officer's stop can share this writer, and a line is never split by it.
+fn send_line(w: &mut impl Write, line: String) -> Result<(), String> {
+    w.write_all(format!("{line}\n").as_bytes()).and_then(|_| w.flush()).map_err(|_| "the executor is gone".to_string())
+}
+
 fn reply(w: &mut impl Write, id: &Value, result: Value) -> Result<(), String> {
-    let line = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
-    writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|_| "the executor is gone".to_string())
+    send_line(w, json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
 }
 
 fn reply_err(w: &mut impl Write, id: &Value, code: i64, msg: &str) -> Result<(), String> {
-    let line = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } }).to_string();
-    writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|_| "the executor is gone".to_string())
+    send_line(w, json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } }).to_string())
+}
+
+/// What the shell saw of a run beyond its result: for the progress view, and for knowing whether the
+/// trail already holds the stop.
+#[derive(Default)]
+pub struct Observed {
+    pub done: Vec<String>,
+    pub stop_recorded: bool,
+    pub finish_recorded: bool,
+    /// The step that had started and not finished when the last notification came.
+    pub in_flight: Option<String>,
 }
 
 /// Serves the executor's requests until it answers `replay.start` (`start_id`). Returns that result.
@@ -75,6 +93,23 @@ pub fn drive<R: BufRead, W: Write>(
     start_id: u64,
     now: &dyn Fn() -> i64,
     decide: &mut dyn FnMut(&Value) -> bool,
+) -> Result<Value, String> {
+    drive_with(reader, writer, store, ctx, start_id, now, decide, &mut |_| {}, &mut Observed::default())
+}
+
+/// `drive`, also passing each `run.progress` notification to `on_progress` and noting what it saw.
+/// A notification has no id and gets no reply.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_with<R: BufRead, W: Write>(
+    reader: R,
+    writer: &mut W,
+    store: &mut Store,
+    ctx: &RunContext,
+    start_id: u64,
+    now: &dyn Fn() -> i64,
+    decide: &mut dyn FnMut(&Value) -> bool,
+    on_progress: &mut dyn FnMut(&Value),
+    seen: &mut Observed,
 ) -> Result<Value, String> {
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
@@ -95,6 +130,19 @@ pub fn drive<R: BufRead, W: Write>(
         };
         let params = &msg["params"];
         match method {
+            "run.progress" => {
+                if params["state"] == "done" {
+                    if let Some(s) = params["step"].as_str() {
+                        seen.done.push(s.to_string());
+                        if seen.in_flight.as_deref() == Some(s) {
+                            seen.in_flight = None;
+                        }
+                    }
+                } else if params["state"] == "started" {
+                    seen.in_flight = params["step"].as_str().map(str::to_string);
+                }
+                on_progress(params);
+            }
             "audit.append" => {
                 let event = params["event"].as_str().unwrap_or("");
                 if !EXECUTOR_EVENTS.contains(&event) {
@@ -116,7 +164,11 @@ pub fn drive<R: BufRead, W: Write>(
                     shown: shown.as_deref(),
                 };
                 match store.append_event(&entry) {
-                    Ok(seq) => reply(writer, &id, json!({ "seq": seq }))?,
+                    Ok(seq) => {
+                        seen.stop_recorded |= event == "run_stopped";
+                        seen.finish_recorded |= event == "run_finished";
+                        reply(writer, &id, json!({ "seq": seq }))?
+                    }
                     // The error names a kind, never a value. The executor stops the run on it.
                     Err(_) => reply_err(writer, &id, -32000, "the audit trail could not be written")?,
                 }
@@ -149,6 +201,79 @@ pub fn run_replay(
     pid: Option<i64>,
     decide: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<Value, String> {
+    let mut hooks = Hooks { on_start: &mut |_| {}, on_progress: &mut |_| {}, stop_grace: STOP_GRACE };
+    run_replay_with(bin, store, ctx, task, inputs, pid, decide, &mut hooks)
+}
+
+/// The shell's ears and hands on a run: `on_start` is given the handle that pauses, resumes and stops it, as
+/// soon as the executor is running; `on_progress` gets each progress notification.
+pub struct Hooks<'a> {
+    pub on_start: &'a mut dyn FnMut(RunHandle),
+    pub on_progress: &'a mut dyn FnMut(&Value),
+    pub stop_grace: Duration,
+}
+
+/// Records a stop the executor could not record, because the officer stopped the run and the executor had
+/// to be ended: `run_stopped` (if the executor had not written it) and `run_finished`. Step ids only.
+pub fn record_forced_stop(
+    store: &mut Store,
+    ctx: &RunContext,
+    task: &Value,
+    seen: &Observed,
+    at: i64,
+) -> Result<(), String> {
+    let all: Vec<String> = task["steps"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let flying = seen.in_flight.as_deref();
+    let not_run: Vec<&str> = all.iter().filter(|s| !seen.done.contains(s) && Some(s.as_str()) != flying).map(String::as_str).collect();
+    let list = |v: &[&str]| if v.is_empty() { "none".to_string() } else { v.join(", ") };
+    let done: Vec<&str> = seen.done.iter().map(String::as_str).collect();
+    let mut shown = format!(
+        "Stopped by the officer. The executor did not end the run in time and was ended. Completed: {}. Not run: {}.",
+        list(&done),
+        list(&not_run)
+    );
+    // The step in flight may have been acted on: the record does not call it not run.
+    if let Some(s) = flying {
+        shown.push_str(&format!(" In flight when it was ended: {s} (whether its action was taken is unknown)."));
+    }
+    let mut rows: Vec<(&str, &str)> = Vec::new();
+    if !seen.stop_recorded {
+        rows.push(("run_stopped", shown.as_str()));
+    }
+    if !seen.finish_recorded {
+        rows.push(("run_finished", "stopped"));
+    }
+    for (event, text) in rows {
+        let e = AuditEntry {
+            at,
+            officer: &ctx.officer,
+            event,
+            task: Some(&ctx.task_ref),
+            run: Some(&ctx.run),
+            item: None,
+            step: None,
+            shown: Some(text),
+        };
+        store.append_event(&e).map_err(|_| "the stop could not be written to the audit trail".to_string())?;
+    }
+    Ok(())
+}
+
+/// `run_replay` with the officer's controls: see `Hooks`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_replay_with(
+    bin: &Path,
+    store: &mut Store,
+    ctx: &RunContext,
+    task: &Value,
+    inputs: &Value,
+    pid: Option<i64>,
+    decide: &mut dyn FnMut(&Value) -> bool,
+    hooks: &mut Hooks,
+) -> Result<Value, String> {
     let mut child = Command::new(bin)
         .arg("serve")
         .stdin(Stdio::piped())
@@ -156,8 +281,28 @@ pub fn run_replay(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("cannot start {}: {}", bin.display(), e.kind()))?;
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut writer = SharedWriter::new(stdin);
+    let child = Arc::new(Mutex::new(Some(child)));
+    let ended = Arc::new(AtomicBool::new(false));
+    let handle = RunHandle {
+        writer: writer.clone(),
+        stop_asked: Arc::new(AtomicBool::new(false)),
+        ended: ended.clone(),
+        kill: {
+            let child = child.clone();
+            Arc::new(move || {
+                if let Ok(mut g) = child.lock() {
+                    if let Some(c) = g.as_mut() {
+                        let _ = c.kill();
+                    }
+                }
+            })
+        },
+        grace: hooks.stop_grace,
+    };
+    let mut seen = Observed::default();
     let now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -165,15 +310,30 @@ pub fn run_replay(
             .unwrap_or(0)
     };
     let result = (|| {
-        writeln!(stdin, "{}", start_request(1, task, inputs, pid)).map_err(|_| "the executor is gone".to_string())?;
-        stdin.flush().map_err(|_| "the executor is gone".to_string())?;
-        drive(std::io::BufReader::new(stdout), &mut stdin, store, ctx, 1, &now, decide)
+        send_line(&mut writer, start_request(1, task, inputs, pid))?;
+        // The controls are handed over only now. A stop pressed before this is sent after `replay.start`
+        // (the executor drops a control line that arrives before it), so it still stops the run.
+        (hooks.on_start)(handle.clone());
+        // A card is never put up once the officer has stopped the run.
+        let mut guarded = |card: &Value| if handle.stop_asked() { false } else { decide(card) };
+        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen)
     })();
-    drop(stdin);
-    if result.is_err() {
-        let _ = child.kill();
+    // Closing our end tells the executor to exit; an error ends it now.
+    let finished = child.lock().ok().and_then(|mut g| g.take());
+    writer.close();
+    if let Some(mut c) = finished {
+        if result.is_err() {
+            let _ = c.kill();
+        }
+        let _ = c.wait();
     }
-    let _ = child.wait();
+    ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    if result.is_err() && handle.stop_asked() {
+        // The officer stopped it and the executor could not say so itself. The trail still says it.
+        if let Err(e) = record_forced_stop(store, ctx, task, &seen, now()) {
+            return Err(e);
+        }
+    }
     result
 }
 
@@ -185,7 +345,10 @@ mod tests {
 
     fn store() -> (Store, std::path::PathBuf) {
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("companion-approval-{}-{n}", std::process::id()));
+        // A counter as well as the clock: parallel tests can read the same clock tick and share a directory.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("companion-approval-{}-{n}-{k}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         (Store::open(&dir.join("s.db"), &Fixed([7u8; 32])).unwrap(), dir)
     }

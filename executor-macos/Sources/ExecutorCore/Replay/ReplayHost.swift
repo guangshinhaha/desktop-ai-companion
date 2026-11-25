@@ -41,12 +41,19 @@ public enum Waiting {
         case done(T)
         case ceiling
         case stopped(String)
+        /// The officer stopped the run (see `RunControl`) while the wait was on.
+        case cancelled
     }
+
+    /// While a run can be stopped, one wait is cut into slices of this length so a stop is seen within
+    /// it. An accessibility event still ends a wait early. The poll rate (the backoff) does not change.
+    public static let cancelSlice: TimeInterval = 0.1
 
     public static func until<T>(
         ceiling: TimeInterval,
         wait: (TimeInterval) -> Void,
         now: () -> TimeInterval,
+        cancelled: (() -> Bool)? = nil,
         poll: () -> Poll<T>
     ) -> Result<T> {
         let deadline = now() + ceiling
@@ -59,7 +66,22 @@ public enum Waiting {
             }
             let remaining = deadline - now()
             if remaining <= 0 { return .ceiling }
-            wait(min(backoff, remaining))
+            let target = min(backoff, remaining)
+            if let cancelled {
+                if cancelled() { return .cancelled }
+                var waited = 0.0
+                while waited < target - 1e-9 {
+                    let slice = min(cancelSlice, target - waited)
+                    let t0 = now()
+                    wait(slice)
+                    if cancelled() { return .cancelled }
+                    let took = now() - t0
+                    waited += max(took, 0)
+                    if took < slice - 0.01 { break } // an event woke the wait: look now
+                }
+            } else {
+                wait(target)
+            }
             backoff = min(backoff * 2, backoffCap)
         }
     }

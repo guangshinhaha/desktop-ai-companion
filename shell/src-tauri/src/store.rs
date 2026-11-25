@@ -198,11 +198,12 @@ pub struct AuditEntry<'a> {
 }
 
 /// The events of TD 7.2, plus the one the store writes for itself. `append_event` accepts nothing else.
-pub const AUDIT_EVENTS: [&str; 11] = [
+pub const AUDIT_EVENTS: [&str; 12] = [
     "run_started",
     "approved",
     "rejected",
     "step_diverged",
+    "run_stopped",
     "recovered",
     "run_finished",
     "item_marked_by_officer",

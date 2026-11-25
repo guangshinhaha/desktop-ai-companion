@@ -2,7 +2,10 @@ import Foundation
 
 /// Minimal JSON-RPC 2.0 over stdio, one JSON message per line (TD 3.2).
 ///
-/// Shell to executor: `ping`, and `replay.start {task, inputs, pid?, ceiling?}`. While a replay runs the
+/// Shell to executor: `ping`, and `replay.start {task, inputs, pid?, ceiling?}`. While a replay runs the shell
+/// may also send the notifications `replay.pause`, `replay.resume` and `replay.stop` (no id, no reply), and the
+/// executor sends `run.progress {state: started|done|paused|resumed, step, say, index, total}` (no id, no wait).
+/// A stop ends the run with outcome `stopped`, after the executor records `run_stopped`. While a replay runs the
 /// executor sends the shell two requests and waits for each answer:
 ///   `approval.request {card}`  -> `{approved: true|false}`. Only the JSON value `true` approves.
 ///   `audit.append {event, step?, shown?, item?}` -> `{seq}`. Anything else stops the run.
@@ -37,14 +40,24 @@ public enum RPC {
     }
 
     /// Reads requests until stdin closes, then returns. Blocks on read, so it is idle between requests.
-    public static func serve(input: @escaping () -> String? = { readLine(strippingNewline: true) },
+    /// `input` waits for the next line; `poll` returns a line only if one is already there, so a stop is seen
+    /// while a step waits. With no `input`, both read standard input. Without `poll` (tests) a run cannot be
+    /// stopped from outside, except while it waits on an answer.
+    public static func serve(input: (() -> String?)? = nil,
+                             poll: (() -> String?)? = nil,
                              output: @escaping (String) -> Void = { FileHandle.standardOutput.write(Data(($0 + "\n").utf8)) },
                              hostFactory: @escaping HostFactory = RPC.accessibilityHost) {
-        let talk = Conversation(input: input, output: output)
-        while let line = input() {
+        let stdin = LineReader(fd: STDIN_FILENO)
+        let read: () -> String? = input ?? { stdin.readLine() }
+        let peek: (() -> String?)? = input == nil ? { stdin.pollLine() } : poll
+        let talk = Conversation(input: read, output: output)
+        while let line = read() {
             if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
             if let req = parse(line), req["method"] as? String == "replay.start", let id = req["id"] {
-                output(replayStart(id: id, params: req["params"] as? [String: Any] ?? [:], talk: talk, hostFactory: hostFactory))
+                let control = RunControl(poll: peek, block: read)
+                talk.control = control
+                output(replayStart(id: id, params: req["params"] as? [String: Any] ?? [:], talk: talk, control: control, hostFactory: hostFactory))
+                talk.control = nil
                 continue
             }
             if let reply = handle(line: line) { output(reply) }
@@ -53,7 +66,7 @@ public enum RPC {
 
     // MARK: replay
 
-    static func replayStart(id: Any, params: [String: Any], talk: Conversation, hostFactory: HostFactory) -> String {
+    static func replayStart(id: Any, params: [String: Any], talk: Conversation, control: RunControl, hostFactory: HostFactory) -> String {
         func fail(_ code: Int, _ m: String) -> String { encode(["jsonrpc": "2.0", "id": id, "error": err(code, m)]) }
         guard let taskObj = params["task"] as? [String: Any], let inputsObj = params["inputs"] as? [String: Any],
               let taskData = try? JSONSerialization.data(withJSONObject: taskObj),
@@ -79,13 +92,18 @@ public enum RPC {
 
         let gate = ApprovalGate(source: RPCApprovalSource(talk: talk), out: { _ in })
         let report = Replayer(task: task, inputs: inputs, host: host, gate: gate, ceiling: ceiling,
-                              audit: RPCAudit(talk: talk), log: { _ in }).run()
+                              audit: RPCAudit(talk: talk), control: control, progress: { p in
+            // A notification: no id, nothing waits for it. Step names and the task's say line only.
+            talk.output(encode(["jsonrpc": "2.0", "method": "run.progress", "params": [
+                "state": p.kind.rawValue, "step": p.step, "say": p.say, "index": p.index, "total": p.total]]))
+        }, log: { _ in }).run()
         var result: [String: Any] = ["completed": report.completed, "not_run": report.notRun]
         switch report.outcome {
         case .finished: result["outcome"] = "finished"
         case .diverged(let step, let reason): result["outcome"] = "diverged"; result["step"] = step; result["reason"] = reason
         case .notApproved(let step): result["outcome"] = "not_approved"; result["step"] = step
         case .refused(let why): result["outcome"] = "refused"; result["reason"] = why
+        case .stopped(let step, let actionDone): result["outcome"] = "stopped"; result["step"] = step; result["action_done"] = actionDone
         }
         return encode(["jsonrpc": "2.0", "id": id, "result": result])
     }
@@ -94,16 +112,26 @@ public enum RPC {
     final class Conversation {
         let input: () -> String?
         let output: (String) -> Void
+        /// Set while a replay runs, so a stop that arrives while a question is open is seen.
+        var control: RunControl?
         private var n = 0
         init(input: @escaping () -> String?, output: @escaping (String) -> Void) { self.input = input; self.output = output }
 
         /// The answer's `result`, or nil for an error, end of input, or a malformed answer. Lines for other
         /// ids are not answers and are skipped.
-        func ask(_ method: String, _ params: [String: Any]) -> [String: Any]? {
+        /// A stop ends the wait only when `cancellable` (the officer's question). An audit append is always
+        /// waited for: the trail must hold the record, and a stop is then handled by the run, not mistaken
+        /// for a failed write.
+        func ask(_ method: String, _ params: [String: Any], cancellable: Bool = false) -> [String: Any]? {
             n += 1
             let id = "x\(n)"
             output(RPC.encode(["jsonrpc": "2.0", "id": id, "method": method, "params": params]))
             while let line = input() {
+                // A stop, pause or resume sent while the officer is being asked. A stop is a no to the question.
+                if control?.apply(line: line) == true {
+                    if cancellable && control?.state == .stopped { return nil }
+                    continue
+                }
                 guard let o = RPC.parse(line), o["id"] as? String == id, o["method"] == nil else { continue }
                 return o["result"] as? [String: Any]
             }
@@ -116,7 +144,7 @@ public enum RPC {
         init(talk: Conversation) { self.talk = talk }
         func nextAnswer() -> String? { nil }
         func answer(for card: ApprovalCard) -> String? {
-            guard let r = talk.ask("approval.request", ["card": card.json]) else { return nil }
+            guard let r = talk.ask("approval.request", ["card": card.json], cancellable: true) else { return nil }
             // Only the JSON value true. A string, a number or a missing field is a no.
             if let a = r["approved"] as? NSNumber, CFGetTypeID(a) == CFBooleanGetTypeID(), a.boolValue { return "y" }
             return "n"

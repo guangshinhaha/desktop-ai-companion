@@ -6,6 +6,7 @@ public enum AuditEventKind: String, CaseIterable {
     case approved
     case rejected
     case stepDiverged = "step_diverged"
+    case runStopped = "run_stopped"
     case recovered
     case runFinished = "run_finished"
     case itemMarkedByOfficer = "item_marked_by_officer"
