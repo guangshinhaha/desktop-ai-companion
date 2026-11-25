@@ -4,8 +4,10 @@
 
 pub mod approval;
 pub mod chat;
+pub mod csv;
 pub mod executor;
 pub mod extract;
+pub mod listrun;
 pub mod progress;
 pub mod recording;
 pub mod review;
@@ -129,6 +131,18 @@ struct Session {
     approval: Mutex<Option<PendingApproval>>,
     /// The replay on screen, or the last one's report.
     run: Mutex<Option<progress::ActiveRun>>,
+    /// The one list run going now, if any.
+    listrun: Mutex<Option<ActiveListRun>>,
+    /// What went wrong with a list run, for the screen: (run, why).
+    listrun_error: Mutex<Option<(String, String)>>,
+}
+
+/// A list run going on a background thread. The stop flag is read between rows.
+struct ActiveListRun {
+    run: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the officer asks to end the run: the thread records the end when it finishes its row.
+    end_by: std::sync::Arc<Mutex<Option<String>>>,
 }
 
 /// The card on screen and where the officer's answer goes. One at a time: a run asks one question at a time.
@@ -194,6 +208,29 @@ fn approval_answer(app: AppHandle, window: tauri::WebviewWindow, approved: bool)
     let _ = window.close();
 }
 
+/// Shows the approval card and waits for the officer. No timeout: waiting is not consent. A closed window or
+/// a dropped sender is a no.
+fn ask_officer(app: &AppHandle, card: &serde_json::Value) -> bool {
+    if run_ui::stop_asked(app) {
+        return false;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let label = format!(
+        "approval-{:x}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    );
+    if let Ok(mut p) = app.state::<Session>().approval.lock() {
+        *p = Some(PendingApproval { card: card.clone(), answer: tx, label: label.clone() });
+    }
+    // A card is never put up for a run the officer has stopped; one stopped while it is up is a no.
+    if run_ui::stop_asked(app) {
+        answer_approval(app, Some(&label), false);
+    } else {
+        open_approval_window(app, &label);
+    }
+    rx.recv().unwrap_or(false)
+}
+
 /// Runs a saved task through the executor. The officer is asked before every step that may commit; every
 /// decision and the run's start and end are appended to the audit chain. Inputs stay in memory.
 /// Returns the executor's report: outcome, completed and not-run step ids.
@@ -210,6 +247,10 @@ async fn replay_start(
         return Err("the officer's name is needed".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
+        // The list run and a single replay share the approval card and the progress window: one at a time.
+        if app.state::<Session>().listrun.lock().map_err(|_| "busy")?.is_some() {
+            return Err("a list run is going; wait for it to end".to_string());
+        }
         let mut store = open_store()?;
         let body = store
             .task_body(&task_id, version)
@@ -233,7 +274,7 @@ async fn replay_start(
             guard.finish(&app, &Err(e.clone()));
             return Err(e);
         }
-        let ctx = approval::RunContext { officer, task_ref: format!("{task_id}@{version}"), run: run.clone() };
+        let ctx = approval::RunContext { officer, task_ref: format!("{task_id}@{version}"), run: run.clone(), item: None };
         let mut on_start = |h| run_ui::attach(&app, h);
         let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(&app, p);
         let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
@@ -400,6 +441,304 @@ fn review_discard(app: AppHandle) {
     close_review_window(&app);
 }
 
+// MARK: list runs (#33)
+
+const LISTRUN: &str = "listrun";
+
+fn open_listrun_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(LISTRUN) {
+        let _ = w.set_focus();
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, LISTRUN, WebviewUrl::App("listrun.html".into()))
+        .title("Run a task over a spreadsheet")
+        .inner_size(760.0, 700.0)
+        .center()
+        .build();
+}
+
+fn saved_task(store: &store::Store, task_id: &str, version: i64) -> Result<serde_json::Value, String> {
+    let body = store.task_body(task_id, version).map_err(|e| e.to_string())?.ok_or("no such task version")?;
+    serde_json::from_str(&body).map_err(|_| "the saved task is not readable".to_string())
+}
+
+/// Reads the file on this machine and says what it holds: column names and a row count, never a cell.
+/// Until the officer says the first row is a header, no cell is shown as a name: the columns are numbered.
+#[tauri::command]
+async fn listrun_preview(path: String, task_id: String, version: i64, header: bool) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = open_store()?;
+        let task = saved_task(&store, &task_id, version)?;
+        let inputs = csv::task_inputs(&task);
+        let (file, _) = csv::read_file(std::path::Path::new(&path), header)?;
+        let names: Vec<&String> = inputs.iter().map(|i| &i.name).collect();
+        // A step that is not marked "no" is asked about. None means every row runs with no card.
+        let asked = task["steps"].as_array().map_or(0, |s| s.iter().filter(|x| x["consequential"] != "no").count());
+        Ok(serde_json::json!({
+            "columns": file.header,
+            "rows": file.rows.len(),
+            "inputs": names,
+            "suggested": if header { csv::suggest_mapping(&file.header, &inputs) } else { Default::default() },
+            "approval_steps": asked,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The slot that says a list run is going. Held from the moment the run is claimed until its thread ends,
+/// however it ends. While held, a single replay is refused (they share the approval card).
+struct ActiveGuard(AppHandle);
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut a) = self.0.state::<Session>().listrun.lock() {
+            *a = None;
+        }
+    }
+}
+
+fn claim_listrun(app: &AppHandle, run: &str) -> Result<(ActiveGuard, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<Mutex<Option<String>>>), String> {
+    use std::sync::{atomic::AtomicBool, Arc};
+    if run_ui::is_live(app) {
+        return Err("a replay is running; wait for it to end".into());
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let end_by = Arc::new(Mutex::new(None));
+    let session = app.state::<Session>();
+    let mut slot = session.listrun.lock().map_err(|_| "busy")?;
+    if slot.is_some() {
+        return Err("a list run is already going".into());
+    }
+    *slot = Some(ActiveListRun { run: run.to_string(), stop: stop.clone(), end_by: end_by.clone() });
+    drop(slot);
+    // A new go at a run clears what went wrong the last time.
+    if let Ok(mut e) = session.listrun_error.lock() {
+        *e = None;
+    }
+    Ok((ActiveGuard(app.clone()), stop, end_by))
+}
+
+fn set_listrun_error(app: &AppHandle, run: &str, why: String) {
+    if let Ok(mut e) = app.state::<Session>().listrun_error.lock() {
+        *e = Some((run.to_string(), why));
+    }
+}
+
+/// One row through the executor, with the progress window and Stop (#28) for that row.
+#[allow(clippy::too_many_arguments)]
+fn replay_row(
+    app: &AppHandle,
+    store: &mut store::Store,
+    ctx: &approval::RunContext,
+    task: &serde_json::Value,
+    inputs: &serde_json::Value,
+    pid: Option<i64>,
+    stop: &std::sync::atomic::AtomicBool,
+    obs: &mut dyn approval::ItemObserver,
+) -> Result<serde_json::Value, String> {
+    let label = format!("{}, row {}", ctx.run, ctx.item.unwrap_or(0));
+    let guard = run_ui::begin(app, progress::Progress::new(&label, task))?;
+    let mut on_start = |h| run_ui::attach(app, h);
+    let mut on_progress = |p: &serde_json::Value| run_ui::on_progress(app, p);
+    let mut hooks = approval::Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: progress::STOP_GRACE };
+    let result = approval::run_replay_observed(&executor::executor_path(), store, ctx, task, inputs, pid, &mut |card| ask_officer(app, card), &mut hooks, obs);
+    // The officer pressed Stop for this row: no more rows after it.
+    if run_ui::stop_asked(app) {
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    guard.finish(app, &result);
+    result
+}
+
+/// Runs the rows on a thread. The officer sees progress through `listrun_status`; anything that goes wrong is
+/// kept for the screen, not dropped.
+#[allow(clippy::too_many_arguments)]
+fn spawn_listrun(
+    app: AppHandle,
+    guard: ActiveGuard,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    end_by: std::sync::Arc<Mutex<Option<String>>>,
+    run: String,
+    task_id: String,
+    version: i64,
+    rows: Vec<serde_json::Value>,
+    from: Option<i64>,
+    officer: String,
+    pid: Option<i64>,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let _guard = guard;
+        let outcome = (|| -> Result<(), String> {
+            let mut store = open_store()?;
+            let task = saved_task(&store, &task_id, version)?;
+            let task_ref = format!("{task_id}@{version}");
+            let stopped = || stop.load(Ordering::SeqCst);
+            let params = listrun::RunParams { run: &run, task_ref: &task_ref, officer: &officer, rows: &rows, from, stop: &stopped };
+            listrun::run_rows(&mut store, &params, &mut |store, ctx, inputs, obs| replay_row(&app, store, ctx, &task, inputs, pid, &stop, obs))?;
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            set_listrun_error(&app, &run, e);
+        }
+        if let Some(by) = end_by.lock().ok().and_then(|mut b| b.take()) {
+            let ended = open_store().and_then(|mut s| listrun::end_run(&mut s, &run, &by, now_secs()));
+            if let Err(e) = ended {
+                set_listrun_error(&app, &run, format!("the run could not be ended: {e}"));
+            }
+        }
+    });
+}
+
+fn run_id() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("run_{nanos:x}")
+}
+
+/// Starts a run over the file, or, if an unfinished run for this task and file exists (after a crash or a
+/// restart), picks that one up: rows done are not asked again and a row that was mid-commit shows as unknown.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn listrun_start(
+    app: AppHandle,
+    path: String,
+    task_id: String,
+    version: i64,
+    header: bool,
+    mapping: std::collections::BTreeMap<String, String>,
+    officer: String,
+    pid: Option<i64>,
+) -> Result<String, String> {
+    if !approval::valid_officer(&officer) {
+        return Err("the officer's name is needed".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // The slot first: a start that cannot go leaves no run behind.
+        let new_run = run_id();
+        let (guard, stop, end_by) = claim_listrun(&app, &new_run)?;
+        let mut store = open_store()?;
+        let inputs = csv::task_inputs(&saved_task(&store, &task_id, version)?);
+        let loaded = listrun::start_or_resume(&mut store, std::path::Path::new(&path), &task_id, version, &inputs, header, &mapping, &new_run, now_secs())?;
+        if let Ok(mut s) = app.state::<Session>().listrun.lock() {
+            if let Some(a) = s.as_mut() {
+                a.run = loaded.run.clone();
+            }
+        }
+        drop(store);
+        let run = loaded.run.clone();
+        spawn_listrun(app, guard, stop, end_by, loaded.run, task_id, version, loaded.rows, None, officer, pid);
+        Ok(run)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Continues a stopped run. The same file is needed again: values are never stored. `from` is the row to
+/// start at; a diverged or rejected row there is asked again, and that is recorded as the officer's act.
+#[tauri::command]
+async fn listrun_resume(
+    app: AppHandle,
+    run: String,
+    path: String,
+    from: Option<i64>,
+    officer: String,
+    pid: Option<i64>,
+) -> Result<(), String> {
+    if !approval::valid_officer(&officer) {
+        return Err("the officer's name is needed".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let (guard, stop, end_by) = claim_listrun(&app, &run)?;
+        let store = open_store()?;
+        let (task_id, version, _, _) = store.run_info(&run).map_err(|e| e.to_string())?.ok_or("no such run")?;
+        let inputs = csv::task_inputs(&saved_task(&store, &task_id, version)?);
+        let rows = listrun::rows_for_run(&store, &run, std::path::Path::new(&path), &inputs)?;
+        drop(store);
+        spawn_listrun(app, guard, stop, end_by, run, task_id, version, rows, from, officer, pid);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A run's rows and what went wrong with it, if anything. A run nobody holds is first made safe to read:
+/// a row that died mid-commit shows as unknown.
+#[tauri::command]
+fn listrun_status(app: AppHandle, run: String) -> Result<serde_json::Value, String> {
+    let session = app.state::<Session>();
+    let active = session.listrun.lock().map_err(|_| "busy")?.as_ref().is_some_and(|a| a.run == run);
+    let mut store = open_store()?;
+    if !active {
+        listrun::settle_orphans(&mut store, &run)?;
+    }
+    let mut v = listrun::status(&store, &run)?;
+    v["active"] = serde_json::json!(active);
+    let err = session.listrun_error.lock().map_err(|_| "busy")?.clone();
+    if let Some((r, why)) = err {
+        if r == run {
+            v["error"] = serde_json::json!(why);
+        }
+    }
+    Ok(v)
+}
+
+/// Unfinished runs, so a restart can find them.
+#[tauri::command]
+fn listrun_unfinished() -> Result<serde_json::Value, String> {
+    listrun::unfinished(&open_store()?)
+}
+
+/// The officer's answer for a stopped row: `mark_done`, `mark_not_done`, `skip`, `fixed_by_hand` or `retry`.
+#[tauri::command]
+fn listrun_answer(session: tauri::State<Session>, run: String, item: i64, answer: String, officer: String) -> Result<(), String> {
+    if session.listrun.lock().map_err(|_| "busy")?.is_some() {
+        return Err("the run is still going".into());
+    }
+    let a = match answer.as_str() {
+        "mark_done" => listrun::Answer::MarkDone,
+        "mark_not_done" => listrun::Answer::MarkNotDone,
+        "skip" => listrun::Answer::Skip,
+        "fixed_by_hand" => listrun::Answer::FixedByHand,
+        "retry" => listrun::Answer::Retry,
+        _ => return Err("not an answer".into()),
+    };
+    let mut store = open_store()?;
+    listrun::settle_orphans(&mut store, &run)?;
+    listrun::officer_answer(&mut store, &run, item, a, &officer, now_secs())
+}
+
+/// Ends the run. If it is going, it stops after the row it is on and the end is recorded then; if that
+/// fails, the screen is told.
+#[tauri::command]
+fn listrun_end(session: tauri::State<Session>, run: String, officer: String) -> Result<(), String> {
+    if !approval::valid_officer(&officer) {
+        return Err("the officer's name is needed".into());
+    }
+    let active = session.listrun.lock().map_err(|_| "busy")?;
+    if let Some(a) = active.as_ref().filter(|a| a.run == run) {
+        *a.end_by.lock().map_err(|_| "busy")? = Some(officer);
+        a.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Ok(());
+    }
+    drop(active);
+    listrun::end_run(&mut open_store()?, &run, &officer, now_secs())
+}
+
+/// Stops between rows without ending: the run can be resumed.
+#[tauri::command]
+fn listrun_pause(session: tauri::State<Session>, run: String) {
+    if let Ok(active) = session.listrun.lock() {
+        if let Some(a) = active.as_ref().filter(|a| a.run == run) {
+            a.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[tauri::command]
+fn listrun_open(app: AppHandle) {
+    open_listrun_window(&app);
+}
+
 pub fn run() {
     let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
     let app = tauri::Builder::default()
@@ -434,6 +773,15 @@ pub fn run() {
             review_discard,
             approval_current,
             approval_answer,
+            listrun_open,
+            listrun_preview,
+            listrun_start,
+            listrun_resume,
+            listrun_unfinished,
+            listrun_status,
+            listrun_answer,
+            listrun_end,
+            listrun_pause,
             replay_start,
             task_catalog,
             run_ui::progress_current,
@@ -447,7 +795,8 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Companion", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&quit])?;
+            let list = tauri::menu::MenuItem::with_id(app, "listrun", "Run a task over a spreadsheet...", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&list, &quit])?;
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?)
                 .icon_as_template(true)
@@ -457,6 +806,8 @@ pub fn run() {
                 .on_menu_event(|app, e| {
                     if e.id() == "quit" {
                         app.exit(0);
+                    } else if e.id() == "listrun" {
+                        open_listrun_window(app);
                     }
                 })
                 .on_tray_icon_event(|tray, e| {

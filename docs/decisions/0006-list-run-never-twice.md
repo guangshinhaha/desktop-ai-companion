@@ -1,0 +1,25 @@
+# 0006: List runs: CSV only, and how a row is never submitted twice
+
+Status: built for #33 (`risk:high`: approval gate, audit trail, a never-twice guarantee); line-by-line review pending. Revised after the adversarial review of PR #95. Refs #33, TD section 6.
+
+## Decisions
+
+- **CSV only.** Excel is out of scope (Shin closed #11 as "Numbers and Sheets only"). An `.xlsx` or `.xls` file is refused with "save the sheet as CSV". The XLSX line of #33's Done when is therefore not met; the PR uses `Refs #33`.
+- **The run store holds no cell values.** `runs.inputs_source` holds the file's SHA-256, its row count, whether the first row is a header, and the column mapping (column names only). `run_items` holds a state and a step id. A value does reach the audit trail: the `shown` text of an `approved` record carries the values the officer approved (decision 0005). Nothing else stores or logs one. A resume must be given the same file again; a different file is refused, because row numbers would no longer mean the same people.
+- **A header row is the officer's call.** Until the officer ticks "the first row holds column names", columns are shown as "Column 1", "Column 2" and the first row is data. A cell is never shown as a column name before that.
+- **Rows are checked before the run starts.** Every value must be non-empty, at most 256 characters and, for a choice input, one of its choices. A line break inside a value, text after a closing quote, and control, bidi or zero-width characters are refused. The file is at most 2 MiB and 5000 rows; a symlink or a non-file is refused. The message names the row and input, never the value.
+- **One file, one run.** Starting a run over a task version and a file (by SHA-256) that already has an unfinished run picks that run up. It does not make a second one, so a restart cannot lose the run or ask rows again. The shell lists unfinished runs and the screen offers Open and resume.
+- **Never twice.** `committing` is written (compare-and-set from `awaiting_approval`) when the executor is about to record `approved`, and the executor acts only after that record is written. A row that reached `committing` is `done` only when the executor reports `finished`; any other ending is `unknown`, including when a later step's `approved` record cannot be written after an earlier step acted. Only a row's first approval can be undone (back to `awaiting_approval`), because only then has nothing been done. A run does not continue while any row is `unknown` or `diverged`. Only the officer clears one, and that is an `item_marked_by_officer` record, written before the change. Every state change is a compare-and-set in the store.
+- **One holder per run.** A run is held through an advisory file lock next to the store (`<store>.lease-<run>`), taken for the whole life of a run and by each of its officer answers and its end. Recovering a run (`committing` to `unknown`, `running` or `awaiting_approval` to `pending`) needs the lock, so a run that is going is never reset under it, and a second shell, window or store cannot run or settle the same run. The lock goes when its process does, so a crashed run is recoverable at once.
+- **Retry is the officer's act.** Continuing from a `diverged` or `rejected` row asks it again and writes an `item_marked_by_officer` record ("retry") first.
+- **Rejected rows do not stop the run.** The officer said no to that row; the next row asks again. Closing the card is a no, so closing every card rejects every row, and the run ends with them all `rejected`. A `rejected` audit record carries no values.
+- **Stop (#28) applies to list runs.** Each row has the progress window and Stop. Stop before the commit leaves the row `pending` and ends the run; after it the row is `unknown`. No card is put up once Stop is pressed.
+- **One replay at a time.** A list run and a single replay are refused while the other is going, because they share the approval card and the progress window.
+
+## Limits
+
+- The lock is advisory and local: it guards cooperating shells on one machine's file system. It does not protect against a process that ignores it, or a store on a network share.
+- The `approved` record and `committing` are two writes. If the shell dies between them the row is `committing` with no record: it becomes `unknown`, never silently retried.
+- Whether a row really was created is the officer's judgement when it is `unknown`; the shell cannot check the target app.
+- The real executor's `rejected` record also carries `shown` text. The fake executor stops sending values on `rejected`; the Swift executor should follow (follow-up issue).
+- Two inputs mapped to one column are allowed. Giving the file of a finished or ended run again starts a new run; the shell does not detect that the same people were already created.

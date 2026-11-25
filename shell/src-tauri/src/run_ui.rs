@@ -29,6 +29,11 @@ fn view_of(app: &AppHandle) -> Option<Value> {
     with_slot(app, |s| s.as_ref().map(|r| r.progress.view()))
 }
 
+/// Whether a replay is on now.
+pub fn is_live(app: &AppHandle) -> bool {
+    with_slot(app, |s| s.as_ref().is_some_and(|r| r.is_live()))
+}
+
 /// Whether the officer has asked to stop the run on screen.
 pub fn stop_asked(app: &AppHandle) -> bool {
     with_slot(app, |s| s.as_ref().is_some_and(|r| r.stop_requested()))
