@@ -243,6 +243,7 @@ impl Store {
         conn.pragma_update(None, "recursive_triggers", true)?;
         let store = Store { conn, path: path.to_path_buf() };
         store.migrate()?;
+        store.ensure_notes()?;
         Ok(store)
     }
 
@@ -322,6 +323,58 @@ impl Store {
              COMMIT;",
         )?;
         Ok(())
+    }
+
+    /// Notes table (#44). Additive and independent of `user_version`: `IF NOT EXISTS`, so it is
+    /// safe to run on every open and does not collide with other schema work. Notes hang off the
+    /// task id, not a version, so they travel with the task across versions. `scope` is 'device'
+    /// today; the shared library (#29, #41) will add 'team'. Note text may hold personal data, so
+    /// it lives only in this encrypted file and no error or log line carries it.
+    fn ensure_notes(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_notes (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+               author TEXT NOT NULL, at INTEGER NOT NULL, body TEXT NOT NULL,
+               scope TEXT NOT NULL DEFAULT 'device');
+             CREATE INDEX IF NOT EXISTS task_notes_by_task ON task_notes (task_id, id);",
+        )?;
+        Ok(())
+    }
+
+    /// Adds a note to a saved task. Returns the note id. Fails if the task does not exist.
+    pub fn add_note(&self, task_id: &str, author: &str, body: &str, now: i64) -> Result<i64> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Db("no such task".into()));
+        }
+        self.conn.execute(
+            "INSERT INTO task_notes (task_id, author, at, body) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, author, now, body],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// A task's notes, oldest first: (id, author, at, body).
+    pub fn notes_for(&self, task_id: &str) -> Result<Vec<(i64, String, i64, String)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, author, at, body FROM task_notes WHERE task_id = ?1 ORDER BY id")?;
+        let rows = st
+            .query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes one note of a task. True if a note was removed.
+    pub fn delete_note(&self, task_id: &str, note_id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM task_notes WHERE task_id = ?1 AND id = ?2",
+            params![task_id, note_id],
+        )? > 0)
     }
 
     /// Saves a task as a new version (max + 1; 1 for a new id). Older versions are kept.

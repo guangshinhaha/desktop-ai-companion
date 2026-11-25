@@ -10,6 +10,7 @@ pub mod extract;
 pub mod listrun;
 pub mod progress;
 pub mod recording;
+pub mod notes;
 pub mod review;
 pub mod router;
 mod run_ui;
@@ -325,6 +326,58 @@ async fn audit_verify() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let export = open_store()?.export_audit().map_err(|e| e.to_string())?;
         executor::verify_audit(&executor::executor_path(), &export)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+const TASK: &str = "task";
+
+fn open_task_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(TASK) {
+        let _ = w.set_focus();
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, TASK, WebviewUrl::App("task.html".into()))
+        .title("Task notes")
+        .inner_size(760.0, 680.0)
+        .center()
+        .build();
+}
+
+/// A saved task's steps and the notes beside them (#44). Notes may hold personal data: they go to
+/// this window only, and nothing here logs them.
+#[tauri::command]
+async fn task_detail(task_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = open_store()?;
+        notes::detail(&store, &notes::LocalNotes(&store), &task_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_note_add(task_id: String, author: String, body: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use notes::NoteBackend;
+        let store = open_store()?;
+        let backend = notes::LocalNotes(&store);
+        backend.add(&task_id, &author, &body, now_secs())?;
+        notes::detail(&store, &backend, &task_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn task_note_remove(task_id: String, note_id: i64) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use notes::NoteBackend;
+        let store = open_store()?;
+        let backend = notes::LocalNotes(&store);
+        backend.remove(&task_id, note_id)?;
+        notes::detail(&store, &backend, &task_id)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -788,7 +841,10 @@ pub fn run() {
             run_ui::run_pause,
             run_ui::run_resume,
             run_ui::run_stop,
-            audit_verify
+            audit_verify,
+            task_detail,
+            task_note_add,
+            task_note_remove
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -796,7 +852,8 @@ pub fn run() {
 
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Companion", true, None::<&str>)?;
             let list = tauri::menu::MenuItem::with_id(app, "listrun", "Run a task over a spreadsheet...", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&list, &quit])?;
+            let notes = tauri::menu::MenuItem::with_id(app, "notes", "Task notes", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&list, &notes, &quit])?;
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?)
                 .icon_as_template(true)
@@ -808,6 +865,8 @@ pub fn run() {
                         app.exit(0);
                     } else if e.id() == "listrun" {
                         open_listrun_window(app);
+                    } else if e.id() == "notes" {
+                        open_task_window(app);
                     }
                 })
                 .on_tray_icon_event(|tray, e| {
