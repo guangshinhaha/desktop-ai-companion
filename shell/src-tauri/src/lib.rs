@@ -9,6 +9,7 @@ pub mod extract;
 pub mod progress;
 pub mod recording;
 pub mod review;
+pub mod router;
 mod run_ui;
 pub mod store;
 pub mod usage;
@@ -215,6 +216,11 @@ async fn replay_start(
             .map_err(|e| e.to_string())?
             .ok_or("no such task version")?;
         let task: serde_json::Value = serde_json::from_str(&body).map_err(|_| "the saved task is not readable")?;
+        // Never start with an input missing: nothing is defaulted or guessed (#32). Names only in the error.
+        let missing = router::missing_inputs(&task, &inputs);
+        if !missing.is_empty() {
+            return Err(format!("missing input: {}", missing.join(", ")));
+        }
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -261,6 +267,14 @@ async fn replay_start(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The saved tasks and the inputs each needs from the officer, for routing a request in the canvas (#32).
+#[tauri::command]
+async fn task_catalog() -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(|| router::catalog(&open_store()?))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Verifies the whole audit trail with `executor-macos verify-audit`. Ok says the trail is intact;
@@ -421,6 +435,7 @@ pub fn run() {
             approval_current,
             approval_answer,
             replay_start,
+            task_catalog,
             run_ui::progress_current,
             run_ui::run_pause,
             run_ui::run_resume,

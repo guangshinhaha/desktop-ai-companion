@@ -9,6 +9,8 @@
 (function (root) {
   "use strict";
 
+  const R = typeof module !== "undefined" && module.exports ? require("./router.js") : root.CompanionRouter;
+
   const SUMMARY_PROMPT = (name, text) => `Summarise this document in a few short paragraphs, then list any actions or deadlines it mentions.\n\nDocument: ${name}\n\n---\n${text}`;
 
   function createChat(doc, api, ui) {
@@ -18,6 +20,9 @@
     let pendingDoc = null; // a dropped document not yet sent
     let busy = false;
     let opened = false;
+    let flow = null; // a question the companion has asked and is waiting on (task offer, inputs, learn)
+    let officer = null; // who approves steps in a run; asked once, kept in memory only
+    let lastRequest = null; // which path the latest request took, for "what did you do?"
 
     function el(tag, text, attrs) {
       const e = doc.createElement(tag);
@@ -81,11 +86,167 @@
       return true;
     }
 
-    async function ask() {
-      const text = ui.input.value.trim();
-      if (!text) return false;
+    // A local turn: answered on this machine, never sent to chat, never saved to chat history.
+    function local(shown, reply) {
+      turns.push({ role: "user", text: shown }, { role: "assistant", text: reply });
+      draw();
+    }
+
+    async function chatPath(text) {
       const ok = await turn(text, text);
-      if (ok) ui.input.value = "";
+      lastRequest = { path: "chat", sent: ok };
+      return ok;
+    }
+
+    function offerTask(task, explicit, text) {
+      flow = { kind: "offer_task", task, explicit, text };
+      lastRequest = { path: "task", task: task.name, started: false };
+      local(text, `I have a saved task called "${task.name}". Run it? Say yes or no.`);
+    }
+
+    async function startTask() {
+      const { task, values } = flow;
+      flow = null;
+      const inputs = {};
+      task.inputs.forEach((inp, i) => { inputs[inp.name] = values[i]; });
+      busy = true;
+      let r;
+      try {
+        r = await api.replay(task, inputs, officer);
+      } catch (e) {
+        r = { ok: false, message: "The task could not be started." };
+      }
+      busy = false;
+      lastRequest.started = !!r.ok;
+      lastRequest.outcome = r.ok ? r.outcome || "done" : "not started";
+      turns.push({ role: "assistant", text: r.ok ? `Finished with outcome: ${lastRequest.outcome}.` : r.message || "The task could not be started." });
+      draw();
+    }
+
+    // Asks for the officer's name if it is not known, then each input in turn. Nothing is defaulted
+    // or guessed: an empty answer asks again, and the run starts only once every input is given.
+    async function collect() {
+      if (!officer) {
+        flow.kind = "need_officer";
+        turns.push({ role: "assistant", text: "Who is approving this run? Give your name or officer id." });
+        draw();
+        return true;
+      }
+      flow.kind = "collecting";
+      const inp = flow.task.inputs[flow.values.length];
+      if (!inp) return startTask();
+      const extra = inp.choices ? ` Choices: ${inp.choices.join(", ")}.` : "";
+      turns.push({ role: "assistant", text: `What is ${inp.name.replace(/_/g, " ")}?${extra}` });
+      draw();
+      return true;
+    }
+
+    async function continueFlow(text) {
+      const f = flow;
+      const cancel = R.norm(text) === "cancel";
+      if (f.kind === "offer_task") {
+        if (R.isYes(text)) {
+          flow = { kind: "collecting", task: f.task, values: [] };
+          turns.push({ role: "user", text });
+          draw();
+          return collect();
+        }
+        if (R.isNo(text)) {
+          flow = null;
+          if (f.explicit) { lastRequest.outcome = "declined"; local(text, "OK. I did not run it."); return true; }
+          return chatPath(f.text); // only mentioned the task: it was a chat after all
+        }
+        flow = null;
+        return ask(text); // something else: a new request
+      }
+      if (f.kind === "offer_learn") {
+        if (R.isYes(text)) {
+          flow = { kind: "ask_app" };
+          local(text, "Which app will you do it in? Give its bundle id, for example com.apple.TextEdit. Say cancel to stop.");
+          return true;
+        }
+        if (R.isNo(text)) { flow = null; return chatPath(f.text); }
+        flow = null;
+        return ask(text);
+      }
+      if (f.kind === "ask_app") {
+        if (cancel) { flow = null; local(text, "OK. Nothing was recorded."); return true; }
+        const bundle = text.trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(bundle) || !bundle.includes(".")) {
+          local(text, "That is not a bundle id. It looks like com.apple.TextEdit. Try again, or say cancel.");
+          return true;
+        }
+        flow = null;
+        let r;
+        try { r = await api.record(bundle); } catch (e) { r = { ok: false, message: "Recording could not start." }; }
+        lastRequest.recording = !!r.ok;
+        local(text, r.ok ? "Recording. Do the task once in that app. I will show you what I learned to review when you stop." : r.message || "Recording could not start.");
+        return true;
+      }
+      if (cancel) { flow = null; lastRequest.outcome = "cancelled"; local(text, "OK. I did not run it."); return true; }
+      if (f.kind === "need_officer") {
+        const name = text.trim();
+        turns.push({ role: "user", text: "(answer entered)" });
+        if (name.length > 80) {
+          turns.push({ role: "assistant", text: "That name is too long. Try again, or say cancel." });
+          draw();
+          return true;
+        }
+        officer = name;
+        return collect();
+      }
+      // collecting: one input at a time
+      const inp = f.task.inputs[f.values.length];
+      let value = text.trim();
+      if (inp.choices) value = inp.choices.find((c) => R.norm(c) === R.norm(value)) || "";
+      turns.push({ role: "user", text: "(answer entered)" });
+      if (!value) {
+        turns.push({ role: "assistant", text: inp.choices ? `Pick one of: ${inp.choices.join(", ")}.` : "I need a value for that. I will not guess one." });
+        draw();
+        return true;
+      }
+      f.values.push(value);
+      return collect();
+    }
+
+    function whatDidYouDo() {
+      const r = lastRequest;
+      if (!r) return "I have not done anything yet.";
+      if (r.path === "chat") return r.sent ? "I took the chat path: your request went to chat." : "I took the chat path, but it was not sent.";
+      if (r.path === "task") {
+        const how = r.started ? `ran it (${r.outcome})` : r.outcome ? `${r.outcome}, so it did not run` : "offered it, and it has not run";
+        return `I took the task path: I matched your saved task "${r.task}" and ${how}. Nothing went to chat.`;
+      }
+      if (r.path === "learn") return `I took the learn path: I have no recording for that, so I offered to learn it${r.recording ? " and started recording" : ""}. Nothing went to chat.`;
+      return "I looked for a saved task and found no match, so I answered here. Nothing went to chat.";
+    }
+
+    async function ask(given) {
+      const text = (given !== undefined ? given : ui.input.value).trim();
+      if (!text || busy) return false;
+      const clear = () => { if (given === undefined) ui.input.value = ""; };
+      say("");
+      if (flow) { clear(); return continueFlow(text); }
+      if (R.isWhatDidYouDo(text)) { clear(); local(text, whatDidYouDo()); return true; }
+      let tasks = [];
+      try { tasks = (await api.tasks()) || []; } catch (e) { tasks = []; }
+      const r = R.route(text, tasks);
+      if (r.path === "task") { clear(); offerTask(r.task, r.explicit, text); return true; }
+      if (r.path === "none") {
+        clear();
+        lastRequest = { path: "none" };
+        local(text, r.reason === "ambiguous" ? "Two saved tasks have that name. Rename one so I can tell them apart." : `I have no saved task called "${r.target}".${tasks.length ? " Saved tasks: " + tasks.map((k) => k.name).join(", ") + "." : " None are saved yet."}`);
+        return true;
+      }
+      if (r.path === "learn") {
+        clear();
+        flow = { kind: "offer_learn", text };
+        lastRequest = { path: "learn" };
+        local(text, "I do not have a recording for that yet. Do it once and I will learn it? Say yes, or no to ask chat instead.");
+        return true;
+      }
+      const ok = await chatPath(text);
+      if (ok) clear();
       return ok;
     }
 
@@ -98,7 +259,7 @@
     }
 
     return {
-      ask,
+      ask: () => ask(),
       sendDoc,
       /** A file dropped on the canvas. Extraction happens on this machine; then a summary is asked for. */
       async drop(paths) {
@@ -121,7 +282,7 @@
         if (pendingDoc && classification()) return sendDoc();
         return false;
       },
-      state: () => ({ messages, turns: turns.map((t) => ({ ...t })), pendingDoc: !!pendingDoc, busy }),
+      state: () => ({ flow: flow && flow.kind, lastRequest: lastRequest && { ...lastRequest }, messages, turns: turns.map((t) => ({ ...t })), pendingDoc: !!pendingDoc, busy }),
     };
   }
 
@@ -142,6 +303,25 @@
             return { ok: true };
           } catch (e) {
             return { ok: false, error: e && typeof e === "object" ? e : { message: String(e) } };
+          }
+        },
+        async tasks() {
+          return invoke("task_catalog");
+        },
+        async replay(task, inputs, officer) {
+          try {
+            const r = await invoke("replay_start", { taskId: task.id, version: task.version, inputs, officer, pid: null });
+            return { ok: true, outcome: r && r.outcome };
+          } catch (e) {
+            return { ok: false, message: typeof e === "string" ? e : "The task could not be started." };
+          }
+        },
+        async record(bundle) {
+          try {
+            await invoke("record_start", { appBundle: bundle });
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, message: typeof e === "string" ? e : "Recording could not start." };
           }
         },
         async attach(path) {

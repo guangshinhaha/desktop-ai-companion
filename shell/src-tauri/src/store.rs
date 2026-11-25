@@ -372,6 +372,17 @@ impl Store {
         Ok(next)
     }
 
+    /// The newest version of every saved task: (id, version, body). Read-only.
+    pub fn latest_tasks(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, t.version, t.body FROM tasks t
+             WHERE t.version = (SELECT MAX(version) FROM tasks WHERE id = t.id)
+             ORDER BY t.saved_at, t.id",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn task_versions(&self, id: &str) -> Result<Vec<i64>> {
         let mut st = self.conn.prepare("SELECT version FROM tasks WHERE id = ?1 ORDER BY version")?;
         let rows = st.query_map([id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
