@@ -213,6 +213,22 @@ pub const AUDIT_EVENTS: [&str; 12] = [
     "audit_purged",
 ];
 
+/// A step id as the task schema writes it: `s` and digits (`schema/task.v1.json`). Nothing else is stored.
+pub fn valid_step_id(s: &str) -> bool {
+    s.len() >= 2 && s.len() <= 12 && s.starts_with('s') && s[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// One task version's verification state (#42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionState {
+    pub version: i64,
+    /// `verified` or `needs_verification`.
+    pub state: String,
+    pub step: Option<String>,
+    /// A run of this version has finished at some point.
+    pub was_verified: bool,
+}
+
 pub struct Store {
     conn: Connection,
     path: std::path::PathBuf,
@@ -244,6 +260,7 @@ impl Store {
         let store = Store { conn, path: path.to_path_buf() };
         store.migrate()?;
         store.ensure_notes()?;
+        store.migrate_verification()?;
         Ok(store)
     }
 
@@ -341,6 +358,25 @@ impl Store {
         Ok(())
     }
 
+    /// Task versions' verification state (#42). Additive and idempotent, kept apart from `migrate` and
+    /// `user_version` so it touches no existing table. Holds step ids and states only, never a value.
+    /// `was_verified` is 1 once a run of the version has finished, and stays 1 if it is later flagged.
+    fn migrate_verification(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS step_passes (
+               task_id TEXT NOT NULL, version INTEGER NOT NULL, step TEXT NOT NULL, at INTEGER NOT NULL,
+               PRIMARY KEY (task_id, version, step));
+             CREATE TABLE IF NOT EXISTS version_state (
+               task_id TEXT NOT NULL, version INTEGER NOT NULL,
+               state TEXT NOT NULL CHECK (state IN ('verified', 'needs_verification')),
+               step TEXT CHECK (step IS NULL OR (length(step) BETWEEN 2 AND 12 AND step GLOB 's[0-9]*'
+                                                 AND substr(step, 2) NOT GLOB '*[^0-9]*')),
+               was_verified INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
+               PRIMARY KEY (task_id, version));",
+        )?;
+        Ok(())
+    }
+
     /// Adds a note to a saved task. Returns the note id. Fails if the task does not exist.
     pub fn add_note(&self, task_id: &str, author: &str, body: &str, now: i64) -> Result<i64> {
         let exists: bool = self.conn.query_row(
@@ -375,6 +411,87 @@ impl Store {
             "DELETE FROM task_notes WHERE task_id = ?1 AND id = ?2",
             params![task_id, note_id],
         )? > 0)
+    }
+
+    /// Records one replay's result for a task version, in one transaction (#42). Steps that completed are
+    /// remembered as passed. A divergence that means the interface changed (`interface_changed`, from the
+    /// executor) on a step that had passed before marks the version `needs_verification`; a finished run
+    /// marks it `verified`. Returns the state it set, if it set one. Step ids (`s` and digits) and states
+    /// only: anything else is dropped, never stored. A task version that does not exist is an error. An
+    /// older run never overwrites a newer one's state. No old version is touched or removed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_replay_outcome(
+        &mut self,
+        task_id: &str,
+        version: i64,
+        outcome: &str,
+        diverged_step: Option<&str>,
+        interface_changed: bool,
+        completed: &[String],
+        now: i64,
+    ) -> Result<Option<&'static str>> {
+        let tx = self.conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT count(*) > 0 FROM tasks WHERE id = ?1 AND version = ?2",
+            params![task_id, version],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Db("no such task version".into()));
+        }
+        let diverged_step = diverged_step.filter(|s| valid_step_id(s));
+        let mut set = None;
+        if outcome == "diverged" && interface_changed {
+            if let Some(step) = diverged_step {
+                let passed: bool = tx.query_row(
+                    "SELECT count(*) > 0 FROM step_passes WHERE task_id = ?1 AND version = ?2 AND step = ?3",
+                    params![task_id, version, step],
+                    |r| r.get(0),
+                )?;
+                if passed {
+                    set = Some("needs_verification");
+                }
+            }
+        } else if outcome == "finished" {
+            set = Some("verified");
+        }
+        if let Some(state) = set {
+            let step = if state == "verified" { None } else { diverged_step };
+            let verified = i64::from(state == "verified");
+            let changed = tx.execute(
+                "INSERT INTO version_state (task_id, version, state, step, was_verified, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (task_id, version) DO UPDATE SET
+                   was_verified = CASE WHEN excluded.state = 'verified' OR version_state.state = 'verified'
+                                       OR version_state.was_verified = 1 THEN 1 ELSE 0 END,
+                   state = excluded.state, step = excluded.step, at = excluded.at
+                 WHERE excluded.at >= version_state.at",
+                params![task_id, version, state, step, verified, now],
+            )?;
+            if changed == 0 {
+                set = None;
+            }
+        }
+        for s in completed.iter().filter(|s| valid_step_id(s)) {
+            tx.execute(
+                "INSERT OR IGNORE INTO step_passes (task_id, version, step, at) VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, version, s, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(set)
+    }
+
+    /// Versions of a task that have a recorded state, in version order.
+    pub fn version_states(&self, task_id: &str) -> Result<Vec<VersionState>> {
+        let mut st = self.conn.prepare(
+            "SELECT version, state, step, was_verified FROM version_state WHERE task_id = ?1 ORDER BY version",
+        )?;
+        let rows = st
+            .query_map([task_id], |r| {
+                Ok(VersionState { version: r.get(0)?, state: r.get(1)?, step: r.get(2)?, was_verified: r.get::<_, i64>(3)? == 1 })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Saves a task as a new version (max + 1; 1 for a new id). Older versions are kept.

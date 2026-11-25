@@ -16,6 +16,11 @@ public struct ReplayReport {
     public var outcome: Outcome
     public var completed: [String]
     public var notRun: [String]
+    /// True only for a divergence that means the target's interface is not what was recorded: the target was
+    /// not found or matched more than one element, or the step's own check never held. False for anything else
+    /// (a dialog, a failed audit write, a closed window, a failed action), so a re-verification flag is never
+    /// raised for a reason that is not the interface (#42).
+    public var interfaceChanged: Bool = false
 }
 
 /// One line of the live progress view (PRD C-3). Names and the task's own `say` text only, never run values.
@@ -93,8 +98,8 @@ public final class Replayer {
 
     private func runSteps() -> ReplayReport {
         var done: [String] = []
-        func report(_ o: ReplayReport.Outcome, at index: Int) -> ReplayReport {
-            ReplayReport(outcome: o, completed: done, notRun: task.steps[index...].map(\.id))
+        func report(_ o: ReplayReport.Outcome, at index: Int, interfaceChanged: Bool = false) -> ReplayReport {
+            ReplayReport(outcome: o, completed: done, notRun: task.steps[index...].map(\.id), interfaceChanged: interfaceChanged)
         }
 
         func stopReport(at index: Int, actionDone: Bool = false) -> ReplayReport {
@@ -128,7 +133,7 @@ public final class Replayer {
             case .success(let m): match = m
             case .failure(let d):
                 if d.stopped { return stopReport(at: i) }
-                return report(.diverged(step: step.id, reason: d.reason), at: i)
+                return report(.diverged(step: step.id, reason: d.reason), at: i, interfaceChanged: d.interface)
             }
             log("  found: \(ApprovalGate.safe(match.locator.summary))")
 
@@ -182,9 +187,9 @@ public final class Replayer {
                 let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
                 return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
             case .ok:
-                if let why = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
+                if let (why, interface) = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
                     if stopAsked { return stopReport(at: i, actionDone: true) }
-                    return report(.diverged(step: step.id, reason: why), at: i)
+                    return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: interface)
                 }
             }
             done.append(step.id)
@@ -196,7 +201,8 @@ public final class Replayer {
 
     // MARK: finding
 
-    struct Divergence: Error { let reason: String; var stopped = false }
+    struct Divergence: Error { let reason: String; var stopped = false; var interface = false }
+    static let ambiguousPrefix = "ambiguous: "
 
     func findTarget(_ step: ReplayTask.Step, ceiling: TimeInterval) -> Swift.Result<Match, Divergence> {
         let r: Waiting.Result<Match> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
@@ -204,14 +210,14 @@ public final class Replayer {
             if let d = unexpectedDialog(in: root, step: step) { return .stop("\(d) is open before the step; nothing was clicked") }
             switch Resolver.resolve(step.target, in: root) {
             case .found(let m): return .done(m)
-            case .ambiguous(let a): return .stop("ambiguous: \(a.candidates.count) elements match the target equally (\(a.locator.summary))")
+            case .ambiguous(let a): return .stop("\(Self.ambiguousPrefix)\(a.candidates.count) elements match the target equally (\(a.locator.summary))")
             case .notFound: return .keepWaiting
             }
         }
         switch r {
         case .done(let m): return .success(m)
-        case .ceiling: return .failure(Divergence(reason: "element not found within \(Int(ceiling)) s"))
-        case .stopped(let why): return .failure(Divergence(reason: why))
+        case .ceiling: return .failure(Divergence(reason: "element not found within \(Int(ceiling)) s", interface: true))
+        case .stopped(let why): return .failure(Divergence(reason: why, interface: why.hasPrefix(Self.ambiguousPrefix)))
         case .cancelled: return .failure(Divergence(reason: "stopped by the officer", stopped: true))
         }
     }
@@ -252,7 +258,7 @@ public final class Replayer {
     // MARK: checks
 
     /// Waits until every check of the step passes. Returns nil on success, or why not.
-    func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval, gated: Bool) -> String? {
+    func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval, gated: Bool) -> (String, Bool)? {
         var last = "no window"
         let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
             guard let root = host.snapshot() else { return .keepWaiting }
@@ -266,9 +272,9 @@ public final class Replayer {
         case .done: return nil
         case .ceiling:
             let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
-            return "check not met within \(Int(ceiling)) s: \(last)." + tail
-        case .stopped(let why): return why
-        case .cancelled: return "stopped by the officer"
+            return ("check not met within \(Int(ceiling)) s: \(last)." + tail, true)
+        case .stopped(let why): return (why, false)
+        case .cancelled: return ("stopped by the officer", false)
         }
     }
 

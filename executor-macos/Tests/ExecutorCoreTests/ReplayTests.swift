@@ -507,6 +507,7 @@ final class ReplayerTests: XCTestCase {
         guard case .diverged(let step, let why) = rep.outcome else { return XCTFail("\(rep.outcome)") }
         XCTAssertEqual(step, "s3")
         XCTAssertTrue(why.contains("ambiguous"))
+        XCTAssertTrue(rep.interfaceChanged, "an ambiguous target means the interface is not what was recorded")
         XCTAssertEqual(rep.completed, ["s1", "s2"])
         XCTAssertEqual(src.asked, 0, "no approval is asked for a step that cannot be found")
         XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
@@ -519,6 +520,7 @@ final class ReplayerTests: XCTestCase {
         let rep = r.run()
         guard case .diverged(let step, _) = rep.outcome else { return XCTFail() }
         XCTAssertEqual(step, "s2")
+        XCTAssertTrue(rep.interfaceChanged, "a target not found is an interface change")
         XCTAssertEqual(rep.completed, ["s1"])
         XCTAssertEqual(rep.notRun, ["s2", "s3"])
         // 100 ms, 200, 400, 800, 1600, then the remaining 1.9 s: backoff only, capped at 2 s.
@@ -543,18 +545,22 @@ final class ReplayerTests: XCTestCase {
         let t = try makeTask(), h = host()
         h.onPress = { _, _ in }
         let (r, _) = try replayer(t, h, answers: ["y"], ceiling: 3)
-        guard case .diverged(let step, let why) = r.run().outcome else { return XCTFail() }
+        let rep = r.run()
+        guard case .diverged(let step, let why) = rep.outcome else { return XCTFail() }
         XCTAssertEqual(step, "s3")
         XCTAssertTrue(why.contains("may or may not have taken effect"))
+        XCTAssertTrue(rep.interfaceChanged, "a check that never held is an interface change")
     }
 
     func testUnexpectedDialogStopsAndIsNeverClicked() throws {
         let t = try makeTask(), h = host()
         h.onPress = { _, h in h.tree = withDialog(h.tree!) }
         let (r, _) = try replayer(t, h, answers: ["y"])
-        guard case .diverged(let step, let why) = r.run().outcome else { return XCTFail() }
+        let rep = r.run()
+        guard case .diverged(let step, let why) = rep.outcome else { return XCTFail() }
         XCTAssertEqual(step, "s3")
         XCTAssertTrue(why.contains("dialog"))
+        XCTAssertFalse(rep.interfaceChanged, "an unexpected dialog is not an interface change")
         XCTAssertEqual(h.actions.filter { $0.hasPrefix("press") }, ["press:Create account"], "Yes, create was not pressed")
         XCTAssertTrue(h.waits.isEmpty, "stopped at once, not at the ceiling")
     }
@@ -577,8 +583,10 @@ final class ReplayerTests: XCTestCase {
         }
         let gate = ApprovalGate(source: Slow(h), out: { _ in })
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: gate, log: { _ in })
-        guard case .diverged(_, let why) = r.run().outcome else { return XCTFail() }
+        let rep = r.run()
+        guard case .diverged(_, let why) = rep.outcome else { return XCTFail() }
         XCTAssertTrue(why.contains("after approval"))
+        XCTAssertFalse(rep.interfaceChanged, "a dialog is not an interface change")
         XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
     }
 
@@ -591,7 +599,9 @@ final class ReplayerTests: XCTestCase {
         }
         let gate = ApprovalGate(source: Swap(h), out: { _ in })
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: gate, log: { _ in })
-        guard case .diverged = r.run().outcome else { return XCTFail() }
+        let rep = r.run()
+        guard case .diverged = rep.outcome else { return XCTFail() }
+        XCTAssertFalse(rep.interfaceChanged, "a button that changed during the approval wait is not flagged")
         XCTAssertFalse(h.actions.contains { $0.hasPrefix("press") })
     }
 
@@ -599,8 +609,10 @@ final class ReplayerTests: XCTestCase {
         let t = try makeTask(), h = host()
         h.pressResult = .failed("AX error -25204")
         h.onPress = { _, h in h.tree = createdPage() }
-        guard case .diverged(_, let w1) = try replayer(t, h, answers: ["y"]).0.run().outcome else { return XCTFail() }
+        let rep1 = try replayer(t, h, answers: ["y"]).0.run()
+        guard case .diverged(_, let w1) = rep1.outcome else { return XCTFail() }
         XCTAssertTrue(w1.contains("action failed"))
+        XCTAssertFalse(rep1.interfaceChanged, "a failed action is not an interface change")
 
         let h2 = host()
         h2.pressResult = .failed("AX error -25204")

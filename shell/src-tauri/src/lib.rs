@@ -16,6 +16,7 @@ pub mod router;
 mod run_ui;
 pub mod store;
 pub mod usage;
+pub mod verification;
 
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::sync::Mutex;
@@ -305,6 +306,14 @@ async fn replay_start(
             _ => "stopped",
         };
         let _ = store.finish_run(&run, status);
+        // Remember which steps passed, and flag the version if a step that used to pass diverged (#42).
+        // A failure to record is shown with the result, not dropped.
+        let mut result = result;
+        if let Ok(report) = &mut result {
+            if let Some(note) = verification::record_or_note(&mut store, &task_id, version, report, now_secs()) {
+                report["verification_note"] = serde_json::json!(note);
+            }
+        }
         result
     })
     .await
@@ -628,7 +637,16 @@ fn spawn_listrun(
             let task_ref = format!("{task_id}@{version}");
             let stopped = || stop.load(Ordering::SeqCst);
             let params = listrun::RunParams { run: &run, task_ref: &task_ref, officer: &officer, rows: &rows, from, stop: &stopped };
-            listrun::run_rows(&mut store, &params, &mut |store, ctx, inputs, obs| replay_row(&app, store, ctx, &task, inputs, pid, &stop, obs))?;
+            listrun::run_rows(&mut store, &params, &mut |store, ctx, inputs, obs| {
+                let result = replay_row(&app, store, ctx, &task, inputs, pid, &stop, obs);
+                // Each row's result counts toward the version's verification, the same as a single run (#42).
+                if let Ok(report) = &result {
+                    if let Some(note) = verification::record_or_note(store, &task_id, version, report, now_secs()) {
+                        set_listrun_error(&app, &run, note);
+                    }
+                }
+                result
+            })?;
             Ok(())
         })();
         if let Err(e) = outcome {
