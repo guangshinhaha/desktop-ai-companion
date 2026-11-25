@@ -11,6 +11,7 @@ pub mod listrun;
 pub mod progress;
 pub mod recording;
 pub mod notes;
+pub mod reuse;
 pub mod review;
 pub mod router;
 mod run_ui;
