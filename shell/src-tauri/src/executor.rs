@@ -75,6 +75,35 @@ pub fn ping(bin: &Path) -> Result<String, String> {
     result
 }
 
+/// Checks an audit export with `executor-macos verify-audit`. The export goes to its standard input, so
+/// the approved values never touch the disk. Ok holds the verifier's line; Err holds why it failed, which
+/// names the broken sequence number.
+pub fn verify_audit(bin: &Path, export: &str) -> Result<String, String> {
+    let mut child = Command::new(bin)
+        .arg("verify-audit")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {}", bin.display(), e.kind()))?;
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let data = export.to_string();
+    // Written on a thread so a large trail cannot fill the pipe while we wait for the verdict.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(data.as_bytes());
+    });
+    let out = child.wait_with_output().map_err(|e| format!("verifier failed: {}", e.kind()))?;
+    let _ = writer.join();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    } else {
+        Err(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

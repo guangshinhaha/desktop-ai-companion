@@ -1,6 +1,7 @@
 //! Menu-bar shell. One tray icon, one canvas window created on demand and destroyed on close,
 //! so an idle shell holds no web view. No network calls.
 
+pub mod approval;
 pub mod executor;
 pub mod recording;
 pub mod review;
@@ -71,6 +72,133 @@ const REVIEW: &str = "review";
 struct Session {
     draft: Mutex<Option<review::Draft>>,
     recording: Mutex<Option<recording::Recording>>,
+    approval: Mutex<Option<PendingApproval>>,
+}
+
+/// The card on screen and where the officer's answer goes. One at a time: a run asks one question at a time.
+struct PendingApproval {
+    card: serde_json::Value,
+    answer: std::sync::mpsc::Sender<bool>,
+    /// The window asking. A window closing late must not answer for the next card.
+    label: String,
+}
+
+fn open_approval_window(app: &AppHandle, label: &str) {
+    let built = WebviewWindowBuilder::new(app, label, WebviewUrl::App("approval.html".into()))
+        .title("Approval needed")
+        .inner_size(620.0, 640.0)
+        .always_on_top(true)
+        .center()
+        .build();
+    let Ok(w) = built else {
+        // No card could be shown, so the question is a no and the run stops rather than hangs.
+        answer_approval(app, Some(label), false);
+        return;
+    };
+    {
+        // Closing the window without answering is a no. The question was never approved.
+        let handle = app.clone();
+        let mine = label.to_string();
+        w.on_window_event(move |e| {
+            if let WindowEvent::Destroyed = e {
+                answer_approval(&handle, Some(&mine), false);
+            }
+        });
+    }
+}
+
+/// Delivers the officer's decision to the waiting run. A second answer finds nothing waiting.
+fn answer_approval(app: &AppHandle, from: Option<&str>, approved: bool) {
+    let pending = app.state::<Session>().approval.lock().ok().and_then(|mut p| {
+        if from.is_some_and(|l| p.as_ref().is_some_and(|q| q.label != l)) {
+            return None;
+        }
+        p.take()
+    });
+    if let Some(p) = pending {
+        let _ = p.answer.send(approved);
+    }
+}
+
+/// The card the officer is being asked about, or nothing.
+#[tauri::command]
+fn approval_current(session: tauri::State<Session>, window: tauri::WebviewWindow) -> Option<serde_json::Value> {
+    session
+        .approval
+        .lock()
+        .ok()
+        .and_then(|p| p.as_ref().filter(|p| p.label == window.label()).map(|p| p.card.clone()))
+}
+
+/// Only an explicit approve passes `true`. The window closes either way.
+#[tauri::command]
+fn approval_answer(app: AppHandle, window: tauri::WebviewWindow, approved: bool) {
+    // The answer counts only from the window that holds the pending card.
+    answer_approval(&app, Some(window.label()), approved);
+    let _ = window.close();
+}
+
+/// Runs a saved task through the executor. The officer is asked before every step that may commit; every
+/// decision and the run's start and end are appended to the audit chain. Inputs stay in memory.
+/// Returns the executor's report: outcome, completed and not-run step ids.
+#[tauri::command]
+async fn replay_start(
+    app: AppHandle,
+    task_id: String,
+    version: i64,
+    inputs: serde_json::Value,
+    officer: String,
+    pid: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    if !approval::valid_officer(&officer) {
+        return Err("the officer's name is needed".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = open_store()?;
+        let body = store
+            .task_body(&task_id, version)
+            .map_err(|e| e.to_string())?
+            .ok_or("no such task version")?;
+        let task: serde_json::Value = serde_json::from_str(&body).map_err(|_| "the saved task is not readable")?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let run = format!("run_{nanos:x}");
+        store.start_run(&run, &task_id, version, "shell", now_secs()).map_err(|e| e.to_string())?;
+        let ctx = approval::RunContext { officer, task_ref: format!("{task_id}@{version}"), run: run.clone() };
+        let result = approval::run_replay(&executor::executor_path(), &mut store, &ctx, &task, &inputs, pid, &mut |card| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let label = format!("approval-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            if let Ok(mut p) = app.state::<Session>().approval.lock() {
+                *p = Some(PendingApproval { card: card.clone(), answer: tx, label: label.clone() });
+            }
+            open_approval_window(&app, &label);
+            // No timeout: waiting is not consent. A closed window or a dropped sender is a no.
+            rx.recv().unwrap_or(false)
+        });
+        let status = match &result {
+            Ok(r) if r["outcome"] == "finished" => "finished",
+            Ok(r) if r["outcome"] == "refused" => "refused",
+            _ => "stopped",
+        };
+        let _ = store.finish_run(&run, status);
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Verifies the whole audit trail with `executor-macos verify-audit`. Ok says the trail is intact;
+/// Err names the sequence number where it breaks.
+#[tauri::command]
+async fn audit_verify() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let export = open_store()?.export_audit().map_err(|e| e.to_string())?;
+        executor::verify_audit(&executor::executor_path(), &export)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn open_review_window(app: &AppHandle) {
@@ -207,7 +335,11 @@ pub fn run() {
             review_view,
             review_edit,
             review_save,
-            review_discard
+            review_discard,
+            approval_current,
+            approval_answer,
+            replay_start,
+            audit_verify
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

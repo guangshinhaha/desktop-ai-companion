@@ -28,14 +28,40 @@ public final class Replayer {
     let gate: ApprovalGate
     let ceiling: TimeInterval
     let log: (String) -> Void
+    let audit: AuditSink?
 
     public init(task: ReplayTask, inputs: RunInputs, host: ReplayHost, gate: ApprovalGate,
-                ceiling: TimeInterval = Replayer.defaultCeiling, log: @escaping (String) -> Void) {
+                ceiling: TimeInterval = Replayer.defaultCeiling, audit: AuditSink? = nil, log: @escaping (String) -> Void) {
         self.task = task; self.inputs = inputs; self.host = host; self.gate = gate
-        self.ceiling = ceiling; self.log = log
+        self.ceiling = ceiling; self.audit = audit; self.log = log
     }
 
+    /// Runs the task and records it (TD 7.2): `run_started` first, then per step what the officer decided,
+    /// then `step_diverged` if it stopped and `run_finished` always. When a record cannot be written the run
+    /// stops, so nothing is done that the trail does not know about.
     public func run() -> ReplayReport {
+        if let audit, !audit.record(AuditEvent(.runStarted)) {
+            return ReplayReport(outcome: .refused("the audit trail could not be written; nothing was done"),
+                                completed: [], notRun: task.steps.map(\.id))
+        }
+        let report = runSteps()
+        if let audit {
+            var outcome = "finished"
+            switch report.outcome {
+            case .diverged(let step, let reason):
+                // Reasons name steps and elements, never run values (see the report type).
+                _ = audit.record(AuditEvent(.stepDiverged, step: step, shown: ApprovalGate.safe(reason)))
+                outcome = "diverged"
+            case .notApproved: outcome = "not_approved"
+            case .refused: outcome = "refused"
+            case .finished: break
+            }
+            _ = audit.record(AuditEvent(.runFinished, shown: outcome))
+        }
+        return report
+    }
+
+    private func runSteps() -> ReplayReport {
         var done: [String] = []
         func report(_ o: ReplayReport.Outcome, at index: Int) -> ReplayReport {
             ReplayReport(outcome: o, completed: done, notRun: task.steps[index...].map(\.id))
@@ -47,7 +73,7 @@ public final class Replayer {
         log("precondition(s) met: \(task.preconditions.count)")
 
         for (i, step) in task.steps.enumerated() {
-            log("step \(step.id): \(step.say)")
+            log("step \(ApprovalGate.safe(step.id)): \(ApprovalGate.safe(step.say))")
             // The run's ceiling caps a step's own timeout; a task cannot lengthen the run.
             let stepCeiling = min(step.timeoutSeconds ?? ceiling, ceiling)
 
@@ -57,16 +83,22 @@ public final class Replayer {
             case .success(let m): match = m
             case .failure(let d): return report(.diverged(step: step.id, reason: d.reason), at: i)
             }
-            log("  found: \(match.locator.summary)")
+            log("  found: \(ApprovalGate.safe(match.locator.summary))")
 
             // 2. The gate. Nothing below runs for a step that needs approval unless the officer said y.
             var approval: Approval?
             let gated = Self.mustAsk(step, live: match.node)
             if gated {
+                let shown = ApprovalGate.makeCard(step: step, task: task, inputs: inputs, target: match.node).shown
                 switch gate.request(step: step, task: task, inputs: inputs, target: match.node) {
                 case .rejected:
+                    _ = audit?.record(AuditEvent(.rejected, step: step.id, shown: shown))
                     return report(.notApproved(step: step.id), at: i)
                 case .approved(let a):
+                    // The record comes before the action. No record, no action.
+                    if let audit, !audit.record(AuditEvent(.approved, step: step.id, shown: shown)) {
+                        return report(.diverged(step: step.id, reason: "the audit trail could not be written; nothing was done for this step"), at: i)
+                    }
                     approval = a
                 }
                 // The officer may have taken a while. Look again, once, and act only on what is there now.
@@ -99,7 +131,7 @@ public final class Replayer {
                 }
             }
             done.append(step.id)
-            log("  done: \(step.id)")
+            log("  done: \(ApprovalGate.safe(step.id))")
         }
         return ReplayReport(outcome: .finished, completed: done, notRun: [])
     }

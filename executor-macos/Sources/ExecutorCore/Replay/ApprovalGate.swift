@@ -15,6 +15,12 @@ public protocol ApprovalSource {
     /// One answer line for the approval just shown, or nil when there is none (end of input,
     /// no terminal, no such line). The caller counts nil as no.
     func nextAnswer() -> String?
+    /// Same, for a source that shows the card itself (the shell). The default is `nextAnswer`.
+    func answer(for card: ApprovalCard) -> String?
+}
+
+public extension ApprovalSource {
+    func answer(for card: ApprovalCard) -> String? { nextAnswer() }
 }
 
 /// Reads from the terminal the process is attached to. Not a terminal means no answer, so
@@ -59,22 +65,73 @@ public enum ApprovalOutcome {
     case rejected
 }
 
+/// What the officer is shown for one step (TD 7.1). Built from the step and the element found on screen,
+/// never from the task's own words alone, so a summary cannot hide the action.
+public struct ApprovalCard {
+    public struct Pair { public var name: String; public var value: String }
+
+    public var stepId: String
+    public var task: String
+    public var app: String
+    /// The task's summary with this run's inputs filled in, or nil when the task gives none.
+    public var summary: String?
+    public var willDo: String
+    public var unknown: Bool
+    /// What the task claims. The executor cannot check it.
+    public var undoableClaim: Bool
+    public var inputs: [Pair]
+    /// Fixed values the task types, each with the field it goes into (issue #76).
+    public var constants: [Pair]
+
+    /// The card as a JSON object for the shell. Holds values: it goes to the officer's own screen only.
+    public var json: [String: Any] {
+        func pairs(_ p: [Pair]) -> [[String: String]] { p.map { ["name": $0.name, "value": $0.value] } }
+        var o: [String: Any] = ["step": stepId, "task": task, "app": app, "will_do": willDo, "unknown": unknown,
+                                "undoable_claim": undoableClaim, "inputs": pairs(inputs), "constants": pairs(constants)]
+        if let summary { o["summary"] = summary }
+        return o
+    }
+
+    /// The lines of the card. `showValues` false hides this run's input values (a pipe, a log).
+    public func lines(showValues: Bool) -> [String] {
+        var l = ["", "APPROVAL NEEDED: step \(stepId) in \(app)"]
+        if unknown { l.append("  (the recording could not tell whether this step commits, so it is treated as one that does)") }
+        let said = summary.map { showValues ? $0 : "(hidden: output is not a terminal)" } ?? "(the task gives no summary for this step)"
+        l.append("  Task says: " + said)
+        l.append("  Will do: \(willDo)")
+        l.append("  Task says it can be undone: \(undoableClaim ? "yes" : "no")")
+        l.append("  Values this run enters:")
+        for p in inputs { l.append("    \(p.name) = \"\(showValues ? p.value : "<hidden>")\"") }
+        if !constants.isEmpty {
+            l.append("  Fixed values the task types:")
+            for p in constants { l.append("    into \(p.name): \"\(p.value)\"") }
+        }
+        return l
+    }
+
+    /// What goes in the audit record: the card with the approved values (decision 0005).
+    public var shown: String { lines(showValues: true).filter { !$0.isEmpty }.joined(separator: "\n") }
+}
+
 public final class ApprovalGate {
     let source: ApprovalSource
     let out: (String) -> Void
+    let showValues: Bool
 
-    public init(source: ApprovalSource, out: @escaping (String) -> Void) {
+    /// `showValues` false (standard output is a pipe or a file) prints the card without this run's values.
+    public init(source: ApprovalSource, out: @escaping (String) -> Void, showValues: Bool = true) {
         self.source = source
         self.out = out
+        self.showValues = showValues
     }
 
     /// Shows the card for `step`, filled with this run's inputs, and waits for the answer.
     /// Only `y` or `Y` approves. `n`, anything else, an empty line and end of input all reject.
     public func request(step: ReplayTask.Step, task: ReplayTask, inputs: RunInputs, target: UINode) -> ApprovalOutcome {
-        out(Self.card(step: step, task: task, inputs: inputs, target: target))
-        let answer = source.nextAnswer()
-        let decision = Self.isYes(answer)
-        out(decision ? "approved: \(step.id)" : "not approved: \(step.id)")
+        let c = Self.makeCard(step: step, task: task, inputs: inputs, target: target)
+        out((c.lines(showValues: showValues) + ["Type y to approve, n to stop. Anything else stops the run: "]).joined(separator: "\n"))
+        let decision = Self.isYes(source.answer(for: c))
+        out(decision ? "approved: \(Self.safe(step.id))" : "not approved: \(Self.safe(step.id))")
         return decision ? .approved(Approval(stepId: step.id)) : .rejected
     }
 
@@ -83,28 +140,32 @@ public final class ApprovalGate {
         return a == "y" || a == "Y"
     }
 
-    /// The text the officer sees. The only place a run's input values are printed. Everything that comes
-    /// from the task file or the page goes through `safe`, and "Will do" is built from the step and the
-    /// element found on screen, not from the task's own words, so a summary cannot hide the action.
+    /// The text the officer sees, with values. Everything that comes from the task file or the page goes
+    /// through `safe`, and "Will do" is built from the step and the element found on screen.
     static func card(step: ReplayTask.Step, task: ReplayTask, inputs: RunInputs, target: UINode) -> String {
-        var lines = ["", "APPROVAL NEEDED: step \(safe(step.id)) in \(safe(task.bundle))"]
-        if step.consequential == .unknown { lines.append("  (the recording could not tell whether this step commits, so it is treated as one that does)") }
-        let said = (step.approvalSummary?.isEmpty ?? true) ? "(the task gives no summary for this step)" : fill(step.approvalSummary ?? "", inputs: inputs)
-        lines.append("  Task says: " + said)
+        (makeCard(step: step, task: task, inputs: inputs, target: target).lines(showValues: true)
+         + ["Type y to approve, n to stop. Anything else stops the run: "]).joined(separator: "\n")
+    }
+
+    public static func makeCard(step: ReplayTask.Step, task: ReplayTask, inputs: RunInputs, target: UINode) -> ApprovalCard {
         let what = "the \(safe(target.role)) \"\(clip(safe(target.label ?? "no label")))\""
+        let willDo: String
         switch step.action {
-        case .press: lines.append("  Will do: press \(what)")
-        case .setValue: lines.append("  Will do: type \(valueName(step)) into \(what)")
-        case .select: lines.append("  Will do: choose \(valueName(step)) in \(what)")
+        case .press: willDo = "press \(what)"
+        case .setValue: willDo = "type \(valueName(step)) into \(what)"
+        case .select: willDo = "choose \(valueName(step)) in \(what)"
         }
-        lines.append("  Can be undone: \(step.undoable ? "yes" : "no")")
-        lines.append("  Values this run enters:")
-        for spec in task.inputs {
-            let v = inputs.secret(spec.name)?.reveal() ?? ""
-            lines.append("    \(safe(spec.name)) = \"\(safe(v))\"")
+        let said = (step.approvalSummary?.isEmpty ?? true) ? nil : fill(step.approvalSummary ?? "", inputs: inputs)
+        let ins = task.inputs.map { ApprovalCard.Pair(name: safe($0.name), value: safe(inputs.secret($0.name)?.reveal() ?? "")) }
+        var consts: [ApprovalCard.Pair] = []
+        for s in task.steps {
+            if case .constant(let c)? = s.value {
+                let field = s.target.label ?? s.target.labelMatches ?? s.target.domId ?? "step \(s.id)"
+                consts.append(ApprovalCard.Pair(name: clip(safe(field)), value: safe(c)))
+            }
         }
-        lines.append("Type y to approve, n to stop. Anything else stops the run: ")
-        return lines.joined(separator: "\n")
+        return ApprovalCard(stepId: safe(step.id), task: safe(task.name), app: safe(task.bundle), summary: said, willDo: willDo,
+                            unknown: step.consequential == .unknown, undoableClaim: step.undoable, inputs: ins, constants: consts)
     }
 
     static func valueName(_ step: ReplayTask.Step) -> String {
@@ -134,7 +195,7 @@ public final class ApprovalGate {
     /// Control, format (right-to-left override and the like), separator and private-use characters
     /// show as `\u{XXXX}`, so a value cannot move the cursor, clear the line or reorder the text
     /// to make the approval say something else.
-    static func safe(_ s: String) -> String {
+    public static func safe(_ s: String) -> String {
         var out = ""
         for u in s.unicodeScalars {
             switch u.properties.generalCategory {

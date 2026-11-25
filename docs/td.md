@@ -254,7 +254,11 @@ Events: `run_started`, `approved`, `rejected`, `step_diverged`, `recovered`, `ru
 
 Each record carries the hash of the one before it, so a missing or edited record breaks the chain and shows up on verification.
 
-**Open, needs a decision:** whether the audit record stores the values the officer approved, or only the names of the inputs. Accountability argues for the values: "I approved creating an account for this person". Data minimisation argues for names only. **Recommended:** store the values, encrypted, only in the audit store, with a retention period set by the pilot agency. This touches personal data and the audit trail, so it is `risk:high` and needs Shin's line-by-line review.
+**Decided (decision 0005):** the record stores the values the officer approved, encrypted, in the local audit store only. Retention defaults to 7 years (2555 days), as config. A central copy comes with #29.
+
+How it is built. The shell owns the store and the officer's identity. The executor asks over the stdio JSON-RPC (`audit.append`, `approval.request`) and the shell writes the record through the store's API; the executor cannot set the officer, task, run or time. `approved` is written before the action runs, and a failed write stops the run. `executor-macos verify-audit` reads the shell's JSONL export on stdin and exits 0 when the chain is intact, or 5 naming the sequence number of the first bad or missing record. The `recovered`, `item_marked_by_officer`, `task_shared` and `task_handed_over` events are allowed by the store but have no producer yet.
+
+Limit: whoever holds the store key can recompute every hash and the control row and forge a whole trail. The central copy (#29) is what closes that.
 
 ## 8. Chat (Phase 1)
 
@@ -266,7 +270,7 @@ Chat is deliberately thin: one conversation view, drafting and summarising, and 
 |---|---|---|
 | Recorded task (steps, descriptors, input names) | Local store; shared store in Phase 2 | Yes, to the library store. Holds no values |
 | Input values (typed at run time, list rows, `read` values) | Memory during a run | Only to the cleared model route during recovery, and masked unless the route is cleared for them |
-| Values the officer approved | Audit store (pending the Section 7.2 decision) | To the audit store |
+| Values the officer approved | Encrypted local audit store (decision 0005), 7 years by default | Central copy later, via #29 |
 | Screenshots | Memory only, vision fallback only | Only to the cleared route. Never stored |
 | Chat content and dropped documents | Local chat history | To the cleared model route |
 | Password fields | Never read | No |

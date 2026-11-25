@@ -297,7 +297,7 @@ final class ApprovalGateTests: XCTestCase {
         let (g, _, out) = gate(["n"])
         _ = g.request(step: t.steps[2], task: t, inputs: i, target: createButton)
         XCTAssertTrue(out().contains("Create an account for Mei Ling (mei@x.example.test)"))
-        XCTAssertTrue(out().contains("Can be undone: no"))
+        XCTAssertTrue(out().contains("Task says it can be undone: no"))
     }
 
     func testControlAndBidiCharactersCannotRewriteTheCard() throws {
