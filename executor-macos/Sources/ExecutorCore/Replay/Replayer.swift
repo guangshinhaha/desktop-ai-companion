@@ -133,6 +133,8 @@ public final class Replayer {
             // The run's ceiling caps a step's own timeout; a task cannot lengthen the run.
             let stepCeiling = min(step.timeoutSeconds ?? ceiling, ceiling)
 
+            // One recovery budget per step, shared by finding and checking (TD 5.4: three attempts, then the officer).
+            var spent = 0
             let hold: () -> Void = { self.control?.holdWhilePaused(onPause: { self.progress?(here(.paused)) }, onResume: { self.progress?(here(.resumed)) }) }
 
             // 1. Find the element. Two matches is a divergence, never a guess. None, or a dialog in the way,
@@ -145,7 +147,7 @@ public final class Replayer {
                 guard recovery != nil, !d.reason.hasPrefix(Self.ambiguousPrefix) else {
                     return report(.diverged(step: step.id, reason: d.reason), at: i, interfaceChanged: d.interface)
                 }
-                switch recover(step, divergence: d.reason, hold: hold, resume: { self.findTarget(step, ceiling: stepCeiling) }) {
+                switch recover(step, divergence: d.reason, spent: &spent, hold: hold, resume: { self.findTarget(step, ceiling: stepCeiling) }) {
                 case .recovered(let m): match = m
                 case .stopped: return stopReport(at: i)
                 case .gaveUp(let why): return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: d.interface)
@@ -214,7 +216,7 @@ public final class Replayer {
                         guard let (w, iface) = self.awaitChecks(step, ceiling: stepCeiling, gated: false) else { return .success(()) }
                         return .failure(Divergence(reason: w, stopped: self.stopAsked, interface: iface))
                     }
-                    switch recover(step, divergence: why, hold: hold, resume: recheck) {
+                    switch recover(step, divergence: why, spent: &spent, hold: hold, resume: recheck) {
                     case .recovered: break
                     case .stopped: return stopReport(at: i, actionDone: true)
                     case .gaveUp(let w): return report(.diverged(step: step.id, reason: w), at: i, interfaceChanged: interface)
@@ -232,17 +234,20 @@ public final class Replayer {
 
     enum RecoveryEnd<T> { case recovered(T), stopped, gaveUp(String) }
 
-    /// Up to three attempts on one step (TD 5.4), then the officer. Each attempt: look at the window, build the
+    /// Up to three attempts on one step (TD 5.4), then the officer. `spent` is the step's budget, shared by every
+    /// stage of the step. Each attempt: look at the window, build the
     /// request (the one builder), ask, check the answer, record it, and only then act. A recovery act is written
     /// to the trail as `recovered` before it is done; a refused answer as `step_diverged`. A stop is honoured
     /// before asking, after the answer, and before acting; a pause holds before each attempt.
-    func recover<T>(_ step: ReplayTask.Step, divergence first: String, hold: () -> Void,
+    func recover<T>(_ step: ReplayTask.Step, divergence first: String, spent: inout Int, hold: () -> Void,
                     resume: () -> Swift.Result<T, Divergence>) -> RecoveryEnd<T> {
         guard let recovery else { return .gaveUp(first) }
         let officer = "The officer is asked to look."
         var last = first
         let max = RecoveryPolicy.maxAttempts
-        for attempt in 1...max {
+        while spent < max {
+            spent += 1
+            let attempt = spent
             hold()
             if stopAsked { return .stopped }
             guard let root = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }

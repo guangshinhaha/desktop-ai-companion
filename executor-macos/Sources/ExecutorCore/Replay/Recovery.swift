@@ -32,7 +32,8 @@ public struct RecoveryPolicy {
 /// The one function that builds a recovery request (decision 0003, "What a recovery request may carry").
 /// Sent: the step's `say` line, action, descriptor and input name; a pruned tree of the window (roles, labels,
 /// structure). Field values: masked unless the route is cleared. Password fields: never read, never sent.
-/// This run's input values: never, not even inside a label. No screenshot, no credentials, no list rows.
+/// This run's input values: never, not even inside a label. No screenshot, no credentials, no list rows: a
+/// table, list or outline goes as its role and label only, with `rows_omitted`.
 public enum RecoveryRequest {
     public static let maxNodes = 400
     public static let maxDepth = 40
@@ -51,16 +52,32 @@ public enum RecoveryRequest {
     static let fieldRoles: Set<String> = ReplayTask.textRoles.union(ReplayTask.choiceRoles)
     /// Containers with nothing to say: their children are lifted into their parent.
     static let hoistable: Set<String> = ["AXGroup", "AXUnknown", "AXGenericElement", "AXSection", "AXLayoutArea", "AXSplitGroup"]
+    /// Holders of list rows (decision 0003: no list rows). Their contents are never sent.
+    static let rowHolders: Set<String> = ["AXTable", "AXOutline", "AXList", "AXGrid", "AXBrowser", "AXRow", "AXCell", "AXColumn"]
+
+    /// Folded for comparison: case and diacritics ignored, every run of whitespace (NBSP included) one space.
+    static func fold(_ s: String) -> String {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// True when `text` holds one of `secrets` (already folded). Short values (under 3 characters) match a whole
+    /// word, so a one-letter grade still masks a label that is that letter.
+    static func holds(_ text: String, _ secrets: [String]) -> Bool {
+        let t = fold(text)
+        let words = Set(t.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+        return secrets.contains { $0.count >= 3 ? t.contains($0) : (t == $0 || words.contains($0)) }
+    }
 
     public static func build(step: ReplayTask.Step, task: ReplayTask, inputs: RunInputs, root: UINode, divergence: String,
                              attempt: Int, policy: RecoveryPolicy, readValue: (UINode) -> String?) -> Swift.Result<Built, Refusal> {
         guard let classification = policy.knownClassification else {
             return .failure(Refusal(reason: "the task has no classification, and an unknown classification counts as above the model route's ceiling; nothing was sent"))
         }
-        let secrets = inputs.values.values.map { $0.reveal() }.filter { $0.count >= 2 }
+        let secrets = inputs.values.values.map { fold($0.reveal()) }.filter { !$0.isEmpty }
         func clean(_ s: String?) -> (String?, Bool) {
             guard var s, !s.isEmpty else { return (nil, false) }
-            if secrets.contains(where: { s.localizedCaseInsensitiveContains($0) }) { return (masked, true) }
+            if holds(s, secrets) { return (masked, true) }
             if s.count > maxLabel { s = String(s.prefix(maxLabel)) }
             return (s, false)
         }
@@ -95,6 +112,10 @@ public enum RecoveryRequest {
                 } else {
                     o["value_masked"] = true
                 }
+            }
+            if rowHolders.contains(n.role) {
+                if !n.children.isEmpty { o["rows_omitted"] = true }
+                return [o]
             }
             let c = kids()
             if !c.isEmpty { o["children"] = c }
@@ -174,10 +195,25 @@ public enum RecoveryAnswer: Equatable {
         }
     }
 
+    /// Labels of the only buttons recovery may press: ways to dismiss something, compared whole after folding.
+    /// An allow-list, not a list of dangerous words: anything else ("Discard draft", "Go", "OK") is refused.
+    static let dismissals: Set<String> = ["close", "dismiss", "cancel", "not now", "later", "maybe later", "skip",
+                                          "got it", "no thanks", "no, thanks", "hide", "x", "×", "✕"]
+
+    /// Could `node` be what `d` (a gated step's target) names? Same role, and the same label or dom id. No
+    /// uniqueness is needed: two such buttons are both refused, not neither.
+    static func couldBe(_ node: UINode, _ d: Descriptor) -> Bool {
+        if let r = d.role, r != node.role { return false }
+        if let l = d.label, let nl = node.label, RecoveryRequest.fold(l) == RecoveryRequest.fold(nl) { return true }
+        if let id = d.domId, id == node.domId { return true }
+        return false
+    }
+
     /// Checks an act against the window as it is now. Returns the live node to act on, or why not.
     /// Refused: an element not in the tree that was sent, one that moved or changed, a link (it may leave the
-    /// app), anything unlabelled, anything that reads like a commit, the target of any step that needs approval,
-    /// a password field, and typing into anything but this step's own non-gated text field.
+    /// app), anything unlabelled, anything that reads like a commit, anything that could be the target of a step
+    /// that needs approval, a password field, a button whose label is not a dismissal, and typing into anything
+    /// but this step's own non-gated text field.
     static func check(_ kind: Kind, ref: String, built: RecoveryRequest.Built, step: ReplayTask.Step, task: ReplayTask,
                       now root: UINode) -> Swift.Result<UINode, Rejection> {
         func refuse(_ why: String) -> Swift.Result<UINode, Rejection> { .failure(Rejection(reason: why, malformed: false)) }
@@ -194,11 +230,19 @@ public enum RecoveryAnswer: Equatable {
         }
         if ReplayTask.looksLikeCommit(label) { return refuse("it targets a consequential element") }
         for s in task.steps where s.needsApproval {
-            if case .found(let m) = Resolver.resolve(s.target, in: root), m.node === node { return refuse("it targets a consequential element (the target of a step that needs approval)") }
+            var hit = couldBe(node, s.target)
+            if case .found(let m) = Resolver.resolve(s.target, in: root), m.node === node { hit = true }
+            if hit { return refuse("it targets a consequential element (it could be the target of a step that needs approval)") }
         }
         switch kind {
         case .press:
-            guard ["AXButton", "AXDisclosureTriangle", "AXTab"].contains(node.role) else {
+            switch node.role {
+            case "AXDisclosureTriangle", "AXTab": break
+            case "AXButton":
+                guard dismissals.contains(RecoveryRequest.fold(label)) else {
+                    return refuse("it presses a button that is not a way to dismiss something, which may be consequential")
+                }
+            default:
                 return refuse("it presses an element of a kind recovery does not press (\(ApprovalGate.safe(node.role)))")
             }
         case .setValue:

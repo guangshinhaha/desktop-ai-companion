@@ -208,14 +208,14 @@ The model returns one of three answers:
 
 The executor rejects any `act` that targets a consequential element, types a value other than the step's own input, or leaves the recorded app. After three recovery attempts on one step, it asks the officer.
 
-How it is built (#34). One function builds the request (`RecoveryRequest.build` in `executor-macos/Sources/ExecutorCore/Replay/Recovery.swift`), following decision 0003's table. Password fields are never read. Field values are masked unless `replay.start` says the route is cleared (`values_cleared`, which nothing sets before #19). Any label holding one of the run's input values goes as `[masked]`. A run with no `classification` in `replay.start` sends nothing, because unknown counts as above the ceiling. The request goes over RPC as `recover.request {request}`. The shell passes only masked requests to the service's `POST /recover` (`model-adapter/src/recover.ts`), which checks the ceiling before the route and passes on only a well-formed answer. Today's only route is the stub, and it answers `ask_officer`.
+How it is built (#34). One function builds the request (`RecoveryRequest.build` in `executor-macos/Sources/ExecutorCore/Replay/Recovery.swift`), following decision 0003's table. Password fields are never read. Field values are masked unless `replay.start` says the route is cleared (`values_cleared`, which nothing sets before #19). Any label holding one of the run's input values goes as `[masked]`. Labels are compared with case, accents and whitespace folded, and a value under 3 characters is matched as a whole word. A table, list or outline goes as its role and label only (`rows_omitted`), so no list row leaves. A run with no `classification` in `replay.start` sends nothing, because unknown counts as above the ceiling. The request goes over RPC as `recover.request {request}`. The shell passes only masked requests to the service's `POST /recover` (`model-adapter/src/recover.ts`), which checks the ceiling before the route and passes on only a well-formed answer. Today's only route is the stub, and it answers `ask_officer`.
 
 The executor checks every answer itself, whatever the service sent:
 
 - A malformed answer fails closed: the officer is asked at once.
-- An `act` may press only a labelled button, disclosure triangle or tab, or type the step's own input into the step's own field. It is checked against the window as it is now.
-- It is refused if the element reads like a commit, is the target of any step that needs approval, is a link or a password field, or names another app.
-- A refusal is recorded as `step_diverged` and counts as an attempt.
+- An `act` may press only a disclosure triangle, a tab, or a button whose whole label is a dismissal (Close, Dismiss, Cancel, Not now, Skip, Got it and the like). It may also type the step's own input into the step's own field. This is an allow-list, so "Discard draft" or "OK" is refused. Each `act` is checked against the window as it is now.
+- It is refused if the element reads like a commit, or could be the target of any step that needs approval (same role, and the same label or dom id, even when two elements match). It is also refused if it is a link or a password field, or if the answer names another app.
+- A refusal is recorded as `step_diverged` and counts as an attempt. One step has one budget of three attempts, shared by finding its element and checking its result.
 - `recovered` is recorded before the action, and a failed write stops the run.
 - A step that needs approval is never recovered once it has acted, because its action may have taken effect. Recovery never answers an approval card.
 - A Stop or pause before, during or after the request is honoured, and the answer is then never acted on.
