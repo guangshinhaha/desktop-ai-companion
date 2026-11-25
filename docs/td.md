@@ -210,7 +210,7 @@ The executor rejects any `act` that targets a consequential element, types a val
 
 ## 6. List runs (E-5)
 
-A list run executes one task once per row of a spreadsheet (CSV or XLSX, read locally). The officer maps columns to inputs before the run starts. Each row moves through these states:
+A list run executes one task once per row of a spreadsheet (CSV, read locally; Excel is out for now, see decision 0006). The officer maps columns to inputs before the run starts. Each row moves through these states:
 
 ```
 pending ─▶ running ─▶ awaiting_approval ─▶ committing ─▶ done
@@ -222,6 +222,7 @@ pending ─▶ running ─▶ awaiting_approval ─▶ committing ─▶ done
 - The executor writes `committing` to `run_items` before it performs a consequential action, and `done` after the action's check passes. This order is what prevents a double submit.
 - A crash or stop during `committing` leaves the row `unknown`. On resume, the officer must check that row in the target app and mark it done or not done before the run continues. The executor never re-submits an `unknown` row by itself.
 - The run stops at the first `diverged` row by default. The officer can skip the row, fix it by hand, or end the run.
+- Built in `shell/src-tauri/src/listrun.rs` (see decision 0006). `skipped` is the officer's answer to a `diverged` row. A row that reached `committing` and then ended any way but `finished` (a divergence, a stop, a dead executor) is `unknown`, not `diverged`: the action may have happened. A rejected row is left as `rejected` and the run goes on.
 - Approval is per item in Phase 1. Batch approval (E-7) is a later setting with a capped batch size, and still stops at the first divergence.
 
 ## 7. Approval gate and audit trail

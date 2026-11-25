@@ -425,6 +425,74 @@ impl Store {
         Ok(())
     }
 
+    /// Creates a list run's rows 1..=n, all `pending`. Rows are numbered from 1, the same number the audit
+    /// trail's `item` carries. All or none.
+    pub fn create_run_items(&mut self, run_id: &str, n: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for item in 1..=n {
+            tx.execute(
+                "INSERT INTO run_items (run_id, item, state, last_step) VALUES (?1, ?2, 'pending', NULL)",
+                params![run_id, item],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every row of a run, in order: (item, state, last_step).
+    pub fn run_items(&self, run_id: &str) -> Result<Vec<(i64, String, Option<String>)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT item, state, last_step FROM run_items WHERE run_id = ?1 ORDER BY item")?;
+        let rows = st.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn item_state(&self, run_id: &str, item: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state FROM run_items WHERE run_id = ?1 AND item = ?2",
+                params![run_id, item],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Moves a row from one of `from` to `to`, in one statement, so two callers cannot both win. Returns
+    /// whether this call made the move. A row that is not in a `from` state is left as it is.
+    pub fn move_run_item(
+        &self,
+        run_id: &str,
+        item: i64,
+        from: &[&str],
+        to: &str,
+        last_step: Option<&str>,
+    ) -> Result<bool> {
+        let marks = vec!["?"; from.len()].join(",");
+        let sql = format!(
+            "UPDATE run_items SET state = ?1, last_step = COALESCE(?2, last_step)
+             WHERE run_id = ?3 AND item = ?4 AND state IN ({marks})"
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&to, &last_step, &run_id, &item];
+        for f in from {
+            args.push(f);
+        }
+        Ok(self.conn.execute(&sql, args.as_slice())? == 1)
+    }
+
+    /// A run's task, version, inputs source and status.
+    pub fn run_info(&self, run_id: &str) -> Result<Option<(String, i64, String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT task_id, task_version, inputs_source, status FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+    }
+
     pub fn add_chat(&self, at: i64, role: &str, content: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat (at, role, content) VALUES (?1, ?2, ?3)",
