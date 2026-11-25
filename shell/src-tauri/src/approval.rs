@@ -30,7 +30,25 @@ pub struct RunContext {
     /// `<task id>@<version>`
     pub task_ref: String,
     pub run: String,
+    /// The row of a list run. The shell's word: it overrides any `item` the executor sends.
+    pub item: Option<i64>,
 }
+
+/// A list run's row bookkeeping, called by `drive_with` at the points where the row's state must change.
+pub trait ItemObserver {
+    /// An approval card is about to be shown.
+    fn approval_asked(&mut self, _store: &mut Store) {}
+    /// The executor's `approved` is about to be recorded, and it acts right after. Return false to refuse:
+    /// the executor is told the record failed and does not act.
+    fn commit_begins(&mut self, _store: &mut Store) -> bool {
+        true
+    }
+    /// The `approved` record could not be written, so the executor will not act.
+    fn commit_aborted(&mut self, _store: &mut Store) {}
+}
+
+pub struct NoObserver;
+impl ItemObserver for NoObserver {}
 
 /// An officer name the shell will put in the trail: 1 to 80 characters, no control characters.
 pub fn valid_officer(s: &str) -> bool {
@@ -94,7 +112,7 @@ pub fn drive<R: BufRead, W: Write>(
     now: &dyn Fn() -> i64,
     decide: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<Value, String> {
-    drive_with(reader, writer, store, ctx, start_id, now, decide, &mut |_| {}, &mut Observed::default())
+    drive_with(reader, writer, store, ctx, start_id, now, decide, &mut |_| {}, &mut Observed::default(), &mut NoObserver)
 }
 
 /// `drive`, also passing each `run.progress` notification to `on_progress` and noting what it saw.
@@ -110,6 +128,7 @@ pub fn drive_with<R: BufRead, W: Write>(
     decide: &mut dyn FnMut(&Value) -> bool,
     on_progress: &mut dyn FnMut(&Value),
     seen: &mut Observed,
+    obs: &mut dyn ItemObserver,
 ) -> Result<Value, String> {
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
@@ -153,13 +172,18 @@ pub fn drive_with<R: BufRead, W: Write>(
                     reply_err(writer, &id, -32602, "a field is too long or not text")?;
                     continue;
                 };
+                let begins_commit = event == "approved";
+                if begins_commit && !obs.commit_begins(store) {
+                    reply_err(writer, &id, -32000, "the row could not be marked as committing")?;
+                    continue;
+                }
                 let entry = AuditEntry {
                     at: now(),
                     officer: &ctx.officer,
                     event,
                     task: Some(&ctx.task_ref),
                     run: Some(&ctx.run),
-                    item: params["item"].as_i64(),
+                    item: ctx.item.or_else(|| params["item"].as_i64()),
                     step: step.as_deref(),
                     shown: shown.as_deref(),
                 };
@@ -170,7 +194,12 @@ pub fn drive_with<R: BufRead, W: Write>(
                         reply(writer, &id, json!({ "seq": seq }))?
                     }
                     // The error names a kind, never a value. The executor stops the run on it.
-                    Err(_) => reply_err(writer, &id, -32000, "the audit trail could not be written")?,
+                    Err(_) => {
+                        if begins_commit {
+                            obs.commit_aborted(store);
+                        }
+                        reply_err(writer, &id, -32000, "the audit trail could not be written")?
+                    }
                 }
             }
             "approval.request" => {
@@ -181,6 +210,7 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
                 card["officer"] = json!(ctx.officer);
                 card["run"] = json!(ctx.run);
+                obs.approval_asked(store);
                 let approved = decide(&card);
                 reply(writer, &id, json!({ "approved": approved }))?;
             }
@@ -274,6 +304,22 @@ pub fn run_replay_with(
     decide: &mut dyn FnMut(&Value) -> bool,
     hooks: &mut Hooks,
 ) -> Result<Value, String> {
+    run_replay_observed(bin, store, ctx, task, inputs, pid, decide, hooks, &mut NoObserver)
+}
+
+/// `run_replay_with`, also telling a list run's `ItemObserver` where the row stands.
+#[allow(clippy::too_many_arguments)]
+pub fn run_replay_observed(
+    bin: &Path,
+    store: &mut Store,
+    ctx: &RunContext,
+    task: &Value,
+    inputs: &Value,
+    pid: Option<i64>,
+    decide: &mut dyn FnMut(&Value) -> bool,
+    hooks: &mut Hooks,
+    obs: &mut dyn ItemObserver,
+) -> Result<Value, String> {
     let mut child = Command::new(bin)
         .arg("serve")
         .stdin(Stdio::piped())
@@ -316,7 +362,7 @@ pub fn run_replay_with(
         (hooks.on_start)(handle.clone());
         // A card is never put up once the officer has stopped the run.
         let mut guarded = |card: &Value| if handle.stop_asked() { false } else { decide(card) };
-        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen)
+        drive_with(std::io::BufReader::new(stdout), &mut writer, store, ctx, 1, &now, &mut guarded, &mut *hooks.on_progress, &mut seen, obs)
     })();
     // Closing our end tells the executor to exit; an error ends it now.
     let finished = child.lock().ok().and_then(|mut g| g.take());
@@ -354,7 +400,7 @@ mod tests {
     }
 
     fn ctx() -> RunContext {
-        RunContext { officer: "officer-1".into(), task_ref: "tsk_x@1".into(), run: "run_1".into() }
+        RunContext { officer: "officer-1".into(), task_ref: "tsk_x@1".into(), run: "run_1".into(), item: None }
     }
 
     fn line(v: Value) -> String {

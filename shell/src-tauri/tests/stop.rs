@@ -25,7 +25,7 @@ fn task() -> Value {
 }
 
 fn ctx() -> RunContext {
-    RunContext { officer: "Test Officer".into(), task_ref: "tsk_x@1".into(), run: "run_1".into() }
+    RunContext { officer: "Test Officer".into(), task_ref: "tsk_x@1".into(), run: "run_1".into(), item: None }
 }
 
 fn script(dir: &std::path::Path, body: &str) -> PathBuf {
