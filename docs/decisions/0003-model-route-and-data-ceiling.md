@@ -29,7 +29,7 @@ Chat (#30) and recovery (#34) need a model. Officers work with student, staff an
 
 Also sent (#34), none of it page text: the classification, the app's bundle id, the attempt number and maximum, why the step diverged as a code from a closed set (`not_found`, `dialog`, `no_window`, `find_failed`, `check_failed`, `check_failed:<kind>`, `refused`), the step's consequence flag and index, and the input's name (an identifier only). Dom ids go only on control chrome.
 
-Before #19 turns on a real route, one residual from #34 must be closed: recovery may press a dismissal-labelled button (such as "Close") inside a real dialog when that button is the commit and the dialog's text doesn't use its word ("End this session?" over "Close").
+Recovery never presses anything (#34): the only act a model's answer can cause is typing the step's own input into the step's own field. So no answer, from any route, can press a commit.
 
 A recovery request is built by one function, so this table is one place to test. The test asserts that a request built from a tree with a seeded value and a password field contains neither unless the ceiling allows the value.
 

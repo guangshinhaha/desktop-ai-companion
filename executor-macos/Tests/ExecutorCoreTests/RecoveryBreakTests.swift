@@ -70,16 +70,18 @@ final class RecoveryBreakTests: XCTestCase {
     func testB4_PauseDuringAskIsNotHonouredBeforeActing() throws {
         let t = try makeTask()
         let h = FakeHost()
-        h.tree = formBehindNotice()
-        h.onPress = { n, h in if n.domId == "notice-close" { h.tree = provisioningForm() } }
-        h.onSet = { _, h in h.fields["full-name"] = "Aiden Tan"; h.fields["email"] = "a@x.example.test" }
+        // The page wipes Full name the first time; recovery's answer is to retype it (the only act left).
+        h.tree = provisioningForm()
+        var typed = 0
+        h.onSet = { n, h in if n.domId == "full-name" { typed += 1; if typed == 1 { h.fields["full-name"] = "" } } }
         var log: [String] = []
         let control = RunControl(poll: nil, block: { log.append("held(actions so far: \(h.actions))"); return "{\"jsonrpc\":\"2.0\",\"method\":\"replay.stop\"}" })
-        let m = Picking([("Close", press)])
+        let m = Picking([("Full name", ["answer": "act", "action": "set_value", "value": ["input": "full_name"]])])
         m.onAsk = { control.pause() }
         let (r, _) = try run(h, t, m, control: control)
         print("B4 outcome:", r.outcome, "actions:", h.actions, "log:", log)
-        XCTAssertFalse(h.actions.contains("press:Close"), "recovery acted while the run was paused (and the officer then stopped)")
+        XCTAssertEqual(m.requests.count, 1)
+        XCTAssertEqual(typed, 1, "recovery acted while the run was paused (and the officer then stopped)")
     }
 
     /// B5: a dialog asking to cancel a booking; its confirm button is "Cancel".
@@ -98,7 +100,7 @@ final class RecoveryBreakTests: XCTestCase {
         XCTAssertFalse(h.actions.contains("press:Cancel"))
     }
 
-    /// B5 variant: "Close" is on the allow-list, but the dialog asks "Close this case?", so it is the commit.
+    /// B5 variant: the dialog asks "Close this case?", so its "Close" is the commit. Refused: recovery never presses.
     func testB5b_CloseUnderCloseThisCaseIsRefused() throws {
         let t = try makeTask()
         let h = FakeHost()
@@ -111,6 +113,6 @@ final class RecoveryBreakTests: XCTestCase {
         h.onPress = { _, h in h.tree = provisioningForm() }
         let (_, a) = try run(h, t, Picking([("Close", press)]))
         XCTAssertFalse(h.actions.contains("press:Close"))
-        XCTAssertTrue(a.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("asks about") })
+        XCTAssertTrue(a.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("never presses") })
     }
 }

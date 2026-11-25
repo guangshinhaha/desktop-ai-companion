@@ -90,14 +90,13 @@ final class R4ProbeTests: XCTestCase {
         let m = Picking([("Close", press), ("Close", press), ("Close", press)])
         let (r, a) = try run(h, t, m)
         print("P4:", r.outcome, h.actions, a.events.compactMap { $0.shown }.filter { $0.contains("refused") }.first ?? "")
-        // Decision on #34 (consult-shin): a dismissal is pressed only inside a real dialog or sheet. This notice has
-        // no dialog role, so it is refused and the officer is asked; the page's "Closing date" plays no part.
-        XCTAssertFalse(h.actions.contains("press:Close"), "a Close outside a dialog is refused")
-        XCTAssertTrue(a.events.contains { ($0.shown ?? "").contains("outside a dialog") })
+        // Decision on #34 (consult-shin, round 6): recovery never presses anything. Refused, officer asked.
+        XCTAssertFalse(h.actions.contains("press:Close"), "recovery never presses")
+        XCTAssertTrue(a.events.contains { ($0.shown ?? "").contains("never presses") })
     }
 
-    /// The same notice with a dialog role: page text outside the dialog ("Closing date") no longer blocks its Close.
-    func testP4b_DialogNoticeOnPageWithClosingDateIsDismissed() throws {
+    /// The same notice with a dialog role: still refused. Recovery never presses, not even a real dialog's Close.
+    func testP4b_DialogNoticeIsNotDismissedEither() throws {
         let t = try makeTask()
         let notice = UINode(role: "AXGroup", label: "Notice", children: [
             UINode(role: "AXStaticText", label: "Scheduled maintenance tonight"),
@@ -108,7 +107,9 @@ final class R4ProbeTests: XCTestCase {
             [UINode(role: "AXStaticText", label: "Closing date for applications: 1 Dec"), notice])])
         h.onPress = { n, h in if n.domId == "notice-close" { h.tree = provisioningForm() } }
         h.onSet = { _, h in h.fields["full-name"] = "Aiden Tan"; h.fields["email"] = "a@x.example.test" }
-        let (_, _) = try run(h, t, Picking([("Close", press)]))
-        XCTAssertTrue(h.actions.contains("press:Close"), "page text outside the dialog must not block its Close")
+        let (r, a) = try run(h, t, Picking([("Close", press)]))
+        guard case .diverged = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertFalse(h.actions.contains("press:Close"), "recovery never presses")
+        XCTAssertTrue(a.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("never presses") })
     }
 }

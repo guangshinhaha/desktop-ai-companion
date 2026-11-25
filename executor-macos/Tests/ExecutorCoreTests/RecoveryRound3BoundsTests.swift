@@ -31,11 +31,12 @@ final class RecoveryRound3BoundsTests: XCTestCase {
     }
 
     /// R1: a pause sent by the officer arrives after recovery's post-answer hold. `stopAsked` reads it
-    /// (checkpoint applies it, state becomes paused), returns false, and the press goes ahead while paused.
+    /// (checkpoint applies it, state becomes paused), returns false, and the act goes ahead while paused.
+    /// Recovery no longer presses, so the act here is its one remaining kind: retyping a field the page wiped.
     func testR1_PauseArrivingAfterTheAnswerHoldIsSwallowedAndTheActHappensWhilePaused() throws {
         let t = try makeTask()
         let h = FakeHost()
-        h.tree = formBehindNotice()
+        h.tree = provisioningForm()
         var armed = false, pollsAfterAsk = 0
         let control = RunControl(poll: {
             guard armed else { return nil }
@@ -43,17 +44,22 @@ final class RecoveryRound3BoundsTests: XCTestCase {
             // Poll 1 is hold()'s checkpoint right after the answer; poll 2 is the stop check after it.
             return pollsAfterAsk == 2 ? "{\"jsonrpc\":\"2.0\",\"method\":\"replay.pause\"}" : nil
         }, block: { "{\"jsonrpc\":\"2.0\",\"method\":\"replay.stop\"}" })
-        var stateAtPress: [RunControl.State] = []
-        h.onPress = { n, h in stateAtPress.append(control.state); if n.domId == "notice-close" { h.tree = provisioningForm() } }
-        let m = Picking([("Close", press)])
+        var stateAtPress: [RunControl.State] = [], typed = 0
+        h.onSet = { n, h in
+            guard n.domId == "full-name" else { return }
+            typed += 1
+            if typed == 1 { h.fields["full-name"] = "" } else { stateAtPress.append(control.state) }
+        }
+        let m = Picking([("Full name", ["answer": "act", "action": "set_value", "value": ["input": "full_name"]])])
         m.onAsk = { armed = true }
         let (r, _) = try run(h, t, m, control: control)
         print("R1 outcome:", r.outcome, "actions:", h.actions, "state at press:", stateAtPress)
-        XCTAssertFalse(stateAtPress.contains(.paused), "recovery pressed while the run was paused")
+        XCTAssertEqual(m.requests.count, 1, "recovery was asked")
+        XCTAssertFalse(stateAtPress.contains(.paused), "recovery acted while the run was paused")
     }
 
-    /// R2: the dialog's text uses an inflection of the button's word ("Closing" vs "Close"). askedAbout matches
-    /// whole words only, so "Close" here is the commit and is pressed.
+    /// R2: the dialog's text uses an inflection of the button's word ("Closing" vs "Close"), so "Close" here is
+    /// the commit. Refused: recovery never presses.
     func testR2_InflectedQuestionWordLetsTheCommitDismissalThrough() throws {
         let t = try makeTask()
         let h = FakeHost()
@@ -84,7 +90,7 @@ final class RecoveryRound3BoundsTests: XCTestCase {
     }
 
     /// R3: a web modal without role=dialog (plain AXGroup, no subrole) whose buttons sit in their own button bar.
-    /// askedAbout falls back to the button's parent (the bar), which holds only buttons, so the question is never seen.
+    /// The question sits outside the bar. Refused: recovery never presses.
     /// s1's field is missing so s1 diverges at find (no dialog is detected, so this is the only way in).
     func testR3_NonAriaModalWithButtonBarHidesTheQuestion() throws {
         let t = try makeTask()

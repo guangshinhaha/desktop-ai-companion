@@ -112,7 +112,7 @@ public enum RecoveryRequest {
         if s.long.contains(where: { c.contains($0) }) { return true }
         return !s.short.isEmpty && (s.short.contains(c) || words(text).contains { s.short.contains($0) })
     }
-    /// Folded for comparing labels with each other (dismissal words, gated targets).
+    /// Folded for comparing labels with each other (gated targets).
     static func fold(_ s: String) -> String {
         s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
             .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
@@ -249,16 +249,17 @@ public enum RecoveryRequest {
     }
 }
 
-/// The model's answer (TD 5.4): act on a named element, wait again, or ask the officer.
+/// The model's answer (TD 5.4): type the step's own input into its own field, wait again, or ask the officer.
+/// Recovery never presses anything: no structure or text can tell a harmless press from a commit, so a press
+/// answer is refused and the officer is asked at once.
 public enum RecoveryAnswer: Equatable {
-    public enum Kind: String { case press, setValue = "set_value" }
-    case act(kind: Kind, ref: String)
+    case setValue(ref: String)
     case retry
     case askOfficer(String)
 
     public struct Rejection: Error, Equatable {
         public let reason: String
-        /// Not an answer at all. Asking again is pointless: the officer is asked at once.
+        /// Not a usable answer (malformed, or a press). Asking again is pointless: the officer is asked at once.
         public let malformed: Bool
     }
 
@@ -281,34 +282,22 @@ public enum RecoveryAnswer: Equatable {
             guard let r = o["reason"] as? String else { return bad("an ask_officer answer has no reason") }
             return .success(.askOfficer(String(ApprovalGate.safe(r).prefix(200))))
         case "act":
-            guard let name = o["action"] as? String, let kind = Kind(rawValue: name) else { return bad("an act answer names no action this executor allows") }
+            if o["action"] as? String == "press" { return bad("recovery never presses anything; only the officer can") }
+            guard o["action"] as? String == "set_value" else { return bad("an act answer names no action this executor allows") }
             guard let ref = o["ref"] as? String, !ref.isEmpty else { return bad("an act answer names no element") }
-            switch kind {
-            case .press:
-                if o["value"] != nil { return refuse("it types a value other than the step's own input") }
-            case .setValue:
-                guard let v = o["value"] as? [String: Any], v.count == 1, let n = v["input"] as? String,
-                      step.action == .setValue, case .input(let own)? = step.value, n == own
-                else { return refuse("it types a value other than the step's own input") }
-            }
-            return .success(.act(kind: kind, ref: ref))
+            guard let v = o["value"] as? [String: Any], v.count == 1, let n = v["input"] as? String,
+                  step.action == .setValue, case .input(let own)? = step.value, n == own
+            else { return refuse("it types a value other than the step's own input") }
+            return .success(.setValue(ref: ref))
         default:
             return bad("the answer is not act, retry or ask_officer")
         }
     }
 
-    /// Labels of the only buttons recovery may press: ways to dismiss something, compared whole after folding.
-    /// An allow-list, not a list of dangerous words: anything else ("Discard draft", "Go", "OK") is refused.
-    /// Verbs that are often the commit itself ("Cancel" in "Cancel this application?", "Skip", "Hide") are left
-    /// out. A dismissal is pressed only inside a real dialog or sheet (`dialogAround`), and not when the dialog's
-    /// text uses its word in any form (`askedAbout`).
-    static let dismissals: Set<String> = ["close", "dismiss", "not now", "maybe later", "got it", "no thanks",
-                                          "no, thanks", "x", "×", "✕"]
-
     /// Could `node` be what `d` (a gated step's target) names? Fails closed: the same role and the same label or
     /// dom id; any candidate the resolver finds, ambiguous ones included; and, when `d` has neither an exact
     /// label nor a dom id (a glob, a path, anchors only), anything of its role (any role, if it names none),
-    /// since nothing proves the element is not it. No uniqueness is needed: two such buttons are both refused.
+    /// since nothing proves the element is not it.
     static func couldBe(_ node: UINode, _ d: Descriptor, in root: UINode) -> Bool {
         if let r = d.role, r != node.role { return false }
         if let l = d.label, let nl = node.label, RecoveryRequest.fold(l) == RecoveryRequest.fold(nl) { return true }
@@ -321,42 +310,11 @@ public enum RecoveryAnswer: Equatable {
         return d.label == nil && d.domId == nil
     }
 
-    /// The real dialog or sheet a node sits in (a sheet or dialog role, or a group or window with a dialog
-    /// subrole), or nil. A dismissal is pressed only inside one: a "Close" on a page or in a list row may close a case.
-    static func dialogAround(path: [Int], root: UINode) -> UINode? {
-        var chain: [UINode] = [root]
-        for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return nil }; chain.append(n.children[i]) }
-        return chain.last {
-            $0.role == "AXSheet" || $0.role == "AXDialog"
-                || (RecoveryRequest.dialogContainers.contains($0.role) && RecoveryRequest.dialogSubroles.contains($0.subrole ?? ""))
-        }
-    }
-
-    /// True when any text in the dialog (not its buttons) uses the button's word in any form: a word that starts
-    /// with its stem ("Close" -> closing, closure, Closeout, CloseCase). Only the dialog is read, so page text can't
-    /// over-block, and a match anywhere in it refuses.
-    static func askedAbout(_ label: String, in dialog: UINode) -> Bool {
-        let word = RecoveryRequest.words(label)
-        guard !word.isEmpty else { return false }
-        func texts(_ n: UINode) -> [String] {
-            (n.role == "AXButton" ? [] : [n.label].compactMap { $0 }) + n.children.flatMap(texts)
-        }
-        let stems = word.map { $0.count > 3 && $0.hasSuffix("e") ? String($0.dropLast()) : $0 }
-        return texts(dialog).contains { t in
-            let w = RecoveryRequest.words(t)
-            guard w.count >= stems.count else { return false }
-            return (0...(w.count - stems.count)).contains { i in
-                stems.indices.allSatisfy { j in stems[j].count < 3 ? w[i + j] == stems[j] : w[i + j].hasPrefix(stems[j]) }
-            }
-        }
-    }
-
-    /// Checks an act against the window as it is now. Returns the live node to act on, or why not.
-    /// Refused: an element not in the tree that was sent, one that moved or changed, a link (it may leave the
-    /// app), anything unlabelled, anything that reads like a commit, anything that could be the target of a step
-    /// that needs approval, a password field, a button whose label is not a dismissal, and typing into anything
-    /// but this step's own non-gated text field.
-    static func check(_ kind: Kind, ref: String, built: RecoveryRequest.Built, step: ReplayTask.Step, task: ReplayTask,
+    /// Checks a set_value against the window as it is now. Returns the live field to type into, or why not.
+    /// Refused: an element not in the tree that was sent, one that moved or changed, a link, a password field,
+    /// anything unlabelled, anything that reads like a commit, anything that could be the target of a step that
+    /// needs approval, and anything but this step's own non-gated text field.
+    static func check(ref: String, built: RecoveryRequest.Built, step: ReplayTask.Step, task: ReplayTask,
                       now root: UINode) -> Swift.Result<UINode, Rejection> {
         func refuse(_ why: String) -> Swift.Result<UINode, Rejection> { .failure(Rejection(reason: why, malformed: false)) }
         guard let sent = built.refs[ref] else { return refuse("it names no element in the tree that was sent") }
@@ -374,36 +332,9 @@ public enum RecoveryAnswer: Equatable {
         for s in task.steps where s.needsApproval {
             if couldBe(node, s.target, in: root) { return refuse("it targets a consequential element (it could be the target of a step that needs approval)") }
         }
-        switch kind {
-        case .press:
-            // The app's own chrome (tab strip, toolbar, menu bar) can leave the recorded page: never pressed.
-            var up: UINode = root
-            for i in sent.path.dropLast() {
-                if ["AXTabGroup", "AXToolbar", "AXMenuBar", "AXMenu"].contains(up.role) { return refuse("it presses the app's own tabs, toolbar or menus, which may leave the recorded page") }
-                guard i < up.children.count else { break }
-                up = up.children[i]
-            }
-            if ["AXTabGroup", "AXToolbar", "AXMenuBar", "AXMenu"].contains(up.role) { return refuse("it presses the app's own tabs, toolbar or menus, which may leave the recorded page") }
-            switch node.role {
-            case "AXDisclosureTriangle": break
-            case "AXButton":
-                guard dismissals.contains(RecoveryRequest.fold(label)) else {
-                    return refuse("it presses a button that is not a way to dismiss something, which may be consequential")
-                }
-                guard let dialog = dialogAround(path: sent.path, root: root) else {
-                    return refuse("it presses a dismissal outside a dialog, which may close something for good")
-                }
-                if askedAbout(label, in: dialog) {
-                    return refuse("it presses a button whose word the dialog asks about, so it may be the commit")
-                }
-            default:
-                return refuse("it presses an element of a kind recovery does not press (\(ApprovalGate.safe(node.role)))")
-            }
-        case .setValue:
-            guard !step.needsApproval, ReplayTask.textRoles.contains(node.role) else { return refuse("it types into something other than this step's own field") }
-            guard case .found(let m) = Resolver.resolve(step.target, in: root), m.node === node else {
-                return refuse("it types into something other than this step's own field")
-            }
+        guard !step.needsApproval, ReplayTask.textRoles.contains(node.role) else { return refuse("it types into something other than this step's own field") }
+        guard case .found(let m) = Resolver.resolve(step.target, in: root), m.node === node else {
+            return refuse("it types into something other than this step's own field")
         }
         return .success(node)
     }

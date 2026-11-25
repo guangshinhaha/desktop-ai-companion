@@ -24,7 +24,8 @@ function checkRequest(b: Record<string, unknown>): void {
   if (!Number.isInteger(b.attempt) || !Number.isInteger(b.max_attempts)) throw new BadRequestError("attempt and max_attempts must be integers");
 }
 
-/** The three answers (TD 5.4), checked strictly. The executor checks them again against the live window. */
+/** The three answers (TD 5.4), checked strictly. The executor checks them again against the live window.
+ *  The only act is set_value: recovery never presses anything, so a press answer fails closed here too. */
 export function validRecoverAnswer(a: unknown): boolean {
   if (!isObject(a)) return false;
   const keys = Object.keys(a).sort().join(",");
@@ -35,7 +36,6 @@ export function validRecoverAnswer(a: unknown): boolean {
       return keys === "answer,reason" && typeof a.reason === "string";
     case "act":
       if (typeof a.ref !== "string" || a.ref === "") return false;
-      if (a.action === "press") return keys === "action,answer,ref";
       if (a.action === "set_value") {
         const v = a.value;
         return keys === "action,answer,ref,value" && isObject(v) && Object.keys(v).length === 1 && typeof v.input === "string";

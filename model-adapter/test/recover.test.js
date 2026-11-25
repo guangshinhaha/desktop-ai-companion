@@ -83,7 +83,6 @@ test("only POST", async () => {
 
 test("a valid answer from the route is passed through as is", async () => {
   for (const answer of [
-    { answer: "act", action: "press", ref: "n2" },
     { answer: "act", action: "set_value", ref: "n3", value: { input: "name" } },
     { answer: "retry" },
     { answer: "ask_officer", reason: "The page looks different." },
@@ -99,7 +98,7 @@ test("a valid answer from the route is passed through as is", async () => {
 test("a malformed answer from the route fails closed: 502, nothing passed on", async () => {
   for (const answer of [
     null, "press n2", [], { answer: "click", ref: "n2" }, { answer: "act", action: "type", ref: "n2" },
-    { answer: "act", action: "press" }, { answer: "act", action: "set_value", ref: "n3", value: "Aiden Tan" },
+    { answer: "act", action: "press" }, { answer: "act", action: "press", ref: "n2" }, { answer: "act", action: "set_value", ref: "n3", value: "Aiden Tan" },
     { answer: "ask_officer" }, { answer: "retry", extra: 1 },
   ]) {
     const s = await start({ route: routeAnswering(answer) });

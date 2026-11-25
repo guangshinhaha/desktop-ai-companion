@@ -300,28 +300,22 @@ public final class Replayer {
                 guard written("\(head): wait for the step again. Why: \(last).") else {
                     return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
                 }
-            case .success(.act(let kind, let ref)):
+            case .success(.setValue(let ref)):
                 guard let now = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }
                 let node: UINode
-                switch RecoveryAnswer.check(kind, ref: ref, built: built, step: step, task: task, now: now) {
+                switch RecoveryAnswer.check(ref: ref, built: built, step: step, task: task, now: now) {
                 case .failure(let rej):
                     if let stop = refused(rej.reason) { return .gaveUp(stop) }
                     last = "recovery's answer was refused: \(rej.reason)"
                     continue
                 case .success(let n): node = n
                 }
-                let what = kind == .press ? "press" : "type the step's own input into"
-                guard written("\(head): \(what) \(node.role) \"\(node.label ?? "")\". Why: \(last).") else {
+                guard written("\(head): type the step's own input into \(node.role) \"\(node.label ?? "")\". Why: \(last).") else {
                     return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
                 }
                 if settled(hold) { return .stopped }
-                let result: ActionResult
-                switch kind {
-                case .press: result = host.press(node)
-                case .setValue:
-                    guard let ref = step.value, let v = inputs.resolve(ref) else { return .gaveUp("\(first). No value for this step. \(officer)") }
-                    result = host.setValue(node, to: v.reveal())
-                }
+                guard let input = step.value, let v = inputs.resolve(input) else { return .gaveUp("\(first). No value for this step. \(officer)") }
+                let result = host.setValue(node, to: v.reveal())
                 if case .failed(let why) = result { return .gaveUp("\(first). Recovery's action failed (\(why)). \(officer)") }
             }
             switch resume() {

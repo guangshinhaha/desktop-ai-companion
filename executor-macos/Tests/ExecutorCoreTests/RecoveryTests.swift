@@ -179,6 +179,18 @@ final class RecoveryReplayTests: XCTestCase {
         }
     }
 
+    /// A host whose page wipes Full name the first time it is typed into (a re-render). Typing the step's own
+    /// input again is the one act recovery may take.
+    func wipedHost() -> FakeHost {
+        let h = FakeHost()
+        h.tree = provisioningForm()
+        var typed = 0
+        h.onSet = { n, h in if n.domId == "full-name" { typed += 1; if typed == 1 { h.fields["full-name"] = "" } } }
+        h.onPress = { n, h in if n.domId == "create" { h.tree = createdPage() } }
+        return h
+    }
+    nonisolated(unsafe) static let retype: [String: Any] = ["answer": "act", "action": "set_value", "value": ["input": "full_name"]]
+
     func runPicking(_ h: FakeHost, _ plan: [(String?, [String: Any])], task: ReplayTask? = nil,
                     approvals: [String?] = ["y"]) throws -> (ReplayReport, RecordingAudit, PickingModel) {
         let t = try task ?? makeTask()
@@ -192,17 +204,32 @@ final class RecoveryReplayTests: XCTestCase {
 
     // MARK: the request goes out on divergence
 
-    func testADialogBeforeAStepIsDismissedAndTheRunFinishes() throws {
-        let (r, audit, model) = try runPicking(noticeHost(), [("Close", ["answer": "act", "action": "press"])])
+    func testAFieldThePageWipedIsRetypedAndTheRunFinishes() throws {
+        let h = wipedHost()
+        let (r, audit, model) = try runPicking(h, [("Full name", Self.retype)])
         XCTAssertEqual(r.outcome, .finished)
         XCTAssertEqual(model.requests.count, 1)
         let req = model.requests[0]
         XCTAssertEqual((req["step"] as? [String: Any])?["index"] as? Int, 0)
         XCTAssertEqual(audit.kinds.filter { $0 == .recovered }.count, 1)
-        // The record of the recovery is written before the press, so the trail knows first.
+        // The record of the recovery is written before the typing, so the trail knows first.
         let i = audit.kinds.firstIndex(of: .recovered)!
-        XCTAssertEqual(audit.actionsSeen[i], 0)
-        XCTAssertTrue(audit.events[i].shown?.contains("Close") ?? false)
+        XCTAssertEqual(audit.actionsSeen[i], 1)
+        XCTAssertTrue(audit.events[i].shown?.contains("Full name") ?? false)
+        XCTAssertEqual(h.actions.filter { $0 == "set:full-name" }.count, 2)
+    }
+
+    /// Recovery never presses anything, not even a dialog's Close: the press is refused, recorded as
+    /// step_diverged, and the officer is asked at once (no second request).
+    func testADialogBeforeAStepIsNotDismissedThePressGoesToTheOfficer() throws {
+        let h = noticeHost()
+        let (r, audit, model) = try runPicking(h, [("Close", ["answer": "act", "action": "press"]), ("Close", ["answer": "act", "action": "press"])])
+        guard case .diverged(_, let why) = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertTrue(h.actions.isEmpty)
+        XCTAssertEqual(model.requests.count, 1)
+        XCTAssertTrue(why.contains("never presses") && why.contains("officer"), why)
+        XCTAssertTrue(audit.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("never presses") })
+        XCTAssertFalse(audit.kinds.contains(.recovered))
     }
 
     func testNoRecoverySourceKeepsTheOldBehaviour() throws {
@@ -223,7 +250,7 @@ final class RecoveryReplayTests: XCTestCase {
         XCTAssertFalse(h.actions.contains("press:OK, delete drafts"), "a consequential element was pressed")
         XCTAssertTrue(h.actions.isEmpty)
         XCTAssertTrue(why.contains("officer"), why)
-        XCTAssertTrue(audit.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("consequential") })
+        XCTAssertTrue(audit.events.contains { $0.kind == .stepDiverged && ($0.shown ?? "").contains("never presses") })
         XCTAssertFalse(audit.kinds.contains(.recovered))
     }
 
@@ -250,7 +277,7 @@ final class RecoveryReplayTests: XCTestCase {
         let (r, audit, _) = try runPicking(h, [("Continue", ["answer": "act", "action": "press"])], task: t, approvals: [])
         guard case .diverged = r.outcome else { return XCTFail("\(r.outcome)") }
         XCTAssertTrue(h.actions.isEmpty, "recovery pressed a gated step's target")
-        XCTAssertTrue(audit.events.contains { ($0.shown ?? "").contains("needs approval") })
+        XCTAssertTrue(audit.events.contains { ($0.shown ?? "").contains("never presses") })
     }
 
     func testAnUnlabelledButtonOrALinkIsRefused() throws {
@@ -319,11 +346,13 @@ final class RecoveryReplayTests: XCTestCase {
     }
 
     func testRefusedAnswersCountAsAttempts() throws {
-        let h = noticeHost()
-        let (r, _, model) = try runPicking(h, Array(repeating: ("OK, delete drafts", ["answer": "act", "action": "press"]), count: 5))
+        // Typing another input into the step's field is refused, and each refusal spends an attempt.
+        let h = wipedHost()
+        let wrong: [String: Any] = ["answer": "act", "action": "set_value", "value": ["input": "email"]]
+        let (r, _, model) = try runPicking(h, Array(repeating: ("Full name", wrong), count: 5))
         guard case .diverged = r.outcome else { return XCTFail() }
         XCTAssertEqual(model.requests.count, 3)
-        XCTAssertTrue(h.actions.isEmpty)
+        XCTAssertEqual(h.actions, ["set:full-name"], "only the step's own typing")
     }
 
     func testAskOfficerStopsAtOnceWithTheReason() throws {
@@ -343,9 +372,9 @@ final class RecoveryReplayTests: XCTestCase {
     // MARK: recovery never touches the gate
 
     func testRecoveryNeverApprovesAndTheGatedStepStillAsks() throws {
-        // Recovery clears the notice before s1; s3 is still asked about, and a no means nothing is created.
-        let h = noticeHost()
-        let (r, audit, _) = try runPicking(h, [("Close", ["answer": "act", "action": "press"])], approvals: ["n"])
+        // Recovery retypes s1's wiped field; s3 is still asked about, and a no means nothing is created.
+        let h = wipedHost()
+        let (r, audit, _) = try runPicking(h, [("Full name", Self.retype)], approvals: ["n"])
         XCTAssertEqual(r.outcome, .notApproved(step: "s3"))
         XCTAssertFalse(h.actions.contains("press:Create account"))
         XCTAssertFalse(audit.kinds.contains(.approved))
@@ -392,8 +421,8 @@ final class RecoveryReplayTests: XCTestCase {
         XCTAssertTrue(audit.kinds.contains(.runStopped))
     }
 
-    func testAStopAfterAValidAnswerStillPressesNothing() throws {
-        let h = noticeHost()
+    func testAStopAfterAValidAnswerStillActsOnNothing() throws {
+        let h = wipedHost()
         let control = RunControl()
         let audit = RecordingAudit()
         final class StopThenClose: RecoverySource {
@@ -401,32 +430,33 @@ final class RecoveryReplayTests: XCTestCase {
             init(_ c: RunControl) { control = c }
             func ask(_ request: [String: Any]) -> [String: Any]? {
                 control.stop()
-                return ["answer": "act", "action": "press", "ref": ref(in: request, label: "Close")!]
+                var a = RecoveryReplayTests.retype; a["ref"] = ref(in: request, label: "Full name")!
+                return a
             }
         }
         let t = try makeTask()
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
                          ceiling: 2, audit: audit, control: control, recovery: StopThenClose(control),
                          recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
-        XCTAssertEqual(r.outcome, .stopped(step: "s1", actionDone: false))
-        XCTAssertTrue(h.actions.isEmpty)
+        guard case .stopped(step: "s1", _) = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertEqual(h.actions, ["set:full-name"], "only the step's own typing; recovery's answer was not acted on")
     }
 
     func testAFailedRecoveryRecordStopsBeforeTheAction() throws {
-        let h = noticeHost()
+        let h = wipedHost()
         let t = try makeTask()
         let audit = RecordingAudit()
         audit.failOn = [.recovered]
-        let model = PickingModel([("Close", ["answer": "act", "action": "press"])])
+        let model = PickingModel([("Full name", Self.retype)])
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
                          ceiling: 2, audit: audit, recovery: model, recoveryPolicy: RecoveryPolicy(classification: "official-closed"),
                          log: { _ in }).run()
         guard case .diverged(_, let why) = r.outcome else { return XCTFail() }
-        XCTAssertTrue(h.actions.isEmpty)
+        XCTAssertEqual(h.actions, ["set:full-name"], "only the step's own typing")
         XCTAssertTrue(why.contains("audit"), why)
     }
 
-    func testANonGatedStepWhoseCheckFailsBehindADialogIsRecoveredWithoutRedoingTheAction() throws {
+    func testANonGatedStepWhoseCheckFailsBehindADialogGoesToTheOfficerWithoutRedoingTheAction() throws {
         // s1 types, then a notice covers the page and the check cannot pass until it goes.
         let h = FakeHost()
         h.tree = provisioningForm()
@@ -439,9 +469,10 @@ final class RecoveryReplayTests: XCTestCase {
             if n.domId == "create" { h.tree = createdPage() }
         }
         let (r, audit, _) = try runPicking(h, [("Close", ["answer": "act", "action": "press"])])
-        XCTAssertEqual(r.outcome, .finished)
-        XCTAssertEqual(typed, 1, "recovery re-checks; it does not type again")
-        XCTAssertEqual(audit.kinds.filter { $0 == .recovered }.count, 1)
+        guard case .diverged = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertEqual(typed, 1, "recovery does not type again")
+        XCTAssertFalse(h.actions.contains { $0.hasPrefix("press:") }, "recovery never presses")
+        XCTAssertFalse(audit.kinds.contains(.recovered))
     }
 
     func testOverRPCTheRequestGoesToTheShellAndAnErrorIsANo() throws {

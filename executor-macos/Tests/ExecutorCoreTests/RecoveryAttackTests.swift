@@ -4,17 +4,19 @@ import XCTest
 final class RecoveryAttackTests: XCTestCase {
     final class Picking: RecoverySource {
         var plan: [(String?, [String: Any])]; var requests: [[String: Any]] = []
+        var onAsk: (() -> Void)?
         init(_ p: [(String?, [String: Any])]) { plan = p }
         func ask(_ request: [String: Any]) -> [String: Any]? {
             requests.append(request)
+            onAsk?()
             guard !plan.isEmpty else { return nil }
             let p = plan.removeFirst(); var a = p.1
             if let l = p.0 { a["ref"] = ref(in: request, label: l) ?? "n-none" }
             return a
         }
     }
-    func go(_ h: FakeHost, _ t: ReplayTask, _ plan: [(String?, [String: Any])], approvals: [String?] = []) throws -> (ReplayReport, RecordingAudit, Picking, ScriptedApproval) {
-        let m = Picking(plan); let a = RecordingAudit(); a.host = h; let src = ScriptedApproval(approvals)
+    func go(_ h: FakeHost, _ t: ReplayTask, _ plan: [(String?, [String: Any])], approvals: [String?] = [], onAsk: (() -> Void)? = nil) throws -> (ReplayReport, RecordingAudit, Picking, ScriptedApproval) {
+        let m = Picking(plan); m.onAsk = onAsk; let a = RecordingAudit(); a.host = h; let src = ScriptedApproval(approvals)
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: src, out: { _ in }), ceiling: 2,
                          audit: a, recovery: m, recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
         return (r, a, m, src)
@@ -91,7 +93,7 @@ final class RecoveryAttackTests: XCTestCase {
         let (r, a, _, _) = try go(h, t, [("Close", press)])
         guard case .diverged = r.outcome else { return XCTFail("\(r.outcome)") }
         XCTAssertTrue(h.actions.isEmpty, "recovery pressed what could be a gated step's target")
-        XCTAssertTrue(a.events.contains { ($0.shown ?? "").contains("needs approval") })
+        XCTAssertTrue(a.events.contains { ($0.shown ?? "").contains("never presses") })
     }
 
     /// Two stages of one step share one budget, and the officer message says so truly.
@@ -99,11 +101,13 @@ final class RecoveryAttackTests: XCTestCase {
         let t = try makeTask()
         let h = FakeHost()
         h.tree = formBehindNotice()
-        h.onPress = { n, h in if n.domId == "notice-close" { h.tree = provisioningForm() } }
+        // The notice goes by itself while the model is asked (no press); then the typing is wiped, so the check
+        // stage diverges too.
         h.onSet = { n, h in if n.domId == "full-name" { h.fields["full-name"] = "" } }
         let retry: [String: Any] = ["answer": "retry"]
-        let (r, _, m, _) = try go(h, t, [(nil, retry), ("Close", press), (nil, retry), (nil, retry)])
+        let (r, _, m, _) = try go(h, t, [(nil, retry), (nil, retry), (nil, retry), (nil, retry)], onAsk: { h.tree = provisioningForm() })
         XCTAssertEqual(m.requests.map { $0["attempt"] as? Int }, [1, 2, 3])
+        XCTAssertTrue(h.actions.contains("set:full-name"), "the second stage (the check) was reached")
         guard case .diverged(_, let why) = r.outcome else { return XCTFail("\(r.outcome)") }
         XCTAssertTrue(why.contains("tried 3 times"), why)
     }
