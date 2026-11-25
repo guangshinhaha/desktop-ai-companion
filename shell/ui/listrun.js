@@ -49,8 +49,11 @@
       return e;
     }
 
+    // Background reads (the poll, a list reload) must not wipe why the officer's last act was refused.
+    const READS = ["listrun_status", "listrun_unfinished"];
+
     async function call(cmd, args) {
-      s.error = "";
+      if (!READS.includes(cmd)) s.error = "";
       try { return await invoke(cmd, args); }
       catch (e) { s.error = String(e); return undefined; }
       finally { draw(); }
@@ -82,6 +85,8 @@
     async function start() {
       const run = await call("listrun_start", { path: s.path, taskId: s.taskId, version: Number(s.version), header: s.header, mapping: s.mapping, officer: s.officer, pid: null });
       if (run) await open(run);
+      // A refusal names an unfinished run: list what is there now, so it can be opened or ended.
+      else await loadUnfinished();
     }
 
     async function refresh() {
@@ -113,7 +118,7 @@
         const ul = el("ul", { attrs: { "data-role": "unfinished" } });
         for (const u of s.unfinished) {
           const c = Object.keys(u.counts || {}).map((k) => u.counts[k] + " " + (LABELS[k] || k).toLowerCase()).join(", ");
-          ul.appendChild(el("li", { attrs: { "data-run": u.run } }, u.task + " v" + u.version + ": " + c + " ",
+          ul.appendChild(el("li", { attrs: { "data-run": u.run } }, u.run + ": " + u.task + " v" + u.version + ": " + c + " ",
             el("button", { type: "button", attrs: { "data-role": "open-run" }, on: { click: () => open(u.run) } }, "Open and resume")));
         }
         mount.appendChild(ul);

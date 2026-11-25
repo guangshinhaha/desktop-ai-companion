@@ -2,7 +2,7 @@
 //! The key lives in the macOS keychain. No network. Nothing here logs or prints a value:
 //! errors carry a kind, never row content.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
@@ -642,6 +642,54 @@ impl Store {
         Ok(())
     }
 
+    /// Creates a list run and its `n` rows, only if the task has no unfinished list run (#108). The check and
+    /// both inserts are one immediate transaction, so two shells on one store cannot both create one. Returns
+    /// the unfinished runs that stood in the way; empty means this run was created.
+    pub fn start_list_run(
+        &mut self,
+        id: &str,
+        task_id: &str,
+        task_version: i64,
+        inputs_source: &str,
+        n: i64,
+        now: i64,
+    ) -> Result<Vec<OpenRun>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let open = open_runs_of(&tx, task_id, id)?;
+        if open.is_empty() {
+            tx.execute(
+                "INSERT INTO runs (id, task_id, task_version, inputs_source, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+                params![id, task_id, task_version, inputs_source, now],
+            )?;
+            for item in 1..=n {
+                tx.execute(
+                    "INSERT INTO run_items (run_id, item, state, last_step) VALUES (?1, ?2, 'pending', NULL)",
+                    params![id, item],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(open)
+    }
+
+    /// The unfinished list runs of one task, newest first.
+    pub fn open_list_runs_of(&self, task_id: &str) -> Result<Vec<OpenRun>> {
+        open_runs_of(&self.conn, task_id, "")
+    }
+
+    /// Marks a list run `running`, only if no OTHER list run of its task is unfinished, in one immediate
+    /// transaction (this also guards reopening a finished run). Returns those others; empty means it was marked.
+    pub fn mark_list_run_running(&mut self, id: &str, task_id: &str) -> Result<Vec<OpenRun>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let others = open_runs_of(&tx, task_id, id)?;
+        if others.is_empty() {
+            tx.execute("UPDATE runs SET status = 'running' WHERE id = ?1", params![id])?;
+            tx.commit()?;
+        }
+        Ok(others)
+    }
+
     /// Every row of a run, in order: (item, state, last_step).
     pub fn run_items(&self, run_id: &str) -> Result<Vec<(i64, String, Option<String>)>> {
         let mut st = self
@@ -882,6 +930,27 @@ impl Store {
         tx.commit()?;
         Ok(n)
     }
+}
+
+/// An unfinished list run of a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRun {
+    pub id: String,
+    pub version: i64,
+    pub inputs_source: String,
+}
+
+/// "Unfinished" means the same as in `open_list_runs`: not finished, not ended, and started from a file.
+fn open_runs_of(conn: &Connection, task_id: &str, except: &str) -> Result<Vec<OpenRun>> {
+    let mut st = conn.prepare(
+        "SELECT id, task_version, inputs_source FROM runs
+         WHERE task_id = ?1 AND id <> ?2 AND status NOT IN ('finished', 'ended') AND inputs_source LIKE '{%'
+         ORDER BY started_at DESC, id DESC",
+    )?;
+    let rows = st.query_map(params![task_id, except], |r| {
+        Ok(OpenRun { id: r.get(0)?, version: r.get(1)?, inputs_source: r.get(2)? })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn append_in(tx: &rusqlite::Transaction, e: &AuditEntry) -> Result<i64> {
