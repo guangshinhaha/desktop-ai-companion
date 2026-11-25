@@ -318,3 +318,17 @@ fn extraction_writes_no_file() {
     let after: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);
 }
+
+#[test]
+fn http_service_posts_a_recovery_request_and_returns_only_a_json_object() {
+    let (url, h) = serve(200, "{\"answer\":\"ask_officer\",\"reason\":\"No model is connected (stub route).\"}");
+    let got = HttpService::new(&url).unwrap().recover(&json!({ "kind": "recover", "classification": "official-open" }));
+    assert_eq!(got.unwrap()["answer"], "ask_officer");
+    let seen = h.join().unwrap();
+    assert!(seen.starts_with("POST /recover\n"));
+    for (status, body) in [(403, "{\"error\":\"above_ceiling\"}"), (502, "{\"error\":\"route_error\"}"), (200, "[1]"), (200, "not json"), (500, "{}")] {
+        let (url, h) = serve(status, body);
+        assert!(HttpService::new(&url).unwrap().recover(&json!({})).is_none(), "{status} {body}");
+        h.join().unwrap();
+    }
+}

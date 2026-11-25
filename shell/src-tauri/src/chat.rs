@@ -106,6 +106,29 @@ impl HttpService {
             _ => Err(SendError::NotConfigured),
         }
     }
+
+    /// Posts a replay's recovery request to `POST /recover` (#34). Returns the answer object, or None for
+    /// anything else: unreachable, refused above the ceiling, a route error, or a reply that is not an object.
+    /// The executor checks the answer again; None makes it ask the officer.
+    pub fn recover(&self, body: &Value) -> Option<Value> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(45)))
+            .max_redirects(0)
+            .build()
+            .into();
+        let mut resp = agent
+            .post(&format!("{}/recover", self.base))
+            .header("content-type", "application/json")
+            .send(body.to_string().as_bytes())
+            .ok()?;
+        if resp.status().as_u16() != 200 {
+            return None;
+        }
+        let text = resp.body_mut().with_config().limit(64 * 1024).read_to_string().ok()?;
+        serde_json::from_str::<Value>(&text).ok().filter(Value::is_object)
+    }
 }
 
 impl Service for HttpService {

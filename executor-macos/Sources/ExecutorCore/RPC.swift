@@ -9,6 +9,10 @@ import Foundation
 /// executor sends the shell two requests and waits for each answer:
 ///   `approval.request {card}`  -> `{approved: true|false}`. Only the JSON value `true` approves.
 ///   `audit.append {event, step?, shown?, item?}` -> `{seq}`. Anything else stops the run.
+///   `recover.request {request}` -> the answer object (#34). The shell passes it to the companion service's
+///   `POST /recover`. An error, a missing or malformed answer, or a stop is never acted on: the officer is asked.
+/// `replay.start` may carry `classification` (the task's, a non-empty string) and `values_cleared` (the JSON value
+/// true only when the route is cleared for it). Without a classification nothing is sent for recovery.
 /// There is no timeout on either, and no answer (the shell closing its end) is a no. The officer's
 /// identity, the task reference and the run id are the shell's: the executor never names them.
 public enum RPC {
@@ -90,9 +94,19 @@ public enum RPC {
         let host: ReplayHost
         do { host = try hostFactory(task, pid) } catch { return fail(-32000, "\(error)") }
 
+        var policy = RecoveryPolicy()
+        if let c = params["classification"] {
+            guard let s = c as? String else { return fail(-32602, "classification must be a string") }
+            policy.classification = s
+        }
+        // Only the JSON value true, and only with a classification.
+        if let v = params["values_cleared"] as? NSNumber, CFGetTypeID(v) == CFBooleanGetTypeID(), v.boolValue {
+            policy.valuesCleared = policy.knownClassification != nil
+        }
         let gate = ApprovalGate(source: RPCApprovalSource(talk: talk), out: { _ in })
         let report = Replayer(task: task, inputs: inputs, host: host, gate: gate, ceiling: ceiling,
-                              audit: RPCAudit(talk: talk), control: control, progress: { p in
+                              audit: RPCAudit(talk: talk), control: control, recovery: RPCRecovery(talk: talk),
+                              recoveryPolicy: policy, progress: { p in
             // A notification: no id, nothing waits for it. Step names and the task's say line only.
             talk.output(encode(["jsonrpc": "2.0", "method": "run.progress", "params": [
                 "state": p.kind.rawValue, "step": p.step, "say": p.say, "index": p.index, "total": p.total]]))
@@ -148,6 +162,15 @@ public enum RPC {
             // Only the JSON value true. A string, a number or a missing field is a no.
             if let a = r["approved"] as? NSNumber, CFGetTypeID(a) == CFBooleanGetTypeID(), a.boolValue { return "y" }
             return "n"
+        }
+    }
+
+    final class RPCRecovery: RecoverySource {
+        let talk: Conversation
+        init(talk: Conversation) { self.talk = talk }
+        /// A stop while the request is out ends the wait: the answer is then never acted on.
+        func ask(_ request: [String: Any]) -> [String: Any]? {
+            talk.ask("recover.request", ["request": request], cancellable: true)
         }
     }
 

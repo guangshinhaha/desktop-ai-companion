@@ -2,11 +2,14 @@
 
 The one place a model call is made (decision 0003, TD 3.3 and 9). Built ahead of the
 companion service (#29). When `service/` lands, this folder moves to
-`service/src/model/` and `createChatHandler` is mounted behind the sign-in check.
+`service/src/model/` and `createChatHandler` and `createRecoverHandler` are mounted behind the sign-in check.
 
 - The route, ceiling and models are config (`src/config.ts`). Changing route is a config change.
 - Only a stub route exists until #19 names the real one. Nothing real leaves the device.
 - Above the ceiling, or an unknown classification, is refused with 403. Never downgraded.
+- `POST /recover` (`src/recover.ts`, TD 5.4): ceiling first, then the request's shape, then the route's
+  `recover`. Only a well-formed `act`, `retry` or `ask_officer` answer is passed on; anything else is 502.
+  The stub route answers `ask_officer`. The executor checks every answer again against the live window.
 - Logs hold metadata only (`src/log.ts`). Request and reply text never reaches a log.
 - `test/no-client-creds.test.js` fails if `shell/` or `executor-macos/` holds a model
   credential or a direct model URL.
