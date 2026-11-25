@@ -300,7 +300,8 @@ public enum RecoveryAnswer: Equatable {
     /// Labels of the only buttons recovery may press: ways to dismiss something, compared whole after folding.
     /// An allow-list, not a list of dangerous words: anything else ("Discard draft", "Go", "OK") is refused.
     /// Verbs that are often the commit itself ("Cancel" in "Cancel this application?", "Skip", "Hide") are left
-    /// out; a dismissal whose word the dialog's own text uses ("Close this case?") is refused by `askedAbout`.
+    /// out. A dismissal is pressed only inside a real dialog or sheet (`dialogAround`), and not when the dialog's
+    /// text uses its word in any form (`askedAbout`).
     static let dismissals: Set<String> = ["close", "dismiss", "not now", "maybe later", "got it", "no thanks",
                                           "no, thanks", "x", "×", "✕"]
 
@@ -320,37 +321,33 @@ public enum RecoveryAnswer: Equatable {
         return d.label == nil && d.domId == nil
     }
 
-    /// True when the text around a dismissal button (its dialog, sheet, or else its parent) uses the button's own
-    /// word: "Close" under "Close this case?" is the commit, not a way out.
-    static func askedAbout(_ label: String, path: [Int], root: UINode) -> Bool {
+    /// The real dialog or sheet a node sits in (a sheet or dialog role, or a group or window with a dialog
+    /// subrole), or nil. A dismissal is pressed only inside one: a "Close" on a page or in a list row may close a case.
+    static func dialogAround(path: [Int], root: UINode) -> UINode? {
         var chain: [UINode] = [root]
-        for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return true }; chain.append(n.children[i]) }
-        // Its dialog or sheet. With none (a web modal with no dialog role), the nearest container above it that
-        // holds any text besides buttons: the notice or modal it sits in, not the whole page.
-        func hasText(_ n: UINode) -> Bool { n.role != "AXButton" && n.label != nil || n.children.contains(where: hasText) }
-        let containers = Array(chain.dropFirst().reversed())
-        let around = chain.last { $0.role == "AXSheet" || $0.role == "AXDialog" || RecoveryRequest.dialogSubroles.contains($0.subrole ?? "") }
-            ?? containers.first { n in n.children.contains { $0.role != "AXButton" && hasText($0) } }
-            ?? root
+        for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return nil }; chain.append(n.children[i]) }
+        return chain.last {
+            $0.role == "AXSheet" || $0.role == "AXDialog"
+                || (RecoveryRequest.dialogContainers.contains($0.role) && RecoveryRequest.dialogSubroles.contains($0.subrole ?? ""))
+        }
+    }
+
+    /// True when any text in the dialog (not its buttons) uses the button's word in any form: a word that starts
+    /// with its stem ("Close" -> closing, closure, Closeout, CloseCase). Only the dialog is read, so page text can't
+    /// over-block, and a match anywhere in it refuses.
+    static func askedAbout(_ label: String, in dialog: UINode) -> Bool {
         let word = RecoveryRequest.words(label)
         guard !word.isEmpty else { return false }
         func texts(_ n: UINode) -> [String] {
-            let own = n.role == "AXButton" ? [] : [n.label].compactMap { $0 }
-            return own + n.children.flatMap(texts)
+            (n.role == "AXButton" ? [] : [n.label].compactMap { $0 }) + n.children.flatMap(texts)
         }
-        // Words match in their forms, so "Closing", "closed", "closure" and "Dismissal" count as the button's word.
-        func forms(_ w: String) -> Set<String> {
-            let base = w.count > 3 && w.hasSuffix("e") ? String(w.dropLast()) : w
-            var f: Set<String> = [w, w + "s", w + "es", w + "ed", w + "d", base + "ing", base + "ed", base + "ure", base + "ures",
-                                  w + "al", w + "als", w + "ing"]
-            if w == "x" || w.count < 3 { f = [w] }
-            return f
-        }
-        let want = word.map(forms)
-        return texts(around).contains { t in
+        let stems = word.map { $0.count > 3 && $0.hasSuffix("e") ? String($0.dropLast()) : $0 }
+        return texts(dialog).contains { t in
             let w = RecoveryRequest.words(t)
-            guard w.count >= want.count else { return false }
-            return (0...(w.count - want.count)).contains { i in want.indices.allSatisfy { want[$0].contains(w[i + $0]) } }
+            guard w.count >= stems.count else { return false }
+            return (0...(w.count - stems.count)).contains { i in
+                stems.indices.allSatisfy { j in stems[j].count < 3 ? w[i + j] == stems[j] : w[i + j].hasPrefix(stems[j]) }
+            }
         }
     }
 
@@ -393,7 +390,10 @@ public enum RecoveryAnswer: Equatable {
                 guard dismissals.contains(RecoveryRequest.fold(label)) else {
                     return refuse("it presses a button that is not a way to dismiss something, which may be consequential")
                 }
-                if askedAbout(label, path: sent.path, root: root) {
+                guard let dialog = dialogAround(path: sent.path, root: root) else {
+                    return refuse("it presses a dismissal outside a dialog, which may close something for good")
+                }
+                if askedAbout(label, in: dialog) {
                     return refuse("it presses a button whose word the dialog asks about, so it may be the commit")
                 }
             default:
