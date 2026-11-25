@@ -238,7 +238,7 @@ public final class Replayer {
     /// stage of the step. Each attempt: look at the window, build the
     /// request (the one builder), ask, check the answer, record it, and only then act. A recovery act is written
     /// to the trail as `recovered` before it is done; a refused answer as `step_diverged`. A stop is honoured
-    /// before asking, after the answer, and before acting; a pause holds before each attempt.
+    /// before asking, after the answer, and before acting; a pause holds before each attempt and after each answer.
     func recover<T>(_ step: ReplayTask.Step, divergence first: String, spent: inout Int, hold: () -> Void,
                     resume: () -> Swift.Result<T, Divergence>) -> RecoveryEnd<T> {
         guard let recovery else { return .gaveUp(first) }
@@ -259,6 +259,8 @@ public final class Replayer {
             }
             log("  recovery: asking (attempt \(attempt) of \(max))")
             let reply = recovery.ask(built.json)
+            // As after an approval card: nothing recovery answered is acted on while the run is paused.
+            hold()
             if stopAsked { return .stopped }
             guard let reply else { return .gaveUp("\(last). Recovery gave no answer. \(officer)") }
             let head = "Recovery at step \(step.id) (attempt \(attempt) of \(max))"

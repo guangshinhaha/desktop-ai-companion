@@ -30,10 +30,15 @@ public struct RecoveryPolicy {
 }
 
 /// The one function that builds a recovery request (decision 0003, "What a recovery request may carry").
-/// Sent: the step's `say` line, action, descriptor and input name; a pruned tree of the window (roles, labels,
-/// structure). Field values: masked unless the route is cleared. Password fields: never read, never sent.
-/// This run's input values: never, not even inside a label. No screenshot, no credentials, no list rows: a
-/// table, list or outline goes as its role and label only, with `rows_omitted`.
+/// Sent: the step's `say` line, action, descriptor and input name; a pruned tree of the window (roles and
+/// structure always). Text is sent only where it names a control, never where it is the page's content:
+/// a label or dom id goes only for control chrome (`chromeRoles`: buttons, tabs, form fields, toggles, the
+/// window, a sheet or dialog, a heading inside a dialog). Static text, rows, cells, list items, links and every
+/// other role go as role and structure only, so other people's data on screen does not leave. Roles and
+/// subroles outside known sets go as `AXUnknown` / are dropped. Field values: masked unless the route is
+/// cleared. Password fields: never read. As a second layer, any sent text holding one of this run's input
+/// values (folded to letters and digits, word by word, email local part) is masked. No screenshot, no
+/// credentials, no list rows: a table, list or outline goes without its rows (`rows_omitted`).
 public enum RecoveryRequest {
     public static let maxNodes = 400
     public static let maxDepth = 40
@@ -55,18 +60,53 @@ public enum RecoveryRequest {
     /// Holders of list rows (decision 0003: no list rows). Their contents are never sent.
     static let rowHolders: Set<String> = ["AXTable", "AXOutline", "AXList", "AXGrid", "AXBrowser", "AXRow", "AXCell", "AXColumn"]
 
-    /// Folded for comparison: case and diacritics ignored, every run of whitespace (NBSP included) one space.
+    /// The only roles whose label (and dom id) is sent: text that names a control, not the page's content.
+    static let chromeRoles: Set<String> = ReplayTask.textRoles.union(ReplayTask.choiceRoles).union([
+        "AXButton", "AXTab", "AXDisclosureTriangle", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton",
+        "AXComboBox", "AXSecureTextField", "AXWindow", "AXSheet", "AXDialog"])
+    /// Subroles that mark a dialog: its own label (its title) and its headings are chrome too.
+    static let dialogSubroles: Set<String> = ["AXApplicationDialog", "AXDialog", "AXSystemDialog"]
+    /// Roles sent as they are. Anything else goes as `AXUnknown`: a role string is the app's, and could carry text.
+    static let knownRoles: Set<String> = chromeRoles.union(hoistable).union(rowHolders).union([
+        "AXApplication", "AXWebArea", "AXScrollArea", "AXStaticText", "AXHeading", "AXImage", "AXLink", "AXToolbar",
+        "AXTabGroup", "AXMenuBar", "AXMenu", "AXMenuItem", "AXSlider", "AXProgressIndicator", "AXSplitter",
+        "AXScrollBar", "AXValueIndicator", "AXLandmarkMain", "AXLandmarkNavigation", "AXForm", "AXList", "AXListItem",
+        "AXRadioGroup", "AXIncrementor", "AXColorWell", "AXDateField", "AXLevelIndicator", "AXRuler", "AXPopover"])
+    static let knownSubroles: Set<String> = dialogSubroles.union([
+        "AXStandardWindow", "AXSecureTextField", "AXSearchField", "AXCloseButton", "AXMinimizeButton", "AXZoomButton",
+        "AXFullScreenButton", "AXToggle", "AXSwitch", "AXTabButton", "AXContentList", "AXDefinitionList",
+        "AXLandmarkMain", "AXLandmarkNavigation", "AXLandmarkBanner", "AXLandmarkRegion", "AXTextAttachment"])
+
+    /// Folded to letters and digits only: case, accents, width, whitespace, punctuation and invisible characters
+    /// (zero-width spaces, curly quotes) all ignored, so "O’Neil", "Aiden\u{200B}Tan" or "9123 4567" match.
+    static func compact(_ s: String) -> String {
+        String(String.UnicodeScalarView(s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }))
+    }
+    static func words(_ s: String) -> [String] {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+    }
+    /// What a run's input values look like for masking: each whole value, each word of 3+ characters, and an
+    /// email's local part, compacted. Values under 3 characters are kept as whole words.
+    static func secrets(_ inputs: RunInputs) -> (long: Set<String>, short: Set<String>) {
+        var long = Set<String>(), short = Set<String>()
+        for v in inputs.values.values.map({ $0.reveal() }) {
+            var parts = [v] + words(v)
+            if let at = v.firstIndex(of: "@") { parts.append(String(v[..<at])) }
+            for p in parts { let c = compact(p); if c.count >= 3 { long.insert(c) } else if !c.isEmpty { short.insert(c) } }
+        }
+        return (long, short)
+    }
+    static func holds(_ text: String, _ s: (long: Set<String>, short: Set<String>)) -> Bool {
+        let c = compact(text)
+        if s.long.contains(where: { c.contains($0) }) { return true }
+        return !s.short.isEmpty && (s.short.contains(c) || words(text).contains { s.short.contains($0) })
+    }
+    /// Folded for comparing labels with each other (dismissal words, gated targets).
     static func fold(_ s: String) -> String {
         s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
             .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
-    }
-
-    /// True when `text` holds one of `secrets` (already folded). Short values (under 3 characters) match a whole
-    /// word, so a one-letter grade still masks a label that is that letter.
-    static func holds(_ text: String, _ secrets: [String]) -> Bool {
-        let t = fold(text)
-        let words = Set(t.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
-        return secrets.contains { $0.count >= 3 ? t.contains($0) : (t == $0 || words.contains($0)) }
     }
 
     public static func build(step: ReplayTask.Step, task: ReplayTask, inputs: RunInputs, root: UINode, divergence: String,
@@ -74,7 +114,7 @@ public enum RecoveryRequest {
         guard let classification = policy.knownClassification else {
             return .failure(Refusal(reason: "the task has no classification, and an unknown classification counts as above the model route's ceiling; nothing was sent"))
         }
-        let secrets = inputs.values.values.map { fold($0.reveal()) }.filter { !$0.isEmpty }
+        let secrets = Self.secrets(inputs)
         func clean(_ s: String?) -> (String?, Bool) {
             guard var s, !s.isEmpty else { return (nil, false) }
             if holds(s, secrets) { return (masked, true) }
@@ -86,23 +126,31 @@ public enum RecoveryRequest {
         var truncated = false
         func isSecure(_ n: UINode) -> Bool { secureRoles.contains(n.role) || n.subrole == "AXSecureTextField" }
 
-        func emit(_ n: UINode, path: [Int], depth: Int) -> [[String: Any]] {
+        func emit(_ n: UINode, path: [Int], depth: Int, inDialog: Bool = false) -> [[String: Any]] {
             if refs.count >= maxNodes { truncated = true; return [] }
             func kids() -> [[String: Any]] {
                 guard depth < maxDepth else { if !n.children.isEmpty { truncated = true }; return [] }
                 var out: [[String: Any]] = []
-                for (i, c) in n.children.enumerated() { out += emit(c, path: path + [i], depth: depth + 1) }
+                let dialog = inDialog || n.role == "AXSheet" || n.role == "AXDialog" || dialogSubroles.contains(n.subrole ?? "")
+                for (i, c) in n.children.enumerated() { out += emit(c, path: path + [i], depth: depth + 1, inDialog: dialog) }
                 return out
             }
             if path.count > 0, hoistable.contains(n.role), n.label == nil, n.domId == nil, n.subrole == nil { return kids() }
             let ref = "n\(refs.count + 1)"
             refs[ref] = (n, path)
-            var o: [String: Any] = ["ref": ref, "role": n.role]
-            let (label, labelMasked) = clean(n.label)
-            if let label { o["label"] = label }
-            if labelMasked { o["label_masked"] = true }
-            if let d = clean(n.domId).0 { o["dom_id"] = d }
-            if let s = n.subrole { o["subrole"] = s }
+            let role = knownRoles.contains(n.role) ? n.role : "AXUnknown"
+            var o: [String: Any] = ["ref": ref, "role": role]
+            let isDialog = dialogSubroles.contains(n.subrole ?? "")
+            let chrome = chromeRoles.contains(n.role) || isDialog || (n.role == "AXHeading" && inDialog)
+            if chrome {
+                let (label, labelMasked) = clean(n.label)
+                if let label { o["label"] = label }
+                if labelMasked { o["label_masked"] = true }
+                if let d = clean(n.domId).0 { o["dom_id"] = d }
+            } else if n.label != nil {
+                o["text_omitted"] = true
+            }
+            if let s = n.subrole, knownSubroles.contains(s) { o["subrole"] = s }
             if isSecure(n) {
                 o["secure"] = true // never read: no call to readValue
             } else if fieldRoles.contains(n.role) {
@@ -197,16 +245,44 @@ public enum RecoveryAnswer: Equatable {
 
     /// Labels of the only buttons recovery may press: ways to dismiss something, compared whole after folding.
     /// An allow-list, not a list of dangerous words: anything else ("Discard draft", "Go", "OK") is refused.
-    static let dismissals: Set<String> = ["close", "dismiss", "cancel", "not now", "later", "maybe later", "skip",
-                                          "got it", "no thanks", "no, thanks", "hide", "x", "×", "✕"]
+    /// Verbs that are often the commit itself ("Cancel" in "Cancel this application?", "Skip", "Hide") are left
+    /// out; a dismissal whose word the dialog's own text uses ("Close this case?") is refused by `askedAbout`.
+    static let dismissals: Set<String> = ["close", "dismiss", "not now", "maybe later", "got it", "no thanks",
+                                          "no, thanks", "x", "×", "✕"]
 
-    /// Could `node` be what `d` (a gated step's target) names? Same role, and the same label or dom id. No
-    /// uniqueness is needed: two such buttons are both refused, not neither.
-    static func couldBe(_ node: UINode, _ d: Descriptor) -> Bool {
+    /// Could `node` be what `d` (a gated step's target) names? Fails closed: the same role and the same label or
+    /// dom id; any candidate the resolver finds, ambiguous ones included; and, when `d` has neither an exact
+    /// label nor a dom id (a glob, a path, anchors only), anything of its role (any role, if it names none),
+    /// since nothing proves the element is not it. No uniqueness is needed: two such buttons are both refused.
+    static func couldBe(_ node: UINode, _ d: Descriptor, in root: UINode) -> Bool {
         if let r = d.role, r != node.role { return false }
         if let l = d.label, let nl = node.label, RecoveryRequest.fold(l) == RecoveryRequest.fold(nl) { return true }
         if let id = d.domId, id == node.domId { return true }
-        return false
+        switch Resolver.resolve(d, in: root) {
+        case .found(let m): if m.node === node { return true }
+        case .ambiguous(let a): if a.candidates.contains(where: { $0 === node }) { return true }
+        case .notFound: break
+        }
+        return d.label == nil && d.domId == nil
+    }
+
+    /// True when the text around a dismissal button (its dialog, sheet, or else its parent) uses the button's own
+    /// word: "Close" under "Close this case?" is the commit, not a way out.
+    static func askedAbout(_ label: String, path: [Int], root: UINode) -> Bool {
+        var chain: [UINode] = [root]
+        for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return true }; chain.append(n.children[i]) }
+        let around = chain.last { $0.role == "AXSheet" || $0.role == "AXDialog" || RecoveryRequest.dialogSubroles.contains($0.subrole ?? "") }
+            ?? chain.last ?? root
+        let word = RecoveryRequest.words(label)
+        guard !word.isEmpty else { return false }
+        func texts(_ n: UINode) -> [String] {
+            let own = n.role == "AXButton" ? [] : [n.label].compactMap { $0 }
+            return own + n.children.flatMap(texts)
+        }
+        return texts(around).contains { t in
+            let w = RecoveryRequest.words(t)
+            return w.count >= word.count && (0...(w.count - word.count)).contains { Array(w[$0..<($0 + word.count)]) == word }
+        }
     }
 
     /// Checks an act against the window as it is now. Returns the live node to act on, or why not.
@@ -230,9 +306,7 @@ public enum RecoveryAnswer: Equatable {
         }
         if ReplayTask.looksLikeCommit(label) { return refuse("it targets a consequential element") }
         for s in task.steps where s.needsApproval {
-            var hit = couldBe(node, s.target)
-            if case .found(let m) = Resolver.resolve(s.target, in: root), m.node === node { hit = true }
-            if hit { return refuse("it targets a consequential element (it could be the target of a step that needs approval)") }
+            if couldBe(node, s.target, in: root) { return refuse("it targets a consequential element (it could be the target of a step that needs approval)") }
         }
         switch kind {
         case .press:
@@ -241,6 +315,9 @@ public enum RecoveryAnswer: Equatable {
             case "AXButton":
                 guard dismissals.contains(RecoveryRequest.fold(label)) else {
                     return refuse("it presses a button that is not a way to dismiss something, which may be consequential")
+                }
+                if askedAbout(label, path: sent.path, root: root) {
+                    return refuse("it presses a button whose word the dialog asks about, so it may be the commit")
                 }
             default:
                 return refuse("it presses an element of a kind recovery does not press (\(ApprovalGate.safe(node.role)))")
