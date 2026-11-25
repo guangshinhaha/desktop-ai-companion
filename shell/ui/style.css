@@ -1,6 +1,17 @@
 :root { color-scheme: light dark; }
 html, body { margin: 0; height: 100%; background: Canvas; }
-body { display: flex; align-items: center; padding: 0 16px; font: 16px -apple-system, system-ui, sans-serif; }
-input { width: 100%; box-sizing: border-box; padding: 12px 14px; font: inherit; color: CanvasText;
+body { font: 16px -apple-system, system-ui, sans-serif; color: CanvasText; }
+main { box-sizing: border-box; height: 100%; padding: 0 16px; display: flex; flex-direction: column; justify-content: flex-end; }
+.row { display: flex; gap: 8px; align-items: center; height: 76px; flex: none; }
+input, select { box-sizing: border-box; padding: 12px 14px; font: inherit; color: CanvasText;
         background: transparent; border: 1px solid GrayText; border-radius: 8px; outline: none; }
-input:focus { border-color: Highlight; }
+input { flex: 1; min-width: 0; }
+select { flex: none; max-width: 170px; }
+input:focus, select:focus { border-color: Highlight; }
+#log { flex: 1; overflow-y: auto; padding-top: 12px; }
+#log:empty { display: none; }
+#log p { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#log p[data-role="user"] { color: GrayText; }
+#status { margin: 0; font-size: 14px; }
+#status:empty { display: none; }
+#status[role="alert"] { color: LinkText; }

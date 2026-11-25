@@ -1,8 +1,11 @@
 //! Menu-bar shell. One tray icon, one canvas window created on demand and destroyed on close,
-//! so an idle shell holds no web view. No network calls.
+//! so an idle shell holds no web view. The only network call is chat to the companion service
+//! (`chat.rs`), over https or to this machine.
 
 pub mod approval;
+pub mod chat;
 pub mod executor;
+pub mod extract;
 pub mod recording;
 pub mod review;
 pub mod store;
@@ -53,6 +56,54 @@ fn toggle_canvas(app: &AppHandle) {
 fn close_canvas(app: AppHandle) {
     if let Some(w) = app.get_webview_window(CANVAS) {
         let _ = w.close();
+    }
+}
+
+/// Chat turn (#31). Chunks stream to the canvas over `on_event`; the full reply is not returned.
+/// The error is plain words for the officer, with a kind the canvas can branch on.
+#[tauri::command]
+async fn chat_send(
+    classification: String,
+    messages: serde_json::Value,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<(), serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = now_secs();
+        let service = chat::HttpService::from_env().map_err(|e| e.to_json())?;
+        let store = open_store().map_err(|_| chat::SendError::NotSaved.to_json())?;
+        let mut on_text = |t: &str| {
+            let _ = on_event.send(serde_json::json!({ "text": t }));
+        };
+        chat::chat_turn(&service, &store, &classification, &messages, now, &mut on_text).map_err(|e| e.to_json())?;
+        if let Some(path) = usage::default_path() {
+            if let Ok(log) = usage::UsageLog::open(&path) {
+                let _ = log.record(usage::Event::ChatRequest, 1, now);
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| chat::SendError::ReplyFailed.to_json())?
+}
+
+/// Reads a dropped file's text on this machine. The text goes back to the canvas, nothing else.
+#[tauri::command]
+async fn chat_attach(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = std::path::PathBuf::from(&path);
+        let text = extract::extract_text(&p).map_err(|e| e.plain().to_string())?;
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("document").to_string();
+        Ok(serde_json::json!({ "name": name, "text": text }))
+    })
+    .await
+    .map_err(|_| extract::ExtractError::Unreadable.plain().to_string())?
+}
+
+/// The canvas starts as one input; the first chat message opens it up to show the conversation.
+#[tauri::command]
+fn expand_canvas(app: AppHandle) {
+    if let Some(w) = app.get_webview_window(CANVAS) {
+        let _ = w.set_size(tauri::LogicalSize::new(560.0, 520.0));
     }
 }
 
@@ -329,6 +380,9 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             close_canvas,
+            chat_send,
+            chat_attach,
+            expand_canvas,
             ping_executor,
             record_start,
             record_stop,

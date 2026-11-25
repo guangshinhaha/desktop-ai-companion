@@ -7,8 +7,23 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<input id="ask" type="text" autofocus autocomplete="off" spellcheck="false"
-       placeholder="Ask, or tell me which task to run" aria-label="Ask the companion">
+<main>
+  <div id="log" role="log" aria-live="polite" aria-label="Conversation"></div>
+  <p id="status" role="status"></p>
+  <div class="row">
+    <input id="ask" type="text" autofocus autocomplete="off" spellcheck="false"
+           placeholder="Ask, or drop a document to summarise" aria-label="Ask the companion">
+    <select id="classification" aria-label="Classification of this chat">
+      <option value="" selected>Classification</option>
+      <option value="official-open">Official (Open)</option>
+      <option value="official-closed">Official (Closed)</option>
+      <option value="restricted">Restricted</option>
+      <option value="confidential">Confidential</option>
+      <option value="secret">Secret</option>
+    </select>
+  </div>
+</main>
+<script src="chat.js"></script>
 <script src="canvas.js"></script>
 </body>
 </html>
