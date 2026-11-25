@@ -9,6 +9,11 @@ use serde_json::{json, Value};
 /// The saved tasks (newest version of each) as the canvas needs them: id, version, name, and the
 /// inputs the officer must supply (`source: ask`). `column` and `read` inputs are filled by the run.
 pub fn catalog(store: &Store) -> Result<Vec<Value>, String> {
+    catalog_with(store, &crate::reuse::LocalReuse(store))
+}
+
+/// As [`catalog`], with where the reuse counts come from (#43): this device now, the shared library later.
+pub fn catalog_with(store: &Store, reuse: &dyn crate::reuse::ReuseBackend) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     for (id, latest, latest_body) in store.latest_tasks().map_err(|e| e.to_string())? {
         // The version offered is not always the newest: after a flag the older one stays until a newer one passes (#42).
@@ -36,6 +41,8 @@ pub fn catalog(store: &Store) -> Result<Vec<Value>, String> {
                 }
             }
         }
+        let r = reuse.reuse(&id)?;
+        entry["reuse"] = json!({ "replays": r.replays, "last_success_at": r.last_success_at, "scope": r.scope });
         out.push(entry);
     }
     Ok(out)

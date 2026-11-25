@@ -599,6 +599,20 @@ impl Store {
         Ok(())
     }
 
+    /// A task's reuse on this device: finished runs, and when the latest clean one began (#43). Clean means
+    /// no row ended diverged, rejected, unknown or skipped. Counts and a time only; no officer is read.
+    pub fn reuse_counts(&self, task_id: &str) -> Result<(i64, Option<i64>)> {
+        Ok(self.conn.query_row(
+            "SELECT count(*),
+                    max(CASE WHEN NOT EXISTS (SELECT 1 FROM run_items i WHERE i.run_id = runs.id
+                                              AND i.state IN ('diverged', 'rejected', 'unknown', 'skipped'))
+                             THEN started_at END)
+             FROM runs WHERE task_id = ?1 AND status = 'finished'",
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
     pub fn set_run_item(
         &self,
         run_id: &str,

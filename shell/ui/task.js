@@ -51,6 +51,15 @@
           } } }));
     }
 
+    // A count and a date for the whole device (later the team). Never a name.
+    function reuseLine(r) {
+      const where = r.scope === "team" ? "by your team" : "on this device";
+      if (!r.replays) return "Not replayed yet " + where + ".";
+      const n = r.replays === 1 ? "1 time" : r.replays + " times";
+      const last = r.last_success_at ? "last succeeded " + new Date(r.last_success_at * 1000).toLocaleDateString() : "no successful run yet";
+      return "Replayed " + n + " " + where + ", " + last + ".";
+    }
+
     function draw() {
       mount.replaceChildren();
       mount.appendChild(el("h1", {}, "Task notes"));
@@ -85,6 +94,8 @@
             if (r.ok) { detail = r.out; draw(); }
           } } });
         mount.appendChild(el("p", {}, detail.name + ", version " + detail.version));
+        const entry = catalog.find((t) => t.id === detail.id);
+        if (entry && entry.reuse) mount.appendChild(el("p", { className: "who", attrs: { "data-role": "reuse" } }, reuseLine(entry.reuse)));
         mount.appendChild(el("div", { className: "layout" },
           el("section", {}, el("h2", {}, "Steps"), steps),
           el("section", { className: "notes" }, el("h2", {}, "Notes and decisions"), list,
