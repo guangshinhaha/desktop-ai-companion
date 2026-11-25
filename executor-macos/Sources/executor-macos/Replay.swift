@@ -102,6 +102,12 @@ func runReplay(_ args: [String]) -> Never {
         say("  completed: \(list(report.completed))")
         say("  not run: \(list(report.notRun))")
         exit(4)
+    case .stopped(let step, _):
+        // The terminal command has no stop control; this is here so the switch stays complete.
+        say("run stopped at step \(step)")
+        say("  completed: \(list(report.completed))")
+        say("  not run: \(list(report.notRun))")
+        exit(2)
     case .refused(let why):
         say("run refused: \(why)")
         say("  completed: none")

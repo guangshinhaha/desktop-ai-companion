@@ -6,6 +6,7 @@ pub mod approval;
 pub mod chat;
 pub mod executor;
 pub mod extract;
+pub mod progress;
 pub mod recording;
 pub mod review;
 pub mod store;

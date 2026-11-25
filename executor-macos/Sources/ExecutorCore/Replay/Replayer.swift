@@ -9,10 +9,24 @@ public struct ReplayReport {
         case notApproved(step: String)
         /// Refused before the first action (precondition, unsupported task).
         case refused(String)
+        /// The officer stopped the run. Nothing was done after the stop. `actionDone` is true when the step
+        /// had been acted on but its checks were not confirmed yet: look at the app for that one.
+        case stopped(step: String, actionDone: Bool)
     }
     public var outcome: Outcome
     public var completed: [String]
     public var notRun: [String]
+}
+
+/// One line of the live progress view (PRD C-3). Names and the task's own `say` text only, never run values.
+public struct ReplayProgress: Equatable {
+    public enum Kind: String { case started, done, paused, resumed }
+    public var kind: Kind
+    public var step: String
+    public var say: String
+    /// 1-based position of the step, and the number of steps.
+    public var index: Int
+    public var total: Int
 }
 
 /// Replays a task step by step (PRD E-1, E-4; TD 5.2, 5.3, 7.1).
@@ -29,12 +43,18 @@ public final class Replayer {
     let ceiling: TimeInterval
     let log: (String) -> Void
     let audit: AuditSink?
+    let control: RunControl?
+    let progress: ((ReplayProgress) -> Void)?
 
     public init(task: ReplayTask, inputs: RunInputs, host: ReplayHost, gate: ApprovalGate,
-                ceiling: TimeInterval = Replayer.defaultCeiling, audit: AuditSink? = nil, log: @escaping (String) -> Void) {
+                ceiling: TimeInterval = Replayer.defaultCeiling, audit: AuditSink? = nil,
+                control: RunControl? = nil, progress: ((ReplayProgress) -> Void)? = nil, log: @escaping (String) -> Void) {
         self.task = task; self.inputs = inputs; self.host = host; self.gate = gate
-        self.ceiling = ceiling; self.audit = audit; self.log = log
+        self.ceiling = ceiling; self.audit = audit; self.control = control; self.progress = progress; self.log = log
     }
+
+    private var cancelled: (() -> Bool)? { control.map { c in { c.isStopped } } }
+    private var stopAsked: Bool { control?.isStopped ?? false }
 
     /// Runs the task and records it (TD 7.2): `run_started` first, then per step what the officer decided,
     /// then `step_diverged` if it stopped and `run_finished` always. When a record cannot be written the run
@@ -52,6 +72,13 @@ public final class Replayer {
                 // Reasons name steps and elements, never run values (see the report type).
                 _ = audit.record(AuditEvent(.stepDiverged, step: step, shown: ApprovalGate.safe(reason)))
                 outcome = "diverged"
+            case .stopped(let step, let actionDone):
+                // Step ids and counts only. This is the record of the stop (PRD C-4).
+                func list(_ ids: [String]) -> String { ids.isEmpty ? "none" : ids.joined(separator: ", ") }
+                var shown = "Stopped by the officer at step \(step). Completed: \(list(report.completed)). Not run: \(list(report.notRun))."
+                if actionDone { shown += " The step's action was done and its check was not confirmed." }
+                _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
+                outcome = "stopped"
             case .notApproved: outcome = "not_approved"
             case .refused: outcome = "refused"
             case .finished: break
@@ -67,12 +94,27 @@ public final class Replayer {
             ReplayReport(outcome: o, completed: done, notRun: task.steps[index...].map(\.id))
         }
 
+        func stopReport(at index: Int, actionDone: Bool = false) -> ReplayReport {
+            ReplayReport(outcome: .stopped(step: task.steps[index].id, actionDone: actionDone),
+                         completed: done, notRun: task.steps[index...].map(\.id))
+        }
+
         for pre in task.preconditions {
-            if let why = awaitCheck(pre, step: nil, ceiling: ceiling) { return report(.refused("precondition not met: \(why)"), at: 0) }
+            if let why = awaitCheck(pre, step: nil, ceiling: ceiling) {
+                if stopAsked { return stopReport(at: 0) }
+                return report(.refused("precondition not met: \(why)"), at: 0)
+            }
         }
         log("precondition(s) met: \(task.preconditions.count)")
 
         for (i, step) in task.steps.enumerated() {
+            let here = { (k: ReplayProgress.Kind) in
+                ReplayProgress(kind: k, step: step.id, say: ApprovalGate.safe(step.say), index: i + 1, total: self.task.steps.count)
+            }
+            // Pause holds the run here, between steps. A stop is checked after, and again before every action.
+            control?.holdWhilePaused(onPause: { progress?(here(.paused)) }, onResume: { progress?(here(.resumed)) })
+            if stopAsked { return stopReport(at: i) }
+            progress?(here(.started))
             log("step \(ApprovalGate.safe(step.id)): \(ApprovalGate.safe(step.say))")
             // The run's ceiling caps a step's own timeout; a task cannot lengthen the run.
             let stepCeiling = min(step.timeoutSeconds ?? ceiling, ceiling)
@@ -81,7 +123,9 @@ public final class Replayer {
             var match: Match
             switch findTarget(step, ceiling: stepCeiling) {
             case .success(let m): match = m
-            case .failure(let d): return report(.diverged(step: step.id, reason: d.reason), at: i)
+            case .failure(let d):
+                if d.stopped { return stopReport(at: i) }
+                return report(.diverged(step: step.id, reason: d.reason), at: i)
             }
             log("  found: \(ApprovalGate.safe(match.locator.summary))")
 
@@ -92,9 +136,12 @@ public final class Replayer {
                 let shown = ApprovalGate.makeCard(step: step, task: task, inputs: inputs, target: match.node).shown
                 switch gate.request(step: step, task: task, inputs: inputs, target: match.node) {
                 case .rejected:
+                    // A stop while the card is open answers it no; the stop is what is recorded.
+                    if stopAsked { return stopReport(at: i) }
                     _ = audit?.record(AuditEvent(.rejected, step: step.id, shown: shown))
                     return report(.notApproved(step: step.id), at: i)
                 case .approved(let a):
+                    if stopAsked { return stopReport(at: i) }
                     // The record comes before the action. No record, no action.
                     if let audit, !audit.record(AuditEvent(.approved, step: step.id, shown: shown)) {
                         return report(.diverged(step: step.id, reason: "the audit trail could not be written; nothing was done for this step"), at: i)
@@ -117,7 +164,8 @@ public final class Replayer {
                 }
             }
 
-            // 3. Act.
+            // 3. Act. Last look at the stop: after this, nothing is done for a step the officer stopped.
+            if stopAsked { return stopReport(at: i) }
             let acted = perform(step, on: match.node, approval: approval)
             // 4. Wait for the checks.
             switch acted {
@@ -127,10 +175,12 @@ public final class Replayer {
                 return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
             case .ok:
                 if let why = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
+                    if stopAsked { return stopReport(at: i, actionDone: true) }
                     return report(.diverged(step: step.id, reason: why), at: i)
                 }
             }
             done.append(step.id)
+            progress?(here(.done))
             log("  done: \(ApprovalGate.safe(step.id))")
         }
         return ReplayReport(outcome: .finished, completed: done, notRun: [])
@@ -138,10 +188,10 @@ public final class Replayer {
 
     // MARK: finding
 
-    struct Divergence: Error { let reason: String }
+    struct Divergence: Error { let reason: String; var stopped = false }
 
     func findTarget(_ step: ReplayTask.Step, ceiling: TimeInterval) -> Swift.Result<Match, Divergence> {
-        let r: Waiting.Result<Match> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now) {
+        let r: Waiting.Result<Match> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
             guard let root = host.snapshot() else { return .keepWaiting }
             if let d = unexpectedDialog(in: root, step: step) { return .stop("\(d) is open before the step; nothing was clicked") }
             switch Resolver.resolve(step.target, in: root) {
@@ -154,6 +204,7 @@ public final class Replayer {
         case .done(let m): return .success(m)
         case .ceiling: return .failure(Divergence(reason: "element not found within \(Int(ceiling)) s"))
         case .stopped(let why): return .failure(Divergence(reason: why))
+        case .cancelled: return .failure(Divergence(reason: "stopped by the officer", stopped: true))
         }
     }
 
@@ -195,7 +246,7 @@ public final class Replayer {
     /// Waits until every check of the step passes. Returns nil on success, or why not.
     func awaitChecks(_ step: ReplayTask.Step, ceiling: TimeInterval, gated: Bool) -> String? {
         var last = "no window"
-        let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now) {
+        let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
             guard let root = host.snapshot() else { return .keepWaiting }
             guard let failing = checksFailure(step, root: root) else { return .done(()) }
             // A passing check wins over a dialog that the step expects; otherwise a new dialog is a stop.
@@ -209,12 +260,13 @@ public final class Replayer {
             let tail = gated ? " The step may or may not have taken effect: check the app before running again." : ""
             return "check not met within \(Int(ceiling)) s: \(last)." + tail
         case .stopped(let why): return why
+        case .cancelled: return "stopped by the officer"
         }
     }
 
     func awaitCheck(_ c: ReplayTask.Check, step: ReplayTask.Step?, ceiling: TimeInterval) -> String? {
         var last = "no window"
-        let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now) {
+        let r: Waiting.Result<Void> = Waiting.until(ceiling: ceiling, wait: host.wait, now: host.now, cancelled: cancelled) {
             guard let root = host.snapshot() else { return .keepWaiting }
             if let f = failure(of: c, step: step, root: root) { last = f; return .keepWaiting }
             return .done(())
