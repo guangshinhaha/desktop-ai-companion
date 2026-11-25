@@ -8,6 +8,8 @@
 //   die        "before_post" | "after_post": kill this process (SIGKILL) at that point for the row whose
 //              full_name is `die_on`. before_post is after `approved` is recorded, before anything is created.
 //   diverge_on a full_name: report a divergence before asking for approval, with nothing created.
+//   steps      2: after the first account, a second consequential step (s5) creates "second.<email>", with its
+//              own approval card and its own `approved` record.
 import { createInterface } from "node:readline";
 
 if (process.argv[2] !== "serve") process.exit(1);
@@ -49,7 +51,8 @@ if (fake.diverge_on === inputs.full_name) {
 const shown = `Create a staff account for ${inputs.full_name} (${inputs.email}) with role ${inputs.role}`;
 const a = await ask("approval.request", { card: { step: "s4", task: task.name ?? "t", summary: shown } });
 if (a.result?.approved !== true) {
-  await must("rejected", { step: "s4", shown });
+  // No values: what was declined is the step, not the person it was for (decision 0005).
+  await must("rejected", { step: "s4", shown: "not approved" });
   await must("run_finished", { shown: "not_approved" });
   await finish({ outcome: "not_approved", step: "s4", completed: [], not_run: ["s4"] });
 }
@@ -65,5 +68,17 @@ if (!res.ok) {
   await must("run_finished", { shown: "diverged" });
   await finish({ outcome: "diverged", step: "s4", reason: "the app refused", completed: [], not_run: ["s4"] });
 }
+if (fake.steps === 2) {
+  const shown2 = `Create a second account for ${inputs.full_name} (second.${inputs.email})`;
+  const b = await ask("approval.request", { card: { step: "s5", task: task.name ?? "t", summary: shown2 } });
+  if (b.result?.approved !== true) {
+    await must("rejected", { step: "s5", shown: "not approved" });
+    await must("run_finished", { shown: "not_approved" });
+    await finish({ outcome: "not_approved", step: "s5", completed: ["s4"], not_run: ["s5"] });
+  }
+  await must("approved", { step: "s5", shown: shown2 });
+  const body2 = new URLSearchParams({ full_name: inputs.full_name, email: `second.${inputs.email}`, school: inputs.school, role: inputs.role });
+  await fetch(`${fake.url}/accounts`, { method: "POST", body: body2, headers: { "content-type": "application/x-www-form-urlencoded" } });
+}
 await must("run_finished", { shown: "finished" });
-await finish({ outcome: "finished", completed: ["s4"], not_run: [] });
+await finish({ outcome: "finished", completed: fake.steps === 2 ? ["s4", "s5"] : ["s4"], not_run: [] });

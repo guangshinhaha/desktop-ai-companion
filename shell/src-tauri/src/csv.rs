@@ -46,9 +46,13 @@ pub fn task_inputs(task: &Value) -> Vec<InputSpec> {
         .unwrap_or_default()
 }
 
-/// Parses CSV text: comma separated, `"` quoting with `""` for a quote, line breaks allowed inside quotes,
-/// a leading byte-order mark ignored, blank lines skipped. Every row must have the header's width.
-pub fn parse(bytes: &[u8]) -> Result<Csv, String> {
+/// Parses CSV text: comma separated, `"` quoting with `""` for a quote, a leading byte-order mark ignored,
+/// blank lines skipped. Every row must have the first row's width.
+///
+/// `has_header` is the officer's word that the first row holds column names. Without it the first row is data
+/// like any other and the columns are called "Column 1", "Column 2" and so on: a person's details are never
+/// taken for a column name, so they are never shown or stored as one.
+pub fn parse(bytes: &[u8], has_header: bool) -> Result<Csv, String> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(format!("the file is larger than {} MB", MAX_FILE_BYTES / 1024 / 1024));
     }
@@ -66,7 +70,15 @@ pub fn parse(bytes: &[u8]) -> Result<Csv, String> {
         cell.clear();
         *quoted = false;
     };
+    let cap = MAX_ROWS + usize::from(has_header);
     while let Some(c) = chars.next() {
+        if !in_quotes && quoted && !matches!(c, ',' | '\r' | '\n') {
+            // After a closing quote only spaces may come before the comma or the end of the line.
+            if !c.is_whitespace() {
+                return Err(format!("line {} has text after a closing quote", records.len() + 1));
+            }
+            continue;
+        }
         if in_quotes {
             match c {
                 '"' if chars.peek() == Some(&'"') => {
@@ -97,7 +109,7 @@ pub fn parse(bytes: &[u8]) -> Result<Csv, String> {
             }
             _ => cell.push(c),
         }
-        if records.len() > MAX_ROWS + 1 {
+        if records.len() > cap {
             return Err(format!("more than {MAX_ROWS} rows"));
         }
     }
@@ -107,51 +119,70 @@ pub fn parse(bytes: &[u8]) -> Result<Csv, String> {
     if !(row.is_empty() && cell.is_empty() && !quoted) {
         end_cell(&mut row, &mut cell, &mut quoted);
         records.push(row);
+        if records.len() > cap {
+            return Err(format!("more than {MAX_ROWS} rows"));
+        }
     }
 
-    let mut it = records.into_iter();
-    let header = it.next().ok_or("the file is empty")?;
-    if header.len() > MAX_COLUMNS {
+    let width = records.first().ok_or("the file is empty")?.len();
+    if width > MAX_COLUMNS {
         return Err(format!("more than {MAX_COLUMNS} columns"));
     }
-    if header.iter().any(|h| h.is_empty()) {
-        return Err("a column has no name in the first row".into());
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    if let Some(d) = header.iter().find(|h| !seen.insert(h.as_str())) {
-        return Err(format!("two columns are both called \"{d}\""));
-    }
+    let bad = |v: &String| v.chars().any(|c| c.is_control() || crate::approval::hidden_char(c));
+    let mut it = records.into_iter();
+    let header: Vec<String> = if has_header {
+        let h = it.next().unwrap_or_default();
+        if h.iter().any(|h| h.is_empty()) {
+            return Err("a column has no name in the first row".into());
+        }
+        if h.iter().any(bad) {
+            return Err("a column name holds a control or hidden character".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(d) = h.iter().find(|h| !seen.insert(h.as_str())) {
+            return Err(format!("two columns are both called \"{d}\""));
+        }
+        h
+    } else {
+        (1..=width).map(|i| format!("Column {i}")).collect()
+    };
     let rows: Vec<Vec<String>> = it.collect();
     if rows.is_empty() {
-        return Err("the file has a header but no rows".into());
+        return Err("the file has no rows".into());
     }
     for (i, r) in rows.iter().enumerate() {
         if r.len() != header.len() {
-            return Err(format!("row {} has {} values but the header has {}", i + 1, r.len(), header.len()));
+            return Err(format!("row {} has {} values but there are {} columns", i + 1, r.len(), header.len()));
         }
-        if r.iter().any(|v| v.chars().any(|c| c.is_control())) {
-            return Err(format!("row {} holds a control character", i + 1));
+        if r.iter().any(bad) {
+            return Err(format!("row {} holds a control or hidden character", i + 1));
         }
     }
     Ok(Csv { header, rows })
 }
 
 /// Reads and parses a file. `.xlsx` and `.xls` are refused in plain words.
-pub fn read_file(path: &std::path::Path) -> Result<(Csv, Vec<u8>), String> {
+pub fn read_file(path: &std::path::Path, has_header: bool) -> Result<(Csv, Vec<u8>), String> {
+    let bytes = read_bytes(path)?;
+    let csv = parse(&bytes, has_header)?;
+    Ok((csv, bytes))
+}
+
+/// The file's bytes, read once: what is fingerprinted is what is parsed.
+pub fn read_bytes(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
     if matches!(ext.as_deref(), Some("xlsx") | Some("xls")) {
         return Err("Excel files are not read yet. Save the sheet as CSV and pick that.".into());
     }
-    let meta = std::fs::metadata(path).map_err(|_| "cannot open the file".to_string())?;
+    // The file itself, not a link to somewhere else.
+    let meta = std::fs::symlink_metadata(path).map_err(|_| "cannot open the file".to_string())?;
     if !meta.is_file() {
         return Err("that is not a file".into());
     }
     if meta.len() as usize > MAX_FILE_BYTES {
         return Err(format!("the file is larger than {} MB", MAX_FILE_BYTES / 1024 / 1024));
     }
-    let bytes = std::fs::read(path).map_err(|_| "cannot read the file".to_string())?;
-    let csv = parse(&bytes)?;
-    Ok((csv, bytes))
+    std::fs::read(path).map_err(|_| "cannot read the file".to_string())
 }
 
 /// SHA-256 of the file's bytes, as lowercase hex. A run remembers this so a resume can refuse a file that changed.
@@ -228,6 +259,11 @@ pub fn build_rows(csv: &Csv, mapping: &BTreeMap<String, String>, inputs: &[Input
 mod tests {
     use super::*;
 
+    /// Most tests have a header row.
+    fn parse(b: &[u8]) -> Result<Csv, String> {
+        super::parse(b, true)
+    }
+
     fn spec(n: &str) -> InputSpec {
         InputSpec { name: n.into(), choices: None }
     }
@@ -275,7 +311,7 @@ mod tests {
 
     #[test]
     fn excel_files_are_refused_in_plain_words() {
-        let e = read_file(std::path::Path::new("/nonexistent/x.xlsx")).unwrap_err();
+        let e = read_file(std::path::Path::new("/nonexistent/x.xlsx"), true).unwrap_err();
         assert!(e.contains("CSV"));
     }
 
@@ -320,5 +356,53 @@ mod tests {
         let i = task_inputs(&t);
         assert_eq!(i[0], spec("a"));
         assert_eq!(i[1].choices, Some(vec!["x".to_string(), "y".to_string()]));
+    }
+
+    #[test]
+    fn without_a_confirmed_header_the_first_row_is_data_and_never_a_column_name() {
+        let c = super::parse(b"Ann Test,ann@example.test\nBo Test,bo@example.test\n", false).unwrap();
+        assert_eq!(c.header, vec!["Column 1", "Column 2"]);
+        assert_eq!(c.rows.len(), 2);
+        assert_eq!(c.rows[0][0], "Ann Test");
+        assert!(!c.header.iter().any(|h| h.contains("Ann")));
+        // With the header confirmed the same bytes read the first row as names.
+        assert_eq!(super::parse(b"Ann Test,ann@example.test\nBo Test,bo@example.test\n", true).unwrap().header[0], "Ann Test");
+    }
+
+    #[test]
+    fn text_after_a_closing_quote_is_refused_and_spaces_are_not() {
+        assert!(parse(b"a,b\n\"x\"y,2\n").unwrap_err().contains("closing quote"));
+        assert!(parse(b"a,b\n\"x\" \"y\",2\n").is_err());
+        assert_eq!(parse(b"a,b\n\"x\"  ,2\n").unwrap().rows[0][0], "x");
+    }
+
+    #[test]
+    fn the_row_cap_holds_with_or_without_a_final_newline() {
+        let mut body = String::from("a\n");
+        for _ in 0..(MAX_ROWS + 1) {
+            body.push_str("x\n");
+        }
+        body.pop();
+        assert!(parse(body.as_bytes()).is_err());
+        body.truncate(body.len() - 2);
+        assert_eq!(parse(body.as_bytes()).unwrap().rows.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn invisible_and_direction_characters_are_refused_in_values_and_names() {
+        assert!(parse("a\nx\u{200b}y\n".as_bytes()).unwrap_err().contains("row 1"));
+        assert!(parse("a\nx\u{202e}y\n".as_bytes()).is_err());
+        assert!(parse("a\u{200b},b\n1,2\n".as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_link_is_not_followed() {
+        let d = std::env::temp_dir().join(format!("companion-csv-link-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("real.csv"), b"a\n1\n").unwrap();
+        let _ = std::fs::remove_file(d.join("link.csv"));
+        std::os::unix::fs::symlink(d.join("real.csv"), d.join("link.csv")).unwrap();
+        assert!(read_file(&d.join("real.csv"), true).is_ok());
+        assert!(read_file(&d.join("link.csv"), true).is_err());
     }
 }

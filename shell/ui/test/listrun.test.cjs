@@ -22,6 +22,7 @@ function setup(status) {
     calls.push([cmd, args]);
     if (cmd === "listrun_start") return "run_1";
     if (cmd === "listrun_status") return status;
+    if (cmd === "listrun_unfinished") return [{ run: "run_9", task: "tsk_x", version: 1, status: "stopped", counts: { done: 2, unknown: 1 } }];
     if (cmd === "listrun_preview") return { columns: ["Name"], rows: 2, inputs: ["full_name"], suggested: {} };
     return null;
   };
@@ -59,7 +60,7 @@ test("the file is read through the shell and only column names come back to the 
   const { ui, calls } = setup({ items: [] });
   ui.state.path = "/tmp/staff.csv"; ui.state.taskId = "tsk_x"; ui.state.version = "2";
   await ui.choose();
-  assert.deepEqual(calls[0], ["listrun_preview", { path: "/tmp/staff.csv", taskId: "tsk_x", version: 2 }]);
+  assert.deepEqual(calls[0], ["listrun_preview", { path: "/tmp/staff.csv", taskId: "tsk_x", version: 2, header: false }]);
   assert.deepEqual(ui.state.preview.columns, ["Name"]);
 });
 
@@ -68,4 +69,38 @@ test("a backend refusal is shown to the officer", async () => {
   const ui = createListRun(fakeDoc, async () => { throw "fix the file first: row 2 full_name is empty"; }, mount);
   await ui.choose();
   assert.match(role(mount, "error")[0].textContent, /row 2/);
+});
+
+test("unfinished runs are listed after a restart and can be opened", async () => {
+  const { ui, mount, calls } = setup({ run: "run_9", status: "stopped", items: [{ item: 3, state: "unknown" }] });
+  await ui.loadUnfinished();
+  assert.equal(role(mount, "unfinished")[0].children.length, 1);
+  await role(mount, "open-run")[0].click();
+  assert.equal(ui.state.run, "run_9");
+  assert.equal(role(mount, "blocked").length, 1);
+  assert.deepEqual(calls.find((c) => c[0] === "listrun_status")[1], { run: "run_9" });
+});
+
+test("the first row is not taken as column names until the officer says so", async () => {
+  const { ui, mount, calls } = setup({ items: [] });
+  ui.state.path = "/tmp/a.csv"; ui.state.taskId = "t";
+  await ui.choose();
+  assert.equal(calls[0][1].header, false);
+  ui.state.header = true;
+  await ui.choose();
+  assert.equal(calls[1][1].header, true);
+  await ui.start();
+  assert.equal(calls.find((c) => c[0] === "listrun_start")[1].header, true);
+  assert.ok(mount);
+});
+
+test("a run error and a task with no approval step are shown", async () => {
+  const { ui, mount } = setup({ run: "run_1", status: "stopped", error: "the executor ended", active: false, items: [{ item: 1, state: "pending" }] });
+  ui.state.run = "run_1";
+  await ui.refresh();
+  assert.match(role(mount, "run-error")[0].textContent, /executor ended/);
+  const b = setup({ items: [] });
+  b.ui.state.preview = { columns: ["A"], rows: 1, inputs: ["x"], suggested: {}, approval_steps: 0 };
+  b.ui.draw();
+  assert.equal(role(b.mount, "no-approval").length, 1);
 });

@@ -53,8 +53,12 @@ impl ItemObserver for NoObserver {}
 /// An officer name the shell will put in the trail: 1 to 80 characters, no control characters.
 pub fn valid_officer(s: &str) -> bool {
     let n = s.chars().count();
-    let hidden = |c: char| matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
-    (1..=80).contains(&n) && !s.chars().any(|c| c.is_control() || hidden(c)) && !s.trim().is_empty()
+    (1..=80).contains(&n) && !s.chars().any(|c| c.is_control() || hidden_char(c)) && !s.trim().is_empty()
+}
+
+/// Zero-width and text-direction characters: invisible, or they make text read as something it is not.
+pub fn hidden_char(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
 /// A text field of an `audit.append`: absent or null is fine; anything else must be a string within the
@@ -210,6 +214,10 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
                 card["officer"] = json!(ctx.officer);
                 card["run"] = json!(ctx.run);
+                // A list run's card says which row it is for.
+                if let Some(row) = ctx.item {
+                    card["row"] = json!(row);
+                }
                 obs.approval_asked(store);
                 let approved = decide(&card);
                 reply(writer, &id, json!({ "approved": approved }))?;

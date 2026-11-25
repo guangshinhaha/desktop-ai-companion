@@ -45,7 +45,7 @@
         return;
       }
       mount.appendChild(el("h1", {}, "Approval needed"));
-      mount.appendChild(el("p", { attrs: { "data-role": "who" } }, "Approving as " + card.officer + ". Run " + card.run + "."));
+      mount.appendChild(el("p", { attrs: { "data-role": "who" } }, "Approving as " + card.officer + ". Run " + card.run + (card.row ? ", row " + card.row : "") + "."));
       mount.appendChild(el("p", { attrs: { "data-role": "where" } }, "Task: " + card.task + ". App: " + card.app + ". Step " + card.step + "."));
       if (card.unknown) {
         mount.appendChild(el("p", { className: "flag unknown", attrs: { "data-role": "unknown" } },

@@ -81,6 +81,8 @@ struct Fixture {
     csv_path: PathBuf,
     emails: Vec<String>,
     rows: Vec<Value>,
+    inputs: Vec<csv::InputSpec>,
+    map: std::collections::BTreeMap<String, String>,
 }
 
 fn task_body() -> Value {
@@ -99,14 +101,14 @@ fn fixture(name: &str) -> Fixture {
     let csv_path = root().join("stand-in/data/staff.csv");
     let task = task_body();
     let inputs = csv::task_inputs(&task);
-    let map = csv::suggest_mapping(&csv::read_file(&csv_path).unwrap().0.header, &inputs);
-    let (file, rows, sha) = listrun::prepare(&csv_path, &inputs, &map).unwrap();
+    let (file, _) = csv::read_file(&csv_path, true).unwrap();
+    let map = csv::suggest_mapping(&file.header, &inputs);
     let emails = file.rows.iter().map(|r| r[1].clone()).collect();
     let mut s = open(&dir);
     s.save_task("tsk_p", "Provision", &task.to_string(), 1).unwrap();
-    s.start_run("run_1", "tsk_p", 1, &listrun::source_json(&sha, rows.len(), &map), 1).unwrap();
-    s.create_run_items("run_1", rows.len() as i64).unwrap();
-    Fixture { dir, csv_path, emails, rows }
+    let loaded = listrun::start_or_resume(&mut s, &csv_path, "tsk_p", 1, &inputs, true, &map, "run_1", 1).unwrap();
+    assert!(!loaded.resumed);
+    Fixture { dir, csv_path, emails, rows: loaded.rows, inputs, map }
 }
 
 fn open(dir: &Path) -> Store {
@@ -286,5 +288,122 @@ fn the_trail_carries_the_row_numbers_and_the_officers_marks_and_verifies() {
     assert_eq!(mark["item"], 2);
     assert_eq!(mark["officer"], OFFICER);
     assert!(!mark["shown"].as_str().unwrap().contains("@"), "the mark names a row, not a person");
-    let _ = &fx.csv_path;
+}
+
+/// Makes the store refuse the `approved` record for one step, as a full disk or a locked file would.
+fn refuse_approved_for(dir: &Path, step: &str) {
+    let conn = rusqlite::Connection::open(dir.join("s.db")).unwrap();
+    conn.pragma_update(None, "key", format!("x'{}'", "05".repeat(32))).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER inject_refuse BEFORE INSERT ON audit WHEN NEW.event = 'approved' AND NEW.step = '{step}'
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_second_consequential_step_whose_record_fails_leaves_the_row_unknown_never_retryable() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("two-step");
+    refuse_approved_for(&fx.dir, "s5");
+    let mut go = Go::new(&fx, &app.url);
+    go.fake = json!({"steps": 2});
+
+    let (out, asked) = go.run();
+    // Step 1 acted (the account was created), then step 2's record was refused: row 1 may be half done.
+    assert_eq!(out, Outcome::Stopped { item: 1, state: "unknown".into() });
+    assert_eq!(asked, 2);
+    assert_eq!(app.log(), &fx.emails[..1], "step 1 happened once, step 2 never");
+    assert_eq!(states(&open(&fx.dir))[0], "unknown");
+
+    // Run again: it is blocked and does nothing. The row never goes back to being asked.
+    let (out, asked) = go.run();
+    assert_eq!(out, Outcome::Blocked { unknown: vec![1], diverged: vec![] });
+    assert_eq!(asked, 0);
+    assert_eq!(app.log().len(), 1);
+}
+
+#[test]
+fn after_a_restart_the_same_file_picks_the_run_up_and_does_not_ask_done_rows_again() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("restart");
+    let mut go = Go::new(&fx, &app.url);
+    go.fake = json!({"die": "before_post", "die_on": "Chen Wei Example"});
+    let (out, _) = go.run();
+    assert_eq!(out, Outcome::Stopped { item: 3, state: "unknown".into() });
+
+    // The shell restarts: a fresh store, the page's memory of the run id gone. The same file and task.
+    let mut s = open(&fx.dir);
+    let listed = listrun::unfinished(&s).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "the unfinished run can be found");
+    assert_eq!(listed[0]["run"], "run_1");
+    let again = listrun::start_or_resume(&mut s, &fx.csv_path, "tsk_p", 1, &fx.inputs, true, &fx.map, "run_2", 99).unwrap();
+    assert!(again.resumed);
+    assert_eq!(again.run, "run_1", "no second run over the same file");
+    assert_eq!(listrun::unfinished(&s).unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(again.rows, fx.rows);
+    drop(s);
+
+    go.fake = json!({});
+    let (out, asked) = go.run();
+    assert_eq!(out, Outcome::Blocked { unknown: vec![3], diverged: vec![] });
+    assert_eq!(asked, 0, "rows 1 and 2 are done and are not asked again");
+    let mut s = open(&fx.dir);
+    listrun::officer_answer(&mut s, "run_1", 3, Answer::MarkNotDone, OFFICER, 10).unwrap();
+    drop(s);
+    let (out, asked) = go.run();
+    assert_eq!(out, Outcome::Finished);
+    assert_eq!(asked, 3);
+    once_each(&app.log(), &fx.emails);
+}
+
+#[test]
+fn a_crash_mid_commit_shows_the_row_unknown_to_the_officer_after_restart() {
+    let fx = fixture("crash-mid-commit");
+    // The shell died with row 2 committing and row 3 waiting on the officer: nothing recorded the end.
+    let s = open(&fx.dir);
+    for (item, to) in [(1, "done"), (2, "committing"), (3, "awaiting_approval")] {
+        s.set_run_item("run_1", item, to, None).unwrap();
+    }
+    drop(s);
+    let mut s = open(&fx.dir);
+    listrun::settle_orphans(&mut s, "run_1").unwrap();
+    assert_eq!(states(&s), ["done", "unknown", "pending", "pending", "pending"]);
+}
+
+#[test]
+fn two_stores_cannot_run_the_same_run_and_the_second_does_not_touch_its_rows() {
+    let fx = fixture("two-stores");
+    let a = open(&fx.dir);
+    let _lease = a.lease_run("run_1").unwrap().expect("the first holder gets the run");
+    let mut b = open(&fx.dir);
+    let never = || false;
+    let p = RunParams { run: "run_1", task_ref: "tsk_p@1", officer: OFFICER, rows: &fx.rows, from: None, stop: &never };
+    let mut called = false;
+    let r = listrun::run_rows(&mut b, &p, &mut |_, _, _, _| {
+        called = true;
+        Err("must not be called".into())
+    });
+    assert!(r.is_err(), "refused while another holds the run");
+    assert!(!called);
+    // A live run's rows are not reset by a second reader.
+    a.move_run_item("run_1", 1, &["pending"], "committing", None).unwrap();
+    listrun::settle_orphans(&mut b, "run_1").unwrap();
+    assert_eq!(states(&b)[0], "committing");
+    // The row can be claimed by only one: awaiting to committing is a single compare-and-set.
+    a.move_run_item("run_1", 2, &["pending"], "awaiting_approval", None).unwrap();
+    assert!(a.move_run_item("run_1", 2, &["awaiting_approval"], "committing", None).unwrap());
+    assert!(!b.move_run_item("run_1", 2, &["awaiting_approval"], "committing", None).unwrap());
+}
+
+#[test]
+fn a_rejection_record_carries_no_values() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("reject-record");
+    let mut go = Go::new(&fx, &app.url);
+    go.reject = vec![1];
+    go.run();
+    let export = open(&fx.dir).export_audit().unwrap();
+    let rej = export.lines().skip(1).map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["event"] == "rejected").unwrap();
+    assert!(!rej["shown"].as_str().unwrap_or("").contains('@'));
 }

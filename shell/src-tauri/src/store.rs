@@ -215,7 +215,14 @@ pub const AUDIT_EVENTS: [&str; 12] = [
 
 pub struct Store {
     conn: Connection,
+    path: std::path::PathBuf,
 }
+
+/// The right to run one list run, held for as long as this value lives. It is an advisory file lock beside
+/// the database, so it is released when the holder exits or crashes, and two stores on one database (two
+/// processes, or two threads) cannot both hold it. Without it a run's rows are not touched.
+#[derive(Debug)]
+pub struct RunLease(#[allow(dead_code)] std::fs::File);
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -234,7 +241,7 @@ impl Store {
         // Forces SQLCipher to decrypt page 1: a wrong key fails here, not later.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
         conn.pragma_update(None, "recursive_triggers", true)?;
-        let store = Store { conn };
+        let store = Store { conn, path: path.to_path_buf() };
         store.migrate()?;
         Ok(store)
     }
@@ -480,6 +487,38 @@ impl Store {
             args.push(f);
         }
         Ok(self.conn.execute(&sql, args.as_slice())? == 1)
+    }
+
+    /// Takes the lease on a run, or None if another holder has it. See `RunLease`.
+    pub fn lease_run(&self, run_id: &str) -> Result<Option<RunLease>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let safe: String = run_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(format!(".lease-{safe}"));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(std::path::PathBuf::from(name))
+            .map_err(|e| StoreError::Db(format!("cannot open the run lease: {}", e.kind())))?;
+        match f.try_lock() {
+            Ok(()) => Ok(Some(RunLease(f))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(StoreError::Db(format!("cannot lock the run: {}", e.kind()))),
+        }
+    }
+
+    /// List runs that are not over (not finished, not ended by the officer): (run, task, version, status).
+    /// Newest first. `inputs_source` is parsed by the caller's rules: only runs that came from a file.
+    pub fn open_list_runs(&self) -> Result<Vec<(String, String, i64, String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, task_id, task_version, status, inputs_source FROM runs
+             WHERE status NOT IN ('finished', 'ended') AND inputs_source LIKE '{%' ORDER BY started_at DESC, id DESC",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// A run's task, version, inputs source and status.
