@@ -12,8 +12,9 @@
 //!  5. A run is held by one lease at a time (`Store::lease_run`). Picking a run up (`recover`), running it and
 //!     the officer's answers all need the lease, so a crashed run is recovered only once its holder is gone and
 //!     a live run's rows are never reset under it.
-//!  6. Starting a run over a file and task that already have an unfinished run picks that run up instead of
-//!     starting a second one.
+//!  6. A task has one unfinished list run at a time (#108). A start with that run's version and file picks it
+//!     up; any other start is refused. Where a store already holds more than one, none starts or continues
+//!     until the officer has ended all but one.
 //!
 //! No cell value is stored in `runs` or `run_items`: the run keeps the file's fingerprint, row count, whether
 //! the first row is a header, and the column mapping, and a resume must be given the same file again. A value
@@ -22,7 +23,7 @@
 
 use crate::approval::{ItemObserver, RunContext};
 use crate::csv::{self, InputSpec};
-use crate::store::{AuditEntry, Store};
+use crate::store::{AuditEntry, OpenRun, Store};
 use crate::usage::{Event, Tally};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -162,6 +163,12 @@ pub fn run_rows(store: &mut Store, p: &RunParams, replay: &mut ReplayRow) -> Res
     if db(store.run_items(p.run))?.len() != p.rows.len() {
         return Err("the file no longer matches the run".into());
     }
+    // Before any row is touched: another unfinished run of this task may already have created these rows.
+    let mut others = db(store.mark_list_run_running(p.run, &info.0))?;
+    if !others.is_empty() {
+        others.push(OpenRun { id: p.run.into(), version: info.1, inputs_source: info.2 });
+        return Err(several_unfinished(&others));
+    }
     recover(store, p.run)?;
 
     // Retry: a diverged or rejected row the officer chose to start from is asked again, on the record.
@@ -177,7 +184,6 @@ pub fn run_rows(store: &mut Store, p: &RunParams, replay: &mut ReplayRow) -> Res
         let _ = store.finish_run(p.run, "stopped");
         return Ok(Outcome::Blocked { unknown, diverged });
     }
-    let _ = store.finish_run(p.run, "running");
 
     let start = p.from.unwrap_or(1);
     for (item, _, _) in items.iter().filter(|(i, s, _)| *i >= start && s == PENDING) {
@@ -419,9 +425,38 @@ pub fn rows_for_run(store: &Store, run: &str, path: &std::path::Path, inputs: &[
     Ok(rows)
 }
 
-/// Starts a run over the file, unless an unfinished run for this task over this same file exists: then that
-/// run is picked up, with the mapping it started with, and nothing new is created. Rows already done are
-/// never asked again, and a row that was `committing` shows as `unknown` for the officer.
+fn named(runs: &[OpenRun]) -> String {
+    runs.iter().map(|r| format!("{} (version {})", r.id, r.version)).collect::<Vec<_>>().join(", ")
+}
+
+/// Why nothing starts or continues while a task has more than one unfinished run. Run ids and versions only.
+fn several_unfinished(runs: &[OpenRun]) -> String {
+    format!(
+        "this task has {} unfinished list runs: {}. None of them will start or continue, because a row created \
+         in one may still be waiting in another. Check the target app, then end all but one. Before you continue \
+         that one, check that none of its waiting rows is already in the app; if any is, end it too.",
+        runs.len(),
+        named(runs)
+    )
+}
+
+/// The one unfinished run this start may pick up: the task's only one, with the same version and file.
+fn resumable(open: &[OpenRun], version: i64, file_sha256: &str) -> Result<String, String> {
+    let [run] = open else { return Err(several_unfinished(open)) };
+    if run.version == version && parse_source(&run.inputs_source).is_some_and(|s| s.sha256 == file_sha256) {
+        return Ok(run.id.clone());
+    }
+    Err(format!(
+        "this task has an unfinished list run: {}. Resume it with the version and file it started with (a copy \
+         saved again counts as a different file), or end it, before starting another.",
+        named(open)
+    ))
+}
+
+/// Starts a run over the file if the task has no unfinished list run. If it has exactly one, over this same
+/// version and file, that run is picked up, with the mapping it started with, and nothing new is created:
+/// rows already done are never asked again, and a row that was `committing` shows as `unknown` for the
+/// officer. Every other start is refused and writes nothing (#108).
 #[allow(clippy::too_many_arguments)]
 pub fn start_or_resume(
     store: &mut Store,
@@ -436,17 +471,20 @@ pub fn start_or_resume(
 ) -> Result<Loaded, String> {
     let bytes = csv::read_bytes(path)?;
     let sha = csv::fingerprint(&bytes);
-    for (id, t, v, _, source) in db(store.open_list_runs())? {
-        if t == task_id && v == version && parse_source(&source).is_some_and(|s| s.sha256 == sha) {
-            let rows = rows_for_run(store, &id, path, inputs)?;
-            return Ok(Loaded { run: id, rows, resumed: true });
+    let mut open = db(store.open_list_runs_of(task_id))?;
+    if open.is_empty() {
+        let file = csv::parse(&bytes, header)?;
+        let rows = csv::build_rows(&file, mapping, inputs)?;
+        let source = source_json(&sha, rows.len(), header, mapping);
+        // Checked again inside the insert's transaction: another shell may have started one meanwhile.
+        open = db(store.start_list_run(new_run, task_id, version, &source, rows.len() as i64, now))?;
+        if open.is_empty() {
+            return Ok(Loaded { run: new_run.to_string(), rows, resumed: false });
         }
     }
-    let file = csv::parse(&bytes, header)?;
-    let rows = csv::build_rows(&file, mapping, inputs)?;
-    db(store.start_run(new_run, task_id, version, &source_json(&sha, rows.len(), header, mapping), now))?;
-    db(store.create_run_items(new_run, rows.len() as i64))?;
-    Ok(Loaded { run: new_run.to_string(), rows, resumed: false })
+    let run = resumable(&open, version, &sha)?;
+    let rows = rows_for_run(store, &run, path, inputs)?;
+    Ok(Loaded { run, rows, resumed: true })
 }
 
 /// Unfinished list runs for the screen: which, for what task, and how far. No values.
@@ -672,6 +710,110 @@ mod tests {
         assert_eq!(check_same_file(&src, "aaaa").unwrap().map["n"], "Name");
         assert!(check_same_file(&src, "bbbb").is_err());
         assert!(check_same_file("shell", "aaaa").is_err());
+    }
+
+    /// A start of `tsk_x` over a synthetic file written beside the store.
+    fn start(s: &mut Store, dir: &std::path::Path, text: &str, version: i64, id: &str) -> Result<Loaded, String> {
+        let path = dir.join(format!("{id}.csv"));
+        std::fs::write(&path, text).unwrap();
+        let inputs = csv::task_inputs(&json!({"inputs":[{"name":"n","type":"text"}]}));
+        let map = [("n".to_string(), "Name".to_string())].into();
+        start_or_resume(s, &path, "tsk_x", version, &inputs, true, &map, id, 5)
+    }
+
+    const FILE: &str = "Name\nZed Synthetic\n";
+
+    /// A store whose only unfinished list run is `run_a`: version 1 over `FILE`.
+    fn store_with_open_run() -> (Store, std::path::PathBuf) {
+        let (mut s, db_path) = store_with_path();
+        let dir = db_path.parent().unwrap().to_path_buf();
+        s.finish_run("run_1", "ended").unwrap();
+        s.save_task("tsk_x", "Test task", "{}", 2).unwrap();
+        assert!(!start(&mut s, &dir, FILE, 1, "run_a").unwrap().resumed);
+        (s, dir)
+    }
+
+    fn assert_nothing_written(s: &Store, id: &str) {
+        assert!(s.run_info(id).unwrap().is_none());
+        assert!(s.run_items(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unfinished_run_refuses_every_start_but_its_own_version_and_file() {
+        let (mut s, dir) = store_with_open_run();
+        let others = [(FILE, 2), ("Name\r\nZed Synthetic\r\n", 1), ("Name\nOther Synthetic\n", 1), ("Name\n\n", 2)];
+        for (text, version) in others {
+            let why = start(&mut s, &dir, text, version, "run_b").unwrap_err();
+            assert!(why.contains("run_a (version 1)") && why.contains("end it"), "{why}");
+            assert!(!why.contains("Synthetic"), "no cell value: {why}");
+            assert_nothing_written(&s, "run_b");
+        }
+        let again = start(&mut s, &dir, FILE, 1, "run_b").unwrap();
+        assert!(again.resumed && again.run == "run_a");
+        assert_nothing_written(&s, "run_b");
+        end_run(&mut s, "run_a", "Test Officer", 9).unwrap();
+        let next = start(&mut s, &dir, FILE, 2, "run_b").unwrap();
+        assert!(!next.resumed && next.run == "run_b");
+        assert_eq!(s.run_items("run_b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_check_inside_the_insert_refuses_a_second_store_and_leaves_other_tasks_alone() {
+        let (mut s, dir) = store_with_open_run();
+        let mut other = Store::open(&dir.join("s.db"), &Fixed([9u8; 32])).unwrap();
+        let blocked = other.start_list_run("run_b", "tsk_x", 2, "{}", 3, 6).unwrap();
+        assert_eq!(blocked.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["run_a"]);
+        assert_nothing_written(&s, "run_b");
+        s.save_task("tsk_y", "Other", "{}", 3).unwrap();
+        assert!(other.start_list_run("run_y", "tsk_y", 1, "{}", 1, 6).unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_unfinished_runs_left_by_the_old_bug_neither_resume_nor_run() {
+        let (mut s, dir) = store_with_open_run();
+        // As the old code did it: a second run over the same file, on a new version.
+        let source = s.run_info("run_a").unwrap().unwrap().2;
+        s.start_run("run_b", "tsk_x", 2, &source, 7).unwrap();
+        s.create_run_items("run_b", 1).unwrap();
+        s.move_run_item("run_a", 1, &[PENDING], COMMITTING, None).unwrap();
+        for version in [1, 2, 3] {
+            let why = start(&mut s, &dir, FILE, version, "run_c").unwrap_err();
+            assert!(why.contains("run_a (version 1)") && why.contains("run_b (version 2)"), "{why}");
+            assert!(why.contains("end all but one"), "{why}");
+            assert_nothing_written(&s, "run_c");
+        }
+        // "Open and resume" goes straight to run_rows: refused too, with every row left as it was.
+        let rows = vec![json!({})];
+        let never = || false;
+        for id in ["run_a", "run_b"] {
+            let mut p = params(&rows, &never);
+            p.run = id;
+            let why = run_rows(&mut s, &p, &mut |_, _, _, _| panic!("must not run")).unwrap_err();
+            assert!(why.contains("run_a (version 1)") && why.contains("run_b (version 2)"), "{why}");
+        }
+        assert_eq!(s.item_state("run_a", 1).unwrap().unwrap(), COMMITTING);
+        end_run(&mut s, "run_a", "Test Officer", 9).unwrap();
+        let mut p = params(&rows, &never);
+        p.run = "run_b";
+        let out = run_rows(&mut s, &p, &mut |_, _, _, _| Ok(json!({"outcome":"finished"}))).unwrap();
+        assert_eq!(out, Outcome::Finished);
+    }
+
+    #[test]
+    fn a_finished_run_is_not_reopened_for_a_retry_while_a_newer_run_is_unfinished() {
+        let (mut s, dir) = store_with_open_run();
+        s.move_run_item("run_a", 1, &[PENDING], REJECTED, None).unwrap();
+        s.finish_run("run_a", "finished").unwrap();
+        start(&mut s, &dir, FILE, 1, "run_b").unwrap();
+        let rows = vec![json!({})];
+        let never = || false;
+        let mut p = params(&rows, &never);
+        p.run = "run_a";
+        p.from = Some(1);
+        assert!(run_rows(&mut s, &p, &mut |_, _, _, _| panic!("must not run")).is_err());
+        assert_eq!(s.item_state("run_a", 1).unwrap().unwrap(), REJECTED);
+        assert_eq!(s.run_info("run_a").unwrap().unwrap().3, "finished");
+        assert_eq!(s.audit_count().unwrap(), 0);
     }
 
     #[test]

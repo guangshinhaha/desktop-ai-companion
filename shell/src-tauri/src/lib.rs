@@ -664,8 +664,9 @@ fn run_id() -> String {
     format!("run_{nanos:x}")
 }
 
-/// Starts a run over the file, or, if an unfinished run for this task and file exists (after a crash or a
-/// restart), picks that one up: rows done are not asked again and a row that was mid-commit shows as unknown.
+/// Starts a run over the file. If the task has an unfinished run with this version and file (after a crash or
+/// a restart), that one is picked up: rows done are not asked again and a row that was mid-commit shows as
+/// unknown. Any other unfinished run of the task refuses the start (`listrun::start_or_resume`).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn listrun_start(

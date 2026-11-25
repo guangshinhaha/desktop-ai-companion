@@ -358,6 +358,75 @@ fn after_a_restart_the_same_file_picks_the_run_up_and_does_not_ask_done_rows_aga
     once_each(&app.log(), &fx.emails);
 }
 
+/// run_1 stops at row 2 with row 1 created: an unfinished run (#108).
+fn stop_at_row_two(fx: &Fixture, url: &str) {
+    let mut go = Go::new(fx, url);
+    go.fake = json!({"diverge_on": "Bella Koh Example"});
+    assert_eq!(go.run().0, Outcome::Stopped { item: 2, state: "diverged".into() });
+}
+
+/// What an officer's second Start does: if the shell lets it make a run, that run is run.
+fn start_again_and_run(fx: &Fixture, url: &str, csv_path: &Path, version: i64) -> Result<listrun::Loaded, String> {
+    let mut s = open(&fx.dir);
+    let loaded = listrun::start_or_resume(&mut s, csv_path, "tsk_p", version, &fx.inputs, true, &fx.map, "run_2", 99)?;
+    let never = || false;
+    let task_ref = format!("tsk_p@{version}");
+    let p = RunParams { run: &loaded.run, task_ref: &task_ref, officer: OFFICER, rows: &loaded.rows, from: None, stop: &never, usage: &Tally::off() };
+    let mut task = task_body();
+    task["fake"] = json!({"url": url});
+    listrun::run_rows(&mut s, &p, &mut |store, ctx, inputs, obs| {
+        let mut hooks = Hooks { on_start: &mut |_| {}, on_progress: &mut |_| {}, stop_grace: Duration::from_secs(5) };
+        run_replay_observed(&fake_executor(), store, ctx, &task, inputs, None, &mut |_| true, &mut hooks, obs)
+    })?;
+    Ok(loaded)
+}
+
+/// The refusal names the open run, writes nothing and creates nothing: row 1 is in the app exactly once.
+fn assert_refused_once(fx: &Fixture, app: &StandIn, again: Result<listrun::Loaded, String>) {
+    assert_eq!(app.log(), &fx.emails[..1], "row 1 was created exactly once, judged from the stand-in's log");
+    let why = again.expect_err("a second run must be refused");
+    assert!(why.contains("run_1 (version 1)") && why.contains("end it"), "{why}");
+    assert!(!why.contains('@') && !why.contains("Example"), "no cell value: {why}");
+    let s = open(&fx.dir);
+    assert!(s.run_info("run_2").unwrap().is_none());
+    assert!(s.run_items("run_2").unwrap().is_empty());
+}
+
+#[test]
+fn a_new_task_version_cannot_start_a_second_run_while_one_is_unfinished() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("new-version");
+    stop_at_row_two(&fx, &app.url);
+    assert_eq!(open(&fx.dir).save_task("tsk_p", "Provision", &task_body().to_string(), 2).unwrap(), 2);
+    let again = start_again_and_run(&fx, &app.url, &fx.csv_path, 2);
+    assert_refused_once(&fx, &app, again);
+}
+
+#[test]
+fn the_same_rows_saved_with_crlf_cannot_start_a_second_run_while_one_is_unfinished() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("crlf");
+    stop_at_row_two(&fx, &app.url);
+    let text = std::fs::read_to_string(&fx.csv_path).unwrap();
+    assert!(!text.contains('\r'));
+    let resaved = fx.dir.join("resaved.csv");
+    std::fs::write(&resaved, text.replace('\n', "\r\n")).unwrap();
+    let again = start_again_and_run(&fx, &app.url, &resaved, 1);
+    assert_refused_once(&fx, &app, again);
+}
+
+#[test]
+fn ending_the_unfinished_run_allows_a_new_one() {
+    let fx = fixture("end-then-start");
+    open(&fx.dir).save_task("tsk_p", "Provision", &task_body().to_string(), 2).unwrap();
+    let mut s = open(&fx.dir);
+    listrun::end_run(&mut s, "run_1", OFFICER, 10).unwrap();
+    let again = listrun::start_or_resume(&mut s, &fx.csv_path, "tsk_p", 2, &fx.inputs, true, &fx.map, "run_2", 99).unwrap();
+    assert!(!again.resumed);
+    assert_eq!(again.run, "run_2");
+    assert_eq!(s.run_items("run_2").unwrap().len(), fx.rows.len());
+}
+
 #[test]
 fn a_crash_mid_commit_shows_the_row_unknown_to_the_officer_after_restart() {
     let fx = fixture("crash-mid-commit");

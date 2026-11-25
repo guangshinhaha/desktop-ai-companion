@@ -81,6 +81,40 @@ test("unfinished runs are listed after a restart and can be opened", async () =>
   assert.deepEqual(calls.find((c) => c[0] === "listrun_status")[1], { run: "run_9" });
 });
 
+test("a refused start shows why and lists the unfinished run by id, to open and end", async () => {
+  const why = "this task has an unfinished list run: run_9 (version 1). Resume it or end it.";
+  const calls = [];
+  const mount = new Node("main");
+  const ui = createListRun(fakeDoc, async (cmd, args) => {
+    calls.push([cmd, args]);
+    if (cmd === "listrun_start") throw why;
+    if (cmd === "listrun_unfinished") return [{ run: "run_9", task: "tsk_x", version: 1, status: "stopped", counts: { done: 1 } }];
+    if (cmd === "listrun_status") return { run: "run_9", status: "stopped", items: [{ item: 2, state: "pending" }] };
+    return null;
+  }, mount);
+  await ui.start();
+  assert.equal(role(mount, "error")[0].textContent, why);
+  assert.match(role(mount, "unfinished")[0].textContent, /run_9: tsk_x v1/);
+  await role(mount, "open-run")[0].click();
+  await role(mount, "end")[0].click();
+  assert.equal(calls.find((c) => c[0] === "listrun_end")[1].run, "run_9");
+});
+
+test("a refused continue, answer or end stays on the screen after the rows reload", async () => {
+  for (const [button, cmd] of [["resume", "listrun_resume"], ["skip", "listrun_answer"], ["end", "listrun_end"]]) {
+    const mount = new Node("main");
+    const ui = createListRun(fakeDoc, async (c) => {
+      if (c === cmd) throw "refused: " + cmd;
+      return { run: "run_1", status: "stopped", items: [{ item: 1, state: button === "skip" ? "diverged" : "pending" }] };
+    }, mount);
+    ui.state.run = "run_1";
+    await ui.refresh();
+    await role(mount, button)[0].click();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(role(mount, "error")[0].textContent, "refused: " + cmd);
+  }
+});
+
 test("the first row is not taken as column names until the officer says so", async () => {
   const { ui, mount, calls } = setup({ items: [] });
   ui.state.path = "/tmp/a.csv"; ui.state.taskId = "t";
