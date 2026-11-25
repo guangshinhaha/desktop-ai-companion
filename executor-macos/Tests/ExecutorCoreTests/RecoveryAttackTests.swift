@@ -59,7 +59,7 @@ final class RecoveryAttackTests: XCTestCase {
         h.onSet = { n, h in if n.domId == "full-name" { h.fields["full-name"] = "" } } // check never passes
         let retry: [String: Any] = ["answer": "retry"]
         let (r, _, m, _) = try go(h, t, [(nil, retry), (nil, retry), ("Close", press), (nil, retry), (nil, retry), (nil, retry)])
-        let s1 = m.requests.filter { ($0["step"] as? [String: Any])?["id"] as? String == "s1" }
+        let s1 = m.requests.filter { ($0["step"] as? [String: Any])?["index"] as? Int == 0 }
         print("A3 outcome:", r.outcome, "requests for s1:", s1.count, "attempt numbers:", s1.map { $0["attempt"]! })
         XCTAssertLessThanOrEqual(s1.count, 3, "more than 3 recovery attempts on one step")
     }

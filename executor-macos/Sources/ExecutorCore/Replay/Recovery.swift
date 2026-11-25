@@ -30,8 +30,9 @@ public struct RecoveryPolicy {
 }
 
 /// The one function that builds a recovery request (decision 0003, "What a recovery request may carry").
-/// Sent: the step's `say` line, action, descriptor and input name; a pruned tree of the window (roles and
-/// structure always). Text is sent only where it names a control, never where it is the page's content:
+/// Sent: the step's place in the task, action, consequence flag, descriptor (under the tree's rules) and input
+/// name (an identifier); why it diverged as a fixed code, never free text; a pruned tree of the window (roles and
+/// structure always). The step's `say` line, its id and its checks are task text and are not sent. Text is sent only where it names a control, never where it is the page's content:
 /// a label or dom id goes only for control chrome (`chromeRoles`: buttons, tabs, form fields, toggles, the
 /// window, a sheet or dialog, a heading inside a dialog). Static text, rows, cells, list items, links and every
 /// other role go as role and structure only, so other people's data on screen does not leave. Roles and
@@ -180,13 +181,14 @@ public enum RecoveryRequest {
         }
         let tree = emit(root, path: [], depth: 0).first ?? [:]
 
-        var stepJSON: [String: Any] = ["id": step.id, "action": step.action.rawValue,
+        var stepJSON: [String: Any] = ["index": task.steps.firstIndex { $0.id == step.id } ?? -1,
+                                       "action": step.action.rawValue,
                                        "target": descriptorJSON(step.target, clean: { clean($0) }),
                                        "consequential": step.consequential.rawValue]
-        let (say, sayMasked) = clean(step.say)
-        if let say { stepJSON["say"] = say }
-        if sayMasked { stepJSON["say_masked"] = true }
-        if case .input(let name)? = step.value { stepJSON["input"] = name }
+        // The input's name, which the answer must echo: only an identifier, and masked like a label.
+        if case .input(let name)? = step.value, name.count <= 40,
+           name.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || $0 == "_") }),
+           case (let n?, false) = clean(name) { stepJSON["input"] = n }
         var json: [String: Any] = [
             "kind": "recover",
             "classification": classification,
@@ -194,7 +196,7 @@ public enum RecoveryRequest {
             "attempt": attempt,
             "max_attempts": RecoveryPolicy.maxAttempts,
             "step": stepJSON,
-            "divergence": divergence,
+            "divergence": divergenceCode(divergence),
             "values": policy.valuesCleared ? "included" : "masked",
             "tree": tree,
         ]
@@ -204,6 +206,25 @@ public enum RecoveryRequest {
 
     /// The step's target under the tree's rules: role always; label, glob and dom id only for a chrome role, and
     /// masked if they hold an input; the path as roles only; anchors (page text near it) never, only a count.
+    /// Why the step diverged, as one code from a closed set. The reason itself (which can quote a check's target,
+    /// a window title pattern or page text) stays on the device.
+    static let divergenceCodes: Set<String> = ["refused", "not_found", "dialog", "no_window", "find_failed", "check_failed",
+        "check_failed:exists", "check_failed:appears", "check_failed:disappears", "check_failed:value_equals",
+        "check_failed:window_title"]
+    static func divergenceCode(_ reason: String) -> String {
+        if reason.hasPrefix("recovery's answer was refused") { return "refused" }
+        if reason.hasPrefix("element not found") { return "not_found" }
+        if reason.hasPrefix("no window") || reason.hasPrefix("the window is gone") { return "no_window" }
+        if reason.hasPrefix("check not met") {
+            let last = reason.split(separator: ":", maxSplits: 1).dropFirst().first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            if last.hasPrefix("window title") || last.hasPrefix("window_title") { return "check_failed:window_title" }
+            for k in ["value_equals", "disappears", "appears", "exists"] where last.hasPrefix(k) { return "check_failed:" + k }
+            return "check_failed"
+        }
+        if reason.contains("dialog") { return "dialog" }
+        return "find_failed"
+    }
+
     static func descriptorJSON(_ d: Descriptor, clean: (String?) -> (String?, Bool)) -> [String: Any] {
         var o: [String: Any] = [:]
         let role = d.role.map { knownRoles.contains($0) ? $0 : "AXUnknown" }
@@ -304,8 +325,12 @@ public enum RecoveryAnswer: Equatable {
     static func askedAbout(_ label: String, path: [Int], root: UINode) -> Bool {
         var chain: [UINode] = [root]
         for i in path.dropLast() { guard let n = chain.last, i < n.children.count else { return true }; chain.append(n.children[i]) }
-        // Its dialog or sheet; with none (a web modal with no dialog role), the whole window.
+        // Its dialog or sheet. With none (a web modal with no dialog role), the nearest container above it that
+        // holds any text besides buttons: the notice or modal it sits in, not the whole page.
+        func hasText(_ n: UINode) -> Bool { n.role != "AXButton" && n.label != nil || n.children.contains(where: hasText) }
+        let containers = Array(chain.dropFirst().reversed())
         let around = chain.last { $0.role == "AXSheet" || $0.role == "AXDialog" || RecoveryRequest.dialogSubroles.contains($0.subrole ?? "") }
+            ?? containers.first { n in n.children.contains { $0.role != "AXButton" && hasText($0) } }
             ?? root
         let word = RecoveryRequest.words(label)
         guard !word.isEmpty else { return false }
@@ -313,15 +338,19 @@ public enum RecoveryAnswer: Equatable {
             let own = n.role == "AXButton" ? [] : [n.label].compactMap { $0 }
             return own + n.children.flatMap(texts)
         }
-        // Words match by stem, so "Closing", "closed" and "Dismissal" count as the button's word.
-        func stem(_ w: String) -> String { w.count > 3 && w.hasSuffix("e") ? String(w.dropLast()) : w }
-        let stems = word.map(stem)
+        // Words match in their forms, so "Closing", "closed", "closure" and "Dismissal" count as the button's word.
+        func forms(_ w: String) -> Set<String> {
+            let base = w.count > 3 && w.hasSuffix("e") ? String(w.dropLast()) : w
+            var f: Set<String> = [w, w + "s", w + "es", w + "ed", w + "d", base + "ing", base + "ed", base + "ure", base + "ures",
+                                  w + "al", w + "als", w + "ing"]
+            if w == "x" || w.count < 3 { f = [w] }
+            return f
+        }
+        let want = word.map(forms)
         return texts(around).contains { t in
             let w = RecoveryRequest.words(t)
-            guard w.count >= stems.count else { return false }
-            return (0...(w.count - stems.count)).contains { i in
-                stems.indices.allSatisfy { j in stems[j].count < 3 ? w[i + j] == stems[j] : w[i + j].hasPrefix(stems[j]) }
-            }
+            guard w.count >= want.count else { return false }
+            return (0...(w.count - want.count)).contains { i in want.indices.allSatisfy { want[$0].contains(w[i + $0]) } }
         }
     }
 

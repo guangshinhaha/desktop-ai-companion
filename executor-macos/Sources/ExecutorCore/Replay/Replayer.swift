@@ -238,7 +238,7 @@ public final class Replayer {
     /// stage of the step. Each attempt: look at the window, build the
     /// request (the one builder), ask, check the answer, record it, and only then act. A recovery act is written
     /// to the trail as `recovered` before it is done; a refused answer as `step_diverged`. A stop is honoured
-    /// before asking, after the answer, and before acting; a pause holds before each attempt and after each answer.
+    /// before asking, after the answer, and before acting; a pause, however late it is read, holds before each request, after each answer, before acting and after recovering.
     /// Holds while paused, however late the pause arrived, then says whether a stop was asked for. A pause read
     /// by a stop check is held here too, not passed over.
     private func settled(_ hold: () -> Void) -> Bool {
@@ -263,8 +263,7 @@ public final class Replayer {
         while spent < max {
             spent += 1
             let attempt = spent
-            hold()
-            if stopAsked { return .stopped }
+            if settled(hold) { return .stopped }
             guard let root = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }
             let built: RecoveryRequest.Built
             switch RecoveryRequest.build(step: step, task: task, inputs: inputs, root: root, divergence: ApprovalGate.safe(last),

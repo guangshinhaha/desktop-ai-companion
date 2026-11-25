@@ -68,10 +68,12 @@ final class RecoveryRequestTests: XCTestCase {
         return b.json
     }
 
-    func testCarriesTheStepsSayActionAndDescriptorAndAPrunedTree() throws {
+    func testCarriesTheStepsActionAndDescriptorAndAPrunedTreeButNotItsSayLine() throws {
         let j = try build(policy)
         let step = j["step"] as! [String: Any]
-        XCTAssertEqual(step["say"] as? String, "Type into Full name")
+        XCTAssertNil(step["say"], "say is task text: not sent")
+        XCTAssertNil(step["id"], "the step id is task text: its index goes instead")
+        XCTAssertEqual(step["index"] as? Int, 0)
         XCTAssertEqual(step["action"] as? String, "set_value")
         XCTAssertEqual((step["target"] as? [String: Any])?["dom_id"] as? String, "full-name")
         XCTAssertEqual(step["input"] as? String, "full_name", "the input's name, never its value")
@@ -195,7 +197,7 @@ final class RecoveryReplayTests: XCTestCase {
         XCTAssertEqual(r.outcome, .finished)
         XCTAssertEqual(model.requests.count, 1)
         let req = model.requests[0]
-        XCTAssertEqual((req["step"] as? [String: Any])?["say"] as? String, "Type into Full name")
+        XCTAssertEqual((req["step"] as? [String: Any])?["index"] as? Int, 0)
         XCTAssertEqual(audit.kinds.filter { $0 == .recovered }.count, 1)
         // The record of the recovery is written before the press, so the trail knows first.
         let i = audit.kinds.firstIndex(of: .recovered)!
