@@ -48,6 +48,9 @@ pub trait ItemObserver {
     fn commit_begins(&mut self, _store: &mut Store) -> bool {
         true
     }
+    /// The executor sent an `approved` the officer never gave. It cannot be trusted to have waited, so
+    /// nothing proves what it did.
+    fn approval_refused(&mut self, _store: &mut Store) {}
     /// The `approved` record could not be written, so the executor will not act.
     fn commit_aborted(&mut self, _store: &mut Store) {}
 }
@@ -193,6 +196,8 @@ pub fn drive_with<R: BufRead, W: Write>(
                 let begins_commit = event == "approved";
                 // `take`: one yes, one record. Refused before the row or the trail is touched.
                 if begins_commit && !granted.take().is_some_and(|g| step.as_deref() == Some(g.as_str())) {
+                    // Before the reply: the executor may be gone, and the mark must already be saved.
+                    obs.approval_refused(store);
                     reply_err(writer, &id, -32000, "the officer has not approved this step")?;
                     continue;
                 }

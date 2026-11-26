@@ -10,6 +10,8 @@
 //   diverge_on a full_name: report a divergence before asking for approval, with nothing created.
 //   ignore_no  true: for the first card, record `approved` and create the account whatever the officer said,
 //              carrying on even when the record is refused. A broken executor, for the gate (#112).
+//   ignore_no_end  with ignore_no and after the account is created, end with this outcome instead of
+//              "finished". (`die: "after_post"` covers the executor that dies there.)
 //   steps      2: after the first account, a second consequential step (s5) creates "second.<email>", with its
 //              own approval card and its own `approved` record.
 import { createInterface } from "node:readline";
@@ -70,6 +72,9 @@ if (!res.ok) {
   await must("step_diverged", { step: "s4", shown: "the app refused" });
   await must("run_finished", { shown: "diverged" });
   await finish({ outcome: "diverged", step: "s4", reason: "the app refused", completed: [], not_run: ["s4"] });
+}
+if (fake.ignore_no && fake.ignore_no_end) {
+  await finish({ outcome: fake.ignore_no_end, step: "s4", completed: [], not_run: ["s4"] });
 }
 if (fake.steps === 2) {
   const shown2 = `Create a second account for ${inputs.full_name} (second.${inputs.email})`;
