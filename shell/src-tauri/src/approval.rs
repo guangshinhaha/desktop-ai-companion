@@ -8,6 +8,8 @@
 //!   service's answer object. Only a masked request (`values: "masked"`) goes: the shell never clears values.
 //!   No service, a refusal or a bad reply is an error, and the executor then asks the officer.
 //! The officer, the task reference, the run id and the time are the shell's: the executor cannot set them.
+//! An `approved` record is accepted only for the step of the card the officer last answered yes to, and each
+//! yes covers one record (#112).
 //! No answer is never a yes: if the executor ends, or the officer's window closes, the run stops.
 //! Nothing here logs, prints or puts a value in an error.
 
@@ -144,6 +146,8 @@ pub fn drive_with<R: BufRead, W: Write>(
     obs: &mut dyn ItemObserver,
     recover: &mut dyn FnMut(&Value) -> Option<Value>,
 ) -> Result<Value, String> {
+    // The step of the last card, if the officer said yes to it and no `approved` record has used that yes.
+    let mut granted: Option<String> = None;
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
         if line.trim().is_empty() {
@@ -187,6 +191,11 @@ pub fn drive_with<R: BufRead, W: Write>(
                     continue;
                 };
                 let begins_commit = event == "approved";
+                // `take`: one yes, one record. Refused before the row or the trail is touched.
+                if begins_commit && !granted.take().is_some_and(|g| step.as_deref() == Some(g.as_str())) {
+                    reply_err(writer, &id, -32000, "the officer has not approved this step")?;
+                    continue;
+                }
                 if begins_commit && !obs.commit_begins(store) {
                     reply_err(writer, &id, -32000, "the row could not be marked as committing")?;
                     continue;
@@ -217,6 +226,8 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
             }
             "approval.request" => {
+                // A new card ends any earlier yes, whatever becomes of this one.
+                granted = None;
                 let mut card = params["card"].clone();
                 if !card.is_object() {
                     reply(writer, &id, json!({ "approved": false }))?;
@@ -230,6 +241,9 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
                 obs.approval_asked(store);
                 let approved = decide(&card);
+                if approved {
+                    granted = card["step"].as_str().map(str::to_string);
+                }
                 reply(writer, &id, json!({ "approved": approved }))?;
             }
             "recover.request" => {
