@@ -54,6 +54,17 @@ pub fn sweep(dir: &Path, keep: Option<&Path>) {
     }
 }
 
+/// A draft under review lives in memory only, so any draft file present at launch is left over
+/// from an earlier run (quit, crash or restart before save or discard). Nothing here is deleted
+/// through a link: if the drafts path is not a real folder, launch leaves it alone.
+pub fn sweep_at_launch(dir: Option<PathBuf>) {
+    if let Some(d) = dir {
+        if std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) {
+            sweep(&d, None);
+        }
+    }
+}
+
 pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, String> {
     if !valid_bundle(app_bundle) {
         return Err("that is not an application bundle id".into());

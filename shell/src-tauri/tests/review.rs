@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 
 const SECRET: &str = "Zebra-Quokka-7731"; // synthetic stand-in for a typed value
 const NOW: i64 = 1_795_000_000;
@@ -67,10 +68,27 @@ fn edit(d: &mut Draft, e: Value) -> Result<(), String> {
     d.apply(&e)
 }
 
+/// `scripts/validate-task` runs `npm ci` when ajv is missing. Tests run in parallel, and
+/// concurrent installs into one folder break each other, so the first caller installs for all.
+fn install_validator(root: &Path) {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        if !root.join("schema/node_modules/ajv").exists() {
+            let ok = Command::new("npm")
+                .args(["ci", "--no-audit", "--no-fund"])
+                .current_dir(root.join("schema"))
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "npm ci in schema/ failed");
+        }
+    });
+}
+
 fn validate(body: &str, dir: &Path) -> (bool, String) {
     let f = dir.join("check.json");
     std::fs::write(&f, body).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    install_validator(&root);
     let out = Command::new(root.join("scripts/validate-task")).arg(&f).output().unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text)
@@ -437,7 +455,16 @@ fn a_constant_value_is_never_copied_into_a_summary_even_after_its_step_is_delete
     let dir = tmp("summary-leak");
     let mut d = draft();
     edit(&mut d, json!({"op":"mark_constant","step":"s1","value":SECRET,"confirmed_no_personal_data":true})).unwrap();
-    assert!(step(&d.view(), "s4").to_string().find(SECRET).is_none(), "not copied while the step exists");
+    // The view has no approval field, so read the summaries from a task saved while s1 still exists.
+    // Its own store: that body rightly holds the constant in s1.
+    let mut before = open(&tmp("summary-leak-before"));
+    let (id, v) = d.clone_for_retry().save(&mut before, "officer", NOW).unwrap();
+    let t: Value = serde_json::from_str(&before.task_body(&id, v).unwrap().unwrap()).unwrap();
+    assert_eq!(step(&t, "s1")["value"]["constant"], SECRET);
+    for s in ["s3", "s4"] {
+        let summary = step(&t, s)["approval"]["summary"].as_str().unwrap();
+        assert!(!summary.contains(SECRET), "{s}: not copied while the step exists");
+    }
     edit(&mut d, json!({"op":"delete_step","step":"s1"})).unwrap();
     let mut store = open(&dir);
     let (id, v) = d.save(&mut store, "officer", NOW).unwrap();
@@ -482,6 +509,8 @@ fn a_hand_made_recording_that_breaks_the_format_is_refused_at_save() {
         ("platform", Box::new(|t| t["platform"] = json!("linux"))),
         ("summary not a string", Box::new(|t| t["steps"][2]["approval"]["summary"] = json!(5))),
         ("bad input name", Box::new(|t| t["inputs"][0]["name"] = json!("Bad Name"))),
+        ("unknown without an approval", Box::new(|t| { t["steps"][2].as_object_mut().unwrap().remove("approval"); })),
+        ("yes without an approval", Box::new(|t| { t["steps"][3].as_object_mut().unwrap().remove("approval"); })),
     ];
     for (what, f) in cases {
         let mut t = recorded();
@@ -498,6 +527,32 @@ fn a_constant_for_a_choice_input_must_be_one_of_its_choices() {
     let mut d = Draft::from_json(&t.to_string(), None).unwrap();
     assert!(edit(&mut d, json!({"op":"mark_constant","step":"s1","value":"zzz","confirmed_no_personal_data":true})).is_err());
     edit(&mut d, json!({"op":"mark_constant","step":"s1","value":"a","confirmed_no_personal_data":true})).unwrap();
+}
+
+#[test]
+fn drafts_left_over_from_an_earlier_run_are_removed_at_launch() {
+    let dir = tmp("launch-sweep");
+    let drafts = dir.join("drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    for f in ["draft-1-2.json", "draft-3-4.json", "keep.txt"] {
+        std::fs::write(drafts.join(f), "{}").unwrap();
+    }
+    recording::sweep_at_launch(Some(drafts.clone()));
+    let left: Vec<_> = std::fs::read_dir(&drafts).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["keep.txt"]);
+    // A first launch has no drafts folder, and a launch with no home folder has no path.
+    let absent = dir.join("absent");
+    recording::sweep_at_launch(Some(absent.clone()));
+    assert!(!absent.exists());
+    recording::sweep_at_launch(None);
+    // A drafts path that is a link must not make launch delete files in the folder it points to.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("draft-mine.json"), "{}").unwrap();
+    let linked = dir.join("linked-drafts");
+    std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+    recording::sweep_at_launch(Some(linked));
+    assert!(elsewhere.join("draft-mine.json").exists(), "launch deleted through a linked drafts folder");
 }
 
 #[test]
