@@ -109,7 +109,7 @@ public struct ApprovalCard {
         return l
     }
 
-    /// What goes in the audit record: the card with the approved values (decision 0005).
+    /// The card with its values, sent with the audit event. The shell stores its own copy of the card (#107).
     public var shown: String { lines(showValues: true).filter { !$0.isEmpty }.joined(separator: "\n") }
 }
 

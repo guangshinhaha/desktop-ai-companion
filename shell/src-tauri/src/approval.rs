@@ -3,13 +3,15 @@
 //! The executor is started with `serve` and given `replay.start`. While it runs it sends two kinds of
 //! request and waits for each answer:
 //!   `approval.request {card}`  -> the officer decides; the answer is `{approved: bool}`.
-//!   `audit.append {event, step?, shown?, item?}` -> written through the store's API; the answer is `{seq}`.
+//!   `audit.append {event, step?, shown?}` -> written through the store's API; the answer is `{seq}`.
 //!   `recover.request {request}` -> passed to the companion service's `POST /recover` (#34); the answer is the
 //!   service's answer object. Only a masked request (`values: "masked"`) goes: the shell never clears values.
 //!   No service, a refusal or a bad reply is an error, and the executor then asks the officer.
-//! The officer, the task reference, the run id and the time are the shell's: the executor cannot set them.
+//! The officer, the task reference, the run id, the row (`item`) and the time are the shell's: the executor
+//! cannot set them, and an `item` it sends is ignored.
 //! An `approved` record is accepted only for the step of the card the officer last answered yes to, and each
-//! yes covers one record (#112).
+//! yes covers one record (#112). Its `shown` is that card as the shell showed it (JSON), never the executor's
+//! `shown`. A `rejected` record has no `shown` (#107).
 //! No answer is never a yes: if the executor ends, or the officer's window closes, the run stops.
 //! Nothing here logs, prints or puts a value in an error.
 
@@ -35,7 +37,7 @@ pub struct RunContext {
     /// `<task id>@<version>`
     pub task_ref: String,
     pub run: String,
-    /// The row of a list run. The shell's word: it overrides any `item` the executor sends.
+    /// The row of a list run. The shell's word: any `item` the executor sends is ignored.
     pub item: Option<i64>,
 }
 
@@ -149,8 +151,8 @@ pub fn drive_with<R: BufRead, W: Write>(
     obs: &mut dyn ItemObserver,
     recover: &mut dyn FnMut(&Value) -> Option<Value>,
 ) -> Result<Value, String> {
-    // The step of the last card, if the officer said yes to it and no `approved` record has used that yes.
-    let mut granted: Option<String> = None;
+    // The last card as shown, if the officer said yes to it and no `approved` record has used that yes.
+    let mut granted: Option<Value> = None;
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
         if line.trim().is_empty() {
@@ -195,7 +197,12 @@ pub fn drive_with<R: BufRead, W: Write>(
                 };
                 let begins_commit = event == "approved";
                 // `take`: one yes, one record. Refused before the row or the trail is touched.
-                if begins_commit && !granted.take().is_some_and(|g| step.as_deref() == Some(g.as_str())) {
+                let yes = if begins_commit {
+                    granted.take().filter(|card| card["step"].as_str().is_some_and(|g| step.as_deref() == Some(g)))
+                } else {
+                    None
+                };
+                if begins_commit && yes.is_none() {
                     // Before the reply: the executor may be gone, and the mark must already be saved.
                     obs.approval_refused(store);
                     reply_err(writer, &id, -32000, "the officer has not approved this step")?;
@@ -205,13 +212,19 @@ pub fn drive_with<R: BufRead, W: Write>(
                     reply_err(writer, &id, -32000, "the row could not be marked as committing")?;
                     continue;
                 }
+                // What the officer approved is what the shell showed. A rejected record keeps no values.
+                let shown = match event {
+                    "approved" => yes.map(|card| card.to_string()),
+                    "rejected" => None,
+                    _ => shown,
+                };
                 let entry = AuditEntry {
                     at: now(),
                     officer: &ctx.officer,
                     event,
                     task: Some(&ctx.task_ref),
                     run: Some(&ctx.run),
-                    item: ctx.item.or_else(|| params["item"].as_i64()),
+                    item: ctx.item,
                     step: step.as_deref(),
                     shown: shown.as_deref(),
                 };
@@ -247,7 +260,7 @@ pub fn drive_with<R: BufRead, W: Write>(
                 obs.approval_asked(store);
                 let approved = decide(&card);
                 if approved {
-                    granted = card["step"].as_str().map(str::to_string);
+                    granted = Some(card);
                 }
                 reply(writer, &id, json!({ "approved": approved }))?;
             }
@@ -518,8 +531,8 @@ mod tests {
             line(json!({"jsonrpc":"2.0","id":id,"method":"audit.append","params":p}))
         };
         let input = mk("x1", "run_started", json!({}))
-            + &card_line("s5")
-            + &mk("x2", "approved", json!({"step":"s5","shown":"Create a staff account for Test Person (test@example.test)"}))
+            + &line(json!({"jsonrpc":"2.0","id":"c","method":"approval.request","params":{"card":{"step":"s5","summary":"Create a staff account for Test Person (test@example.test)"}}}))
+            + &mk("x2", "approved", json!({"step":"s5"}))
             + &mk("x3", "run_finished", json!({"shown":"finished"}))
             + &line(json!({"jsonrpc":"2.0","id":1,"result":{"outcome":"finished"}}));
         let mut out = Vec::new();
@@ -688,6 +701,63 @@ mod tests {
         assert_eq!(gate(no, &[true, false]), (vec![false], 0, 0));
         let not_a_card = line(json!({"jsonrpc":"2.0","id":"c2","method":"approval.request","params":{"card":"s4"}}));
         assert_eq!(gate(card_line("s4") + &not_a_card + &approved_line("s4"), &[true]), (vec![false], 0, 0));
+    }
+
+    /// Runs `input` against `ctx`, saying `answer` to each card. Returns the cards shown and the records.
+    fn trail(input: String, ctx: &RunContext, answer: bool) -> (Vec<Value>, Vec<Value>) {
+        let (mut s, _d) = store();
+        let mut cards = Vec::new();
+        let input = input + &line(json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        drive(Cursor::new(input), &mut Vec::new(), &mut s, ctx, 1, &|| 1, &mut |card| {
+            cards.push(card.clone());
+            answer
+        })
+        .unwrap();
+        let export = s.export_audit().unwrap();
+        (cards, export.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect())
+    }
+
+    fn append_line(params: Value) -> String {
+        line(json!({"jsonrpc":"2.0","id":"a","method":"audit.append","params":params}))
+    }
+
+    #[test]
+    fn the_shells_item_beats_the_executors() {
+        let input = append_line(json!({"event":"run_started","item":9}))
+            + &card_line("s5")
+            + &append_line(json!({"event":"approved","step":"s5","item":9}));
+        let row = RunContext { item: Some(2), ..ctx() };
+        let (_, recs) = trail(input.clone(), &row, true);
+        assert_eq!(recs.iter().map(|r| r["item"].clone()).collect::<Vec<_>>(), vec![json!(2), json!(2)]);
+        // A single run has no row, and the executor cannot give it one.
+        let (_, recs) = trail(input, &ctx(), true);
+        assert_eq!(recs.iter().map(|r| r["item"].clone()).collect::<Vec<_>>(), vec![Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn the_approved_record_keeps_the_card_the_shell_showed_not_the_executors_text() {
+        // The card tries to name its own officer, run and row.
+        let card = json!({"step":"s5","summary":"Create an account for Test Person","officer":"evil","run":"run_9","row":9});
+        let input = line(json!({"jsonrpc":"2.0","id":"c","method":"approval.request","params":{"card":card}}))
+            + &append_line(json!({"event":"approved","step":"s5","shown":"Create an account for Someone Else"}));
+        let (cards, recs) = trail(input, &RunContext { item: Some(2), ..ctx() }, true);
+        let kept: Value = serde_json::from_str(recs[0]["shown"].as_str().unwrap()).unwrap();
+        assert_eq!(kept, cards[0]);
+        assert_eq!(kept, json!({"step":"s5","summary":"Create an account for Test Person","officer":"officer-1","run":"run_1","row":2}));
+        assert!(!recs[0]["shown"].as_str().unwrap().contains("Someone Else"));
+        // With no text from the executor at all, the record still holds the card.
+        let input = card_line("s5") + &append_line(json!({"event":"approved","step":"s5"}));
+        let (cards, recs) = trail(input, &ctx(), true);
+        assert_eq!(serde_json::from_str::<Value>(recs[0]["shown"].as_str().unwrap()).unwrap(), cards[0]);
+    }
+
+    #[test]
+    fn a_rejected_record_stores_no_shown() {
+        let input = card_line("s5") + &append_line(json!({"event":"rejected","step":"s5","shown":"Create an account for Test Person"}));
+        let (_, recs) = trail(input, &ctx(), false);
+        assert_eq!(recs[0]["event"], "rejected");
+        assert_eq!(recs[0]["step"], "s5");
+        assert_eq!(recs[0]["shown"], Value::Null);
     }
 
     #[test]

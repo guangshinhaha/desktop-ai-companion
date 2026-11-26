@@ -7,9 +7,12 @@ import Foundation
 /// length-prefixed fields with a presence byte. A fixture made by that store is checked in the tests, so
 /// the two implementations cannot drift apart unnoticed.
 ///
-/// What this proves: no record was edited, removed or inserted since it was written, unless the person
-/// also recomputed every later hash and the control line, which needs the store's key. A central copy
-/// (#29) is what covers that case.
+/// What this proves: only that the export is consistent with itself. The hashes use no secret and the export
+/// is plain text, so anyone who holds it can edit or drop records, or cut its tail, then recompute the hashes,
+/// rewrite the control line and pass. No store key is needed. A pass does not show that the export matches
+/// what was written. The live store has limits too (decision 0007): a key holder can rewrite the trail, and
+/// someone with access to its files can restore an older copy or delete it. The off-device anchor is the
+/// central copy (#29), which is not built; records changed before their first sync are outside what it can show.
 public enum AuditVerifier {
     public enum Verdict: Equatable {
         case ok(records: Int)
@@ -37,8 +40,10 @@ public enum AuditVerifier {
                   let prev = r["prev_hash"] as? String, let hash = r["hash"] as? String else {
                 return .unreadable("record \(count + 1) is not a complete audit record")
             }
-            // Nothing may be added, and no key may appear twice (readers disagree on which one wins).
-            if Set(r.keys).isSubset(of: knownKeys) == false || knownKeys.contains(where: { line.components(separatedBy: "\"\($0)\":").count > 2 }) {
+            // Nothing may be added, and no key may appear twice (readers disagree on which one wins). The count
+            // must match the parsed record's, so a key the scan reads differently from the parser fails too.
+            let keys = topLevelKeys(line)
+            if !Set(r.keys).isSubset(of: knownKeys) || keys.count != r.count || Set(keys) != Set(r.keys) {
                 return .broken(seq: seq, why: "record \(seq) was edited")
             }
             // A field of the wrong type must not read as "absent": that would let an edit hide.
@@ -77,6 +82,37 @@ public enum AuditVerifier {
         put(task); put(run); put(step); put(shown)
         put(item.map { String($0) })
         return h.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The names of the top-level keys of a line that has parsed as a JSON object, escapes decoded, repeats
+    /// kept. A string is a key when a colon follows it, after any JSON whitespace.
+    static func topLevelKeys(_ line: String) -> [String] {
+        let b = Array(line.utf8)
+        var keys: [String] = []
+        var depth = 0
+        var i = 0
+        while i < b.count {
+            switch b[i] {
+            case UInt8(ascii: "{"), UInt8(ascii: "["): depth += 1
+            case UInt8(ascii: "}"), UInt8(ascii: "]"): depth -= 1
+            case UInt8(ascii: "\""):
+                var end = i + 1
+                while end < b.count, b[end] != UInt8(ascii: "\"") { end += b[end] == UInt8(ascii: "\\") ? 2 : 1 }
+                guard end < b.count else { return keys }
+                if depth == 1 {
+                    var next = end + 1
+                    while next < b.count, [0x20, 0x09, 0x0A, 0x0D].contains(b[next]) { next += 1 }
+                    if next < b.count, b[next] == UInt8(ascii: ":"),
+                       let name = (try? JSONSerialization.jsonObject(with: Data(b[i...end]), options: .fragmentsAllowed)) as? String {
+                        keys.append(name)
+                    }
+                }
+                i = end
+            default: break
+            }
+            i += 1
+        }
+        return keys
     }
 
     private static let knownKeys: Set<String> = ["seq", "at", "officer", "event", "task", "run", "item", "step", "shown", "prev_hash", "hash"]

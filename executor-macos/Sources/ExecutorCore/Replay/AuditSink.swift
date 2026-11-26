@@ -16,7 +16,8 @@ public enum AuditEventKind: String, CaseIterable {
 }
 
 /// One thing to record. `shown` holds what the officer was shown, with the values they approved
-/// (decision 0005); it travels to the shell's encrypted store and nowhere else.
+/// (decision 0005); it travels to the shell and nowhere else. For `approved` the shell stores its own copy
+/// of the card instead, and for `rejected` it stores no `shown` (#107).
 public struct AuditEvent {
     public var kind: AuditEventKind
     public var step: String?

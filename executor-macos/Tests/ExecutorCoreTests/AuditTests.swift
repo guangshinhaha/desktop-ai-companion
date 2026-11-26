@@ -65,6 +65,49 @@ final class AuditVerifierTests: XCTestCase {
         }
     }
 
+    func testARepeatedKeyIsFoundHoweverItIsWritten() throws {
+        // Each repeat is a second `shown`: with a space, tab, return or newline before the colon, or with
+        // a letter of the name written as a JSON escape.
+        let names = ["\"shown\" :", "\"shown\"\t:", "\"shown\"\r:", "\"shown\"\n:", "\"\\u0073hown\":", "\"show\\u006E\" :"]
+        for name in names {
+            // Before the real one and after it: a reader may keep either.
+            for first in [true, false] {
+                var l = try fixture()
+                let extra = name + "\"Someone Else\""
+                l[2] = first ? "{" + extra + "," + String(l[2].dropFirst()) : String(l[2].dropLast()) + "," + extra + "}"
+                // Whichever copy the parser keeps, the record must be refused for the repeat itself.
+                XCTAssertEqual(AuditVerifier.verify(lines: l), .broken(seq: 2, why: "record 2 was edited"), "\(name) first=\(first)")
+            }
+        }
+    }
+
+    func testARepeatThatDoesNotChangeTheHashIsStillRefused() throws {
+        // The repeat holds the true value, so every hash still matches: only the key check can see it.
+        let shown = "\"Create a staff account for Test Person (test.person@example.test), Teacher at Test School\""
+        for name in ["\"shown\" :", "\"shown\"\n:", "\"\\u0073hown\":"] {
+            var l = try fixture()
+            XCTAssertTrue(l[2].contains(shown))
+            l[2] = String(l[2].dropLast()) + "," + name + shown + "}"
+            XCTAssertEqual(AuditVerifier.verify(lines: l), .broken(seq: 2, why: "record 2 was edited"), name)
+        }
+    }
+
+    func testAKeyNameInsideAValueIsNotARepeat() throws {
+        // The fixture's own quoted text, and a key-like string in a value, must not count as keys.
+        XCTAssertEqual(AuditVerifier.topLevelKeys(#"{"a":"\"a\" : 1","b" : ["a",{"a":1}],"c":"x\\"}"#), ["a", "b", "c"])
+    }
+
+    func testDeletingAMiddleRecordAndRenumberingFails() throws {
+        // `seq` is not hashed, so only the `prev_hash` link can see this edit.
+        var l = try fixture()
+        l.remove(at: 3)
+        for (line, from, to) in [(3, "\"seq\":4", "\"seq\":3"), (4, "\"seq\":5", "\"seq\":4"), (0, "\"head_seq\":5", "\"head_seq\":4")] {
+            XCTAssertTrue(l[line].contains(from), from)
+            l[line] = l[line].replacingOccurrences(of: from, with: to)
+        }
+        XCTAssertEqual(AuditVerifier.verify(lines: l), .broken(seq: 3, why: "record 3 does not follow the one before it"))
+    }
+
     func testARemovedRecordFailsAndNamesTheMissingSeq() throws {
         let f = try fixture()
         for (drop, named) in [(1, 1), (3, 3), (5, 5)] as [(Int, Int64)] {
@@ -89,10 +132,10 @@ final class AuditVerifierTests: XCTestCase {
     }
 }
 
-final class ApprovalFilePolicyTests: XCTestCase {
-    func testAReleaseBuildRefusesTheApprovalFile() {
-        XCTAssertNotNil(ApprovalFilePolicy.refusal(debugBuild: false))
-        XCTAssertNil(ApprovalFilePolicy.refusal(debugBuild: true), "the harness runs a debug build")
+final class TerminalReplayPolicyTests: XCTestCase {
+    func testAReleaseBuildRefusesTerminalReplay() {
+        XCTAssertNotNil(TerminalReplayPolicy.refusal(debugBuild: false))
+        XCTAssertNil(TerminalReplayPolicy.refusal(debugBuild: true), "the harness runs a debug build")
     }
 }
 
@@ -226,7 +269,8 @@ final class ReplayAuditTests: XCTestCase {
     func testNoRunValueReachesAnyRecordExceptTheApprovedCard() throws {
         let a = RecordingAudit(), h = host()
         _ = try run(["n"], audit: a, host: h)
-        // A rejected card is shown to the officer and kept (decision 0005); the other events never carry values.
+        // The executor sends the card with both answers; the shell keeps its own copy for a yes and none for a no.
+        // The other events never carry values.
         for e in a.events where e.kind != .rejected && e.kind != .approved {
             XCTAssertFalse((e.shown ?? "").contains("Aiden"))
         }

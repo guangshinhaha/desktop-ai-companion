@@ -1,14 +1,16 @@
 import ExecutorCore
 import Foundation
 
+// Test builds only: see TerminalReplayPolicy.
 // executor-macos replay <task.json> --inputs <file> [--pid <n>] [--approval-file <file>] [--ceiling <seconds>]
 // Exit codes: 0 finished, 1 usage or error, 2 diverged or refused, 4 not approved.
 
 let replayUsage = """
 usage: executor-macos replay <task.json> --inputs <file> [--pid <n>] [--approval-file <file>] [--ceiling <seconds>]
+Test builds only: nothing is written to the audit trail, so a release build refuses it (exit 2). Run tasks from the shell.
   --inputs         JSON object of input name to value for this run (read once, never written anywhere)
   --pid            the one browser process to drive. Without it, more than one candidate stops the run as ambiguous
-  --approval-file  (test builds only; a release build refuses it) answer approvals from this file, one line per approval, instead of the terminal.
+  --approval-file  answer approvals from this file, one line per approval, instead of the terminal.
                    Plain file, yours, not writable by others. There is no flag that approves
   --ceiling        seconds a step may wait for its element and its checks (default 30)
 Before any step that may commit, the run prints what it will do and waits for y. Anything else stops it.
@@ -27,6 +29,7 @@ func say(_ s: String) {
 }
 
 func runReplay(_ args: [String]) -> Never {
+    if let why = TerminalReplayPolicy.refusal() { replayFail(why, code: 2) }
     var taskPath: String?
     var inputsPath: String?
     var approvalPath: String?
@@ -57,7 +60,6 @@ func runReplay(_ args: [String]) -> Never {
         }
         i += 1
     }
-    if approvalPath != nil, let why = ApprovalFilePolicy.refusal() { replayFail(why, code: 2) }
     guard let taskPath else { replayFail("a task file is required\n\(replayUsage)") }
     guard let inputsPath else { replayFail("--inputs is required\n\(replayUsage)") }
 
