@@ -489,3 +489,97 @@ fn the_directory_is_private_and_the_files_are_owner_only() {
         assert_eq!(mode(&f), 0o600, "{}", f.display());
     }
 }
+
+/// Runs each job on its own thread with its own `Store` on one file, as the shell's commands do, all
+/// released together. Returns every error from every thread.
+type Job = Box<dyn FnOnce(&mut Store) -> Vec<String> + Send>;
+
+fn race(dir: &Path, jobs: Vec<Job>) -> Vec<String> {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(jobs.len()));
+    let handles: Vec<_> = jobs
+        .into_iter()
+        .map(|job| {
+            let mut s = open(dir);
+            let b = barrier.clone();
+            std::thread::spawn(move || {
+                b.wait();
+                job(&mut s)
+            })
+        })
+        .collect();
+    handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+}
+
+#[test]
+fn concurrent_audit_appends_all_succeed() {
+    guarded(120, || {
+        let d = tmp("race-audit");
+        drop(open(&d));
+        let jobs = (0..4)
+            .map(|_| -> Job {
+                Box::new(|s| (0..50).filter_map(|i| s.append_audit(&entry(i, "a")).err().map(|e| e.to_string())).collect())
+            })
+            .collect();
+        let errors = race(&d, jobs);
+        assert!(errors.is_empty(), "{} errors, first: {}", errors.len(), errors[0]);
+        let s = open(&d);
+        assert_eq!(s.audit_count().unwrap(), 200);
+        s.verify_audit().unwrap();
+    });
+}
+
+#[test]
+fn concurrent_saves_of_one_task_get_every_version_once() {
+    guarded(120, || {
+        let d = tmp("race-save");
+        drop(open(&d));
+        let jobs = (0..4)
+            .map(|_| -> Job {
+                Box::new(|s| (0..25).filter_map(|i| s.save_task("t", "n", "{}", i).err().map(|e| e.to_string())).collect())
+            })
+            .collect();
+        let errors = race(&d, jobs);
+        assert!(errors.is_empty(), "{} errors, first: {}", errors.len(), errors[0]);
+        assert_eq!(open(&d).task_versions("t").unwrap(), (1..=100).collect::<Vec<i64>>());
+    });
+}
+
+#[test]
+fn audited_saves_and_replay_outcomes_succeed_while_a_purge_runs() {
+    guarded(120, || {
+        const N: i64 = 50;
+        let d = tmp("race-purge");
+        {
+            let mut s = open(&d);
+            s.save_task("seed", "n", "{}", 1).unwrap();
+            for _ in 0..20 {
+                s.append_audit(&entry(1, "old")).unwrap();
+            }
+        }
+        let writer: Job = Box::new(|s| {
+            let mut errors = Vec::new();
+            for i in 0..N {
+                if let Err(e) = s.save_task_audited("t", "n", "officer-1", 1, |_| Ok("{}".into())) {
+                    errors.push(format!("save_task_audited: {e}"));
+                }
+                let done = ["s1".to_string()];
+                if let Err(e) = s.record_replay_outcome("seed", 1, "finished", None, false, &done, i) {
+                    errors.push(format!("record_replay_outcome: {e}"));
+                }
+            }
+            errors
+        });
+        // `now` moves on each pass, so the last purge's own record is old enough to go next time.
+        let purger: Job = Box::new(|s| {
+            (1..=N)
+                .filter_map(|i| s.purge_expired(i * 10 * DAY, 1).err().map(|e| format!("purge_expired: {e}")))
+                .collect()
+        });
+        let errors = race(&d, vec![writer, purger]);
+        assert!(errors.is_empty(), "{} errors, first: {}", errors.len(), errors[0]);
+        let s = open(&d);
+        assert_eq!(s.task_versions("t").unwrap(), (1..=N).collect::<Vec<i64>>());
+        assert_eq!(s.version_states("seed").unwrap()[0].state, "verified");
+        s.verify_audit().unwrap();
+    });
+}
