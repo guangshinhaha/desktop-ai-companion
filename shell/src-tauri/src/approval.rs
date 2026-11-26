@@ -311,7 +311,8 @@ pub struct Hooks<'a> {
 }
 
 /// Records a stop the executor could not record, because the officer stopped the run and the executor had
-/// to be ended: `run_stopped` (if the executor had not written it) and `run_finished`. Step ids only.
+/// to be ended: `run_stopped` (if the executor had not written it) and `run_finished`. Both name the list row
+/// and the step in flight, when there is one. Step ids only.
 pub fn record_forced_stop(
     store: &mut Store,
     ctx: &RunContext,
@@ -350,8 +351,8 @@ pub fn record_forced_stop(
             event,
             task: Some(&ctx.task_ref),
             run: Some(&ctx.run),
-            item: None,
-            step: None,
+            item: ctx.item,
+            step: flying,
             shown: Some(text),
         };
         store.append_event(&e).map_err(|_| "the stop could not be written to the audit trail".to_string())?;

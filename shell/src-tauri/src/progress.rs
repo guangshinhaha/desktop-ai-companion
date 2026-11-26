@@ -423,6 +423,22 @@ mod tests {
             { "id": "s3", "say": "Press Create account" } ] })
     }
 
+    #[test]
+    fn a_stop_pressed_before_the_controls_arrive_is_sent_when_they_are_attached() {
+        let h = RunHandle {
+            writer: SharedWriter::new(Vec::<u8>::new()),
+            stop_asked: Arc::default(),
+            ended: Arc::default(),
+            kill: Arc::new(|| {}),
+            grace: Duration::ZERO,
+        };
+        let mut run = ActiveRun::new(Progress::new("run_1", &task()));
+        run.stop();
+        assert!(!h.stop_asked(), "nothing to tell yet");
+        run.attach(h.clone());
+        assert!(h.stop_asked());
+    }
+
     fn ev(state: &str, step: &str, i: i64) -> Value {
         json!({ "state": state, "step": step, "say": format!("say {step}"), "index": i, "total": 3 })
     }
