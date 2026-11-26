@@ -300,6 +300,40 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_column_name_is_refused_by_position_never_by_value() {
+        // The officer wrongly ticked "the first row holds column names", so that row is a person's details.
+        let e = parse(b"x,Ann Test,y,Ann Test\n1,2,3,4\n").unwrap_err();
+        assert!(e.contains("columns 2 and 4"), "{e}");
+        assert!(!e.contains("Ann"), "{e}");
+    }
+
+    #[test]
+    fn the_preview_pairs_identical_whole_rows_by_number_and_holds_no_cell() {
+        // Rows 3 and 4 repeat rows 1 and 2 once trimmed. Row 5 differs from row 1 in a column the task does not use.
+        let c = parse(b"full_name,note\nAnn Test,a\nBo Test,b\n Ann Test ,\"a\"\nBo Test,b\nAnn Test,z\nAnn Test,a\n").unwrap();
+        let task = json!({"inputs":[{"name":"full_name","type":"text"}]});
+        let p = preview(&c, &task, true);
+        assert_eq!(p["duplicate_rows"], json!({"pairs": [[1, 3], [2, 4], [1, 6]], "total": 3}));
+        assert!(!p.to_string().contains("Ann") && !p.to_string().contains("Bo Test"));
+        // With no header the first row is data and is compared like any other.
+        let c = super::parse(b"Ann Test\nAnn Test\n", false).unwrap();
+        let p = preview(&c, &task, false);
+        assert_eq!(p["duplicate_rows"], json!({"pairs": [[1, 2]], "total": 1}));
+        assert!(!p.to_string().contains("Ann"));
+    }
+
+    #[test]
+    fn the_preview_lists_at_most_20_pairs_and_counts_them_all() {
+        let c = parse(format!("a\n{}", "x\n".repeat(26)).as_bytes()).unwrap();
+        let d = preview(&c, &json!({}), true)["duplicate_rows"].clone();
+        assert_eq!(d["pairs"].as_array().unwrap().len(), 20);
+        assert_eq!(d["pairs"][19], json!([1, 21]));
+        assert_eq!(d["total"], 25);
+        let none = parse(b"a,b\n1,2\n1,3\n").unwrap();
+        assert_eq!(preview(&none, &json!({}), true)["duplicate_rows"], json!({"pairs": [], "total": 0}));
+    }
+
+    #[test]
     fn size_and_row_limits_hold() {
         let mut big = String::from("a\n");
         for _ in 0..(MAX_ROWS + 1) {
