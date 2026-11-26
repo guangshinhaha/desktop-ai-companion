@@ -11,6 +11,7 @@ pub const MAX_ROWS: usize = 5000;
 pub const MAX_COLUMNS: usize = 64;
 /// Same as the executor's `RunInputs.maxValueLength`: a longer value would be refused there anyway.
 pub const MAX_VALUE_CHARS: usize = 256;
+const MAX_DUPLICATE_PAIRS: usize = 20;
 
 #[derive(Debug, PartialEq)]
 pub struct Csv {
@@ -138,9 +139,12 @@ pub fn parse(bytes: &[u8], has_header: bool) -> Result<Csv, String> {
         if h.iter().any(bad) {
             return Err("a column name holds a control or hidden character".into());
         }
-        let mut seen = std::collections::BTreeSet::new();
-        if let Some(d) = h.iter().find(|h| !seen.insert(h.as_str())) {
-            return Err(format!("two columns are both called \"{d}\""));
+        // By position: if the box was ticked wrongly, a "name" is a cell.
+        let mut seen = BTreeMap::new();
+        for (i, name) in h.iter().enumerate() {
+            if let Some(first) = seen.insert(name.as_str(), i) {
+                return Err(format!("columns {} and {} have the same name", first + 1, i + 1));
+            }
         }
         h
     } else {
@@ -198,6 +202,40 @@ pub fn suggest_mapping(header: &[String], inputs: &[InputSpec]) -> BTreeMap<Stri
         .filter(|i| header.iter().any(|h| h == &i.name))
         .map(|i| (i.name.clone(), i.name.clone()))
         .collect()
+}
+
+/// What the list run screen may know before Start: column names, counts and row numbers, never a data cell.
+pub fn preview(file: &Csv, task: &Value, header: bool) -> Value {
+    let inputs = task_inputs(task);
+    let names: Vec<&String> = inputs.iter().map(|i| &i.name).collect();
+    // A step that is not marked "no" is asked about. None means every row runs with no card.
+    let asked = task["steps"].as_array().map_or(0, |s| s.iter().filter(|x| x["consequential"] != "no").count());
+    let (pairs, total) = duplicate_rows(file);
+    json!({
+        "columns": file.header,
+        "rows": file.rows.len(),
+        "inputs": names,
+        "suggested": if header { suggest_mapping(&file.header, &inputs) } else { Default::default() },
+        "approval_steps": asked,
+        "duplicate_rows": { "pairs": pairs, "total": total },
+    })
+}
+
+/// Rows whose every cell matches an earlier row, as (first such row, this row), numbered from 1 as in the run.
+/// The first `MAX_DUPLICATE_PAIRS` pairs, and how many there are in all.
+fn duplicate_rows(csv: &Csv) -> (Vec<(usize, usize)>, usize) {
+    let mut first = std::collections::HashMap::new();
+    let (mut pairs, mut total) = (Vec::new(), 0);
+    for (i, row) in csv.rows.iter().enumerate() {
+        let earlier = *first.entry(row).or_insert(i + 1);
+        if earlier != i + 1 {
+            total += 1;
+            if pairs.len() < MAX_DUPLICATE_PAIRS {
+                pairs.push((earlier, i + 1));
+            }
+        }
+    }
+    (pairs, total)
 }
 
 /// One value that cannot be typed. Names the row and the input, never the value.
