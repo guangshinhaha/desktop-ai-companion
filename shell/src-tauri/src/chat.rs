@@ -153,14 +153,20 @@ impl Service for HttpService {
             .max_redirects(0)
             .build()
             .into();
-        let resp = agent
+        let mut resp = agent
             .post(&self.endpoint("chat"))
             .header("content-type", "application/json")
             .send(body.to_string().as_bytes())
             .map_err(|_| SendError::Unreachable)?;
         match resp.status().as_u16() {
             200 => {}
-            403 => return Err(SendError::AboveCeiling),
+            // Only the ceiling refusal may suggest the classification. The service also answers 403
+            // for other reasons (an `Origin` header), and any proxy can.
+            403 => {
+                let text = resp.body_mut().with_config().limit(64 * 1024).read_to_string().unwrap_or_default();
+                let ceiling = serde_json::from_str::<Value>(&text).is_ok_and(|v| v["error"] == "above_ceiling");
+                return Err(if ceiling { SendError::AboveCeiling } else { SendError::Unreachable });
+            }
             413 => return Err(SendError::TooLong),
             400 => return Err(SendError::BadMessages),
             408 | 502 | 504 => return Err(SendError::ReplyFailed),

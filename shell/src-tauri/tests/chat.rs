@@ -217,6 +217,16 @@ fn http_403_is_the_ceiling_refusal_and_other_statuses_are_plain_failures() {
 }
 
 #[test]
+fn a_403_that_is_not_the_ceiling_refusal_never_suggests_reclassifying() {
+    for body in ["{\"error\":\"origin_not_allowed\"}", "not json", ""] {
+        let (url, h) = serve(403, body);
+        let e = HttpService::new(&url).unwrap().chat(&json!({}), &mut |_| {}).unwrap_err();
+        h.join().unwrap();
+        assert_eq!(e, SendError::Unreachable, "body {body:?}");
+    }
+}
+
+#[test]
 fn an_unreachable_service_is_a_plain_failure() {
     // Port 9 (discard) on this machine; nothing listens.
     let e = HttpService::new("http://127.0.0.1:9").unwrap().chat(&json!({}), &mut |_| {}).unwrap_err();
