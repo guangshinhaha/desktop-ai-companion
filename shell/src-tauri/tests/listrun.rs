@@ -89,6 +89,7 @@ struct Fixture {
 fn task_body() -> Value {
     json!({
         "name": "Provision a staff account (stand-in)",
+        "steps": [{"id":"s4","action":"press","target":{"role":"AXButton","label":"Create account"},"consequential":"yes"}],
         "inputs": [
             {"name":"full_name","type":"text"}, {"name":"email","type":"text"},
             {"name":"school","type":"text"}, {"name":"role","type":"text"}

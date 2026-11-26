@@ -547,7 +547,8 @@ impl Drop for ActiveGuard {
     }
 }
 
-fn claim_listrun(app: &AppHandle, run: &str) -> Result<(ActiveGuard, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<Mutex<Option<String>>>), String> {
+/// `_gate`: no slot is claimed for a task that may not run over a list (#113).
+fn claim_listrun(app: &AppHandle, run: &str, _gate: listrun::AsksApproval) -> Result<(ActiveGuard, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<Mutex<Option<String>>>), String> {
     use std::sync::{atomic::AtomicBool, Arc};
     if run_ui::is_live(app) {
         return Err("a replay is running; wait for it to end".into());
@@ -674,10 +675,11 @@ async fn listrun_start(
         return Err("the officer's name is needed".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        // The slot first: a start that cannot go leaves no run behind.
-        let new_run = run_id();
-        let (guard, stop, end_by) = claim_listrun(&app, &new_run)?;
         let mut store = open_store()?;
+        let gate = listrun::require_approval_step(&store, &task_id, version)?;
+        // The slot before the run is made: a start that cannot go leaves no run behind.
+        let new_run = run_id();
+        let (guard, stop, end_by) = claim_listrun(&app, &new_run, gate)?;
         let inputs = csv::task_inputs(&saved_task(&store, &task_id, version)?);
         let loaded = listrun::start_or_resume(&mut store, std::path::Path::new(&path), &task_id, version, &inputs, header, &mapping, &new_run, now_secs())?;
         if let Ok(mut s) = app.state::<Session>().listrun.lock() {
@@ -710,8 +712,9 @@ async fn listrun_resume(
         return Err("the officer's name is needed".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let (guard, stop, end_by) = claim_listrun(&app, &run)?;
         let store = open_store()?;
+        let gate = listrun::require_approval_step_of_run(&store, &run)?;
+        let (guard, stop, end_by) = claim_listrun(&app, &run, gate)?;
         let (task_id, version, _, _) = store.run_info(&run).map_err(|e| e.to_string())?.ok_or("no such run")?;
         let inputs = csv::task_inputs(&saved_task(&store, &task_id, version)?);
         let rows = listrun::rows_for_run(&store, &run, std::path::Path::new(&path), &inputs)?;

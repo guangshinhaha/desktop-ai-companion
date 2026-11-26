@@ -128,7 +128,8 @@ impl Flow {
 }
 
 fn task() -> Value {
-    json!({ "name": SEEDS[4], "steps": [{ "id": "s1", "say": SEEDS[5] }] })
+    json!({ "name": SEEDS[4], "steps": [{ "id": "s1", "say": SEEDS[5],
+        "action": "press", "target": { "role": "AXButton" }, "consequential": "yes" }] })
 }
 
 fn loaded(resumed: bool) -> Loaded {

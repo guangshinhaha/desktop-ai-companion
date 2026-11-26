@@ -208,15 +208,13 @@ pub fn suggest_mapping(header: &[String], inputs: &[InputSpec]) -> BTreeMap<Stri
 pub fn preview(file: &Csv, task: &Value, header: bool) -> Value {
     let inputs = task_inputs(task);
     let names: Vec<&String> = inputs.iter().map(|i| &i.name).collect();
-    // A step that is not marked "no" is asked about. None means every row runs with no card.
-    let asked = task["steps"].as_array().map_or(0, |s| s.iter().filter(|x| x["consequential"] != "no").count());
     let (pairs, total) = duplicate_rows(file);
     json!({
         "columns": file.header,
         "rows": file.rows.len(),
         "inputs": names,
         "suggested": if header { suggest_mapping(&file.header, &inputs) } else { Default::default() },
-        "approval_steps": asked,
+        "approval_steps": crate::listrun::approval_steps(task),
         "duplicate_rows": { "pairs": pairs, "total": total },
     })
 }

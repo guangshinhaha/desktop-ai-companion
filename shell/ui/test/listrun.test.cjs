@@ -128,15 +128,33 @@ test("the first row is not taken as column names until the officer says so", asy
   assert.ok(mount);
 });
 
-test("a run error and a task with no approval step are shown", async () => {
+test("a run error is shown", async () => {
   const { ui, mount } = setup({ run: "run_1", status: "stopped", error: "the executor ended", active: false, items: [{ item: 1, state: "pending" }] });
   ui.state.run = "run_1";
   await ui.refresh();
   assert.match(role(mount, "run-error")[0].textContent, /executor ended/);
-  const b = setup({ items: [] });
-  b.ui.state.preview = { columns: ["A"], rows: 1, inputs: ["x"], suggested: {}, approval_steps: 0 };
-  b.ui.draw();
-  assert.equal(role(b.mount, "no-approval").length, 1);
+});
+
+test("a task with no approval step cannot be started, and the screen says why", async () => {
+  for (const approval_steps of [0, undefined]) {
+    const { ui, mount, calls } = setup({ items: [] });
+    ui.state.preview = { columns: ["A"], rows: 1, inputs: ["x"], suggested: {}, approval_steps };
+    ui.draw();
+    assert.match(role(mount, "no-approval")[0].textContent, /cannot run over a list: it has no step that asks for approval/);
+    assert.equal(role(mount, "start")[0].disabled, true);
+    await role(mount, "start")[0].click();
+    assert.equal(calls.filter((c) => c[0] === "listrun_start").length, 0);
+  }
+});
+
+test("a task with an approval step can be started", async () => {
+  const { ui, mount, calls } = setup({ run: "run_1", status: "running", items: [] });
+  ui.state.preview = { columns: ["A"], rows: 1, inputs: ["x"], suggested: {}, approval_steps: 1 };
+  ui.draw();
+  assert.equal(role(mount, "no-approval").length, 0);
+  assert.equal(role(mount, "start")[0].disabled, false);
+  await role(mount, "start")[0].click();
+  assert.equal(calls.filter((c) => c[0] === "listrun_start").length, 1);
 });
 
 test("identical rows are warned about by row number, and Start stays enabled", async () => {
