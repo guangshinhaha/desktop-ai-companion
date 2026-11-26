@@ -240,3 +240,38 @@ done"#,
     assert!(!asked, "the officer was never asked: the run was stopped");
     assert!(std::fs::read_to_string(&reply).unwrap().contains(r#""approved":false"#));
 }
+
+#[test]
+fn approved_after_the_stop_guard_declined_is_refused_and_writes_nothing() {
+    let dir = tmp("stale-approved");
+    let reply = dir.join("reply.log");
+    // Asks for approval after the stop, then records `approved` although the shell said no.
+    let bin = script(
+        &dir,
+        &format!(
+            r#"read -r start
+{STARTED}
+sleep 0.3
+echo '{{"jsonrpc":"2.0","id":"x1","method":"approval.request","params":{{"card":{{"step":"s2"}}}}}}'
+while read -r line; do
+  case "$line" in
+    *'"id":"x1"'*) echo '{{"jsonrpc":"2.0","id":"x2","method":"audit.append","params":{{"event":"approved","step":"s2","shown":"synthetic"}}}}';;
+    *'"id":"x2"'*) echo "$line" > '{reply}'
+      echo '{{"jsonrpc":"2.0","id":1,"result":{{"outcome":"stopped","step":"s2","action_done":false,"completed":[],"not_run":["s2"]}}}}'
+      exit 0;;
+  esac
+done"#,
+            reply = reply.display()
+        ),
+    );
+    let mut store = open(&dir);
+    let handle: Arc<Mutex<Option<RunHandle>>> = Arc::default();
+    let (h2, h3) = (handle.clone(), handle.clone());
+    let mut on_start = move |h: RunHandle| *h2.lock().unwrap() = Some(h);
+    let mut on_progress = |_p: &Value| h3.lock().unwrap().clone().unwrap().stop();
+    let mut hooks = Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: Duration::from_secs(5) };
+    // The officer would say yes; the guard answers no without asking.
+    run_replay_with(&bin, &mut store, &ctx(), &task(), &json!({}), None, &mut |_| true, &mut hooks).unwrap();
+    assert!(std::fs::read_to_string(&reply).unwrap().contains(r#""error""#));
+    assert!(events(&store).is_empty());
+}

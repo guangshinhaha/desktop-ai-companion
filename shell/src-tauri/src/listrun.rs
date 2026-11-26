@@ -5,7 +5,8 @@
 //!     after that record is written (see `approval::ItemObserver`). Only a row that is `awaiting_approval` can
 //!     become `committing`, and only once: a second observer finds it `committing` and is refused.
 //!  2. A row found `committing` when a run is picked up again is `unknown`, never retried by the shell. So is a
-//!     row whose later step failed after an earlier step of the same row acted.
+//!     row whose later step failed after an earlier step of the same row acted. So is a row whose executor sent
+//!     an `approved` the officer never gave (#112): it may have acted anyway, however the run then ends.
 //!  3. A run will not continue while any row is `unknown` or `diverged`. Only the officer clears one, by saying
 //!     what happened in the target app, and that is written to the audit trail.
 //!  4. Every state change is a compare-and-set in the store, so a second caller cannot take a row the first holds.
@@ -122,6 +123,11 @@ impl ItemObserver for Row<'_> {
         self.fresh = moved;
         moved
     }
+    fn approval_refused(&mut self, store: &mut Store) {
+        // Saved at once, so the row stays `unknown` however the run ends, a crash of the shell included.
+        // No later approval is accepted for it either: an `unknown` row cannot begin to commit.
+        let _ = store.move_run_item(self.run, self.item, &[RUNNING, AWAITING, COMMITTING], UNKNOWN, None);
+    }
     fn commit_aborted(&mut self, store: &mut Store) {
         // The record was refused, so the executor will not act on THIS approval. If it is the row's first
         // approval nothing has been done for the row and it goes back. If an earlier step already acted, the
@@ -236,6 +242,10 @@ enum Settled {
 fn settle(store: &mut Store, run: &str, item: i64, result: &Result<Value, String>) -> Result<Settled, String> {
     let outcome = result.as_ref().ok().and_then(|r| r["outcome"].as_str());
     let committed = |store: &Store| db(store.item_state(run, item)).map(|s| s.as_deref() == Some(COMMITTING));
+    // Already `unknown`: an `approval_refused`. Nothing the executor reports changes that.
+    if db(store.item_state(run, item))?.as_deref() == Some(UNKNOWN) {
+        return Ok(Settled::Halt(UNKNOWN.into()));
+    }
     match outcome {
         Some("finished") => {
             if db(store.move_run_item(run, item, &[COMMITTING, RUNNING], DONE, None))? {
@@ -856,6 +866,24 @@ mod tests {
         p.from = Some(1);
         let out = run_rows(&mut s, &p, &mut |_, _, _, _| panic!("must not run")).unwrap();
         assert_eq!(out, Outcome::Blocked { unknown: vec![1], diverged: vec![] });
+    }
+
+    #[test]
+    fn a_refused_approval_after_a_real_one_ends_the_row_unknown_even_when_reported_finished() {
+        let mut s = store();
+        let rows = vec![json!({}); 3];
+        let never = || false;
+        let out = run_rows(&mut s, &params(&rows[..3], &never), &mut |st, _, _, obs| {
+            obs.approval_asked(st);
+            assert!(obs.commit_begins(st)); // step 1: a real yes, recorded
+            obs.approval_asked(st); // step 2: the officer says no
+            obs.approval_refused(st); // ... and the executor records approved anyway
+            assert!(!obs.commit_begins(st), "nothing more is accepted for the row");
+            Ok(json!({"outcome":"finished"}))
+        })
+        .unwrap();
+        assert_eq!(out, Outcome::Stopped { item: 1, state: UNKNOWN.into() });
+        assert_eq!(states(&s)[0], UNKNOWN);
     }
 
     #[test]

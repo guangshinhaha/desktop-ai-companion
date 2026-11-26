@@ -291,6 +291,53 @@ fn the_trail_carries_the_row_numbers_and_the_officers_marks_and_verifies() {
     assert!(!mark["shown"].as_str().unwrap().contains("@"), "the mark names a row, not a person");
 }
 
+#[test]
+fn an_executor_that_ignores_a_no_cannot_get_the_row_recorded_as_approved() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("ignore-no");
+    let mut go = Go::new(&fx, &app.url);
+    go.fake = json!({"ignore_no": true});
+    go.reject = vec![1];
+
+    let (out, asked) = go.run();
+    let s = open(&fx.dir);
+    // It created the account anyway (the shell cannot stop that), so the officer has to look.
+    assert_eq!(states(&s)[0], "unknown", "neither done nor committing");
+    assert_eq!(asked, 1, "the run stops at that row");
+    assert_eq!(out, Outcome::Stopped { item: 1, state: "unknown".into() });
+    assert!(!s.export_audit().unwrap().contains(r#""event":"approved""#), "no approval the officer did not give");
+    s.verify_audit().unwrap();
+}
+
+#[test]
+fn a_row_with_a_refused_approval_is_never_left_retryable_however_the_executor_ends() {
+    let Some(app) = StandIn::start() else { return };
+    for (i, end) in ["died", "stopped", "not_approved", "diverged"].into_iter().enumerate() {
+        let fx = fixture(&format!("ignore-no-{end}"));
+        let before = app.log().len();
+        let mut go = Go::new(&fx, &app.url);
+        go.fake = match end {
+            "died" => json!({"ignore_no": true, "die": "after_post", "die_on": fx.rows[0]["full_name"]}),
+            _ => json!({"ignore_no": true, "ignore_no_end": end}),
+        };
+        go.reject = vec![1];
+
+        let (out, asked) = go.run();
+        assert_eq!(out, Outcome::Stopped { item: 1, state: "unknown".into() }, "{i} {end}");
+        assert_eq!(asked, 1, "{end}: the run stops at that row");
+        assert_eq!(states(&open(&fx.dir))[0], "unknown", "{end}");
+
+        // The officer tries again from that row with a healthy executor: blocked until they check the app.
+        let mut again = Go::new(&fx, &app.url);
+        again.from = Some(1);
+        let (out, asked) = again.run();
+        assert_eq!(out, Outcome::Blocked { unknown: vec![1], diverged: vec![] }, "{end}");
+        assert_eq!(asked, 0, "{end}");
+        assert_eq!(app.log().len(), before + 1, "{end}: created once");
+        open(&fx.dir).verify_audit().unwrap();
+    }
+}
+
 /// Makes the store refuse the `approved` record for one step, as a full disk or a locked file would.
 fn refuse_approved_for(dir: &Path, step: &str) {
     let conn = rusqlite::Connection::open(dir.join("s.db")).unwrap();

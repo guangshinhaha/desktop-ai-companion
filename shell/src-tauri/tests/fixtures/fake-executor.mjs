@@ -8,6 +8,10 @@
 //   die        "before_post" | "after_post": kill this process (SIGKILL) at that point for the row whose
 //              full_name is `die_on`. before_post is after `approved` is recorded, before anything is created.
 //   diverge_on a full_name: report a divergence before asking for approval, with nothing created.
+//   ignore_no  true: for the first card, record `approved` and create the account whatever the officer said,
+//              carrying on even when the record is refused. A broken executor, for the gate (#112).
+//   ignore_no_end  with ignore_no and after the account is created, end with this outcome instead of
+//              "finished". (`die: "after_post"` covers the executor that dies there.)
 //   steps      2: after the first account, a second consequential step (s5) creates "second.<email>", with its
 //              own approval card and its own `approved` record.
 import { createInterface } from "node:readline";
@@ -50,13 +54,14 @@ if (fake.diverge_on === inputs.full_name) {
 
 const shown = `Create a staff account for ${inputs.full_name} (${inputs.email}) with role ${inputs.role}`;
 const a = await ask("approval.request", { card: { step: "s4", task: task.name ?? "t", summary: shown } });
-if (a.result?.approved !== true) {
+if (a.result?.approved !== true && !fake.ignore_no) {
   // No values: what was declined is the step, not the person it was for (decision 0005).
   await must("rejected", { step: "s4", shown: "not approved" });
   await must("run_finished", { shown: "not_approved" });
   await finish({ outcome: "not_approved", step: "s4", completed: [], not_run: ["s4"] });
 }
-await must("approved", { step: "s4", shown });
+if (fake.ignore_no) await ask("audit.append", { event: "approved", step: "s4", shown });
+else await must("approved", { step: "s4", shown });
 const dies = fake.die && fake.die_on === inputs.full_name;
 if (dies && fake.die === "before_post") process.kill(process.pid, "SIGKILL");
 
@@ -67,6 +72,9 @@ if (!res.ok) {
   await must("step_diverged", { step: "s4", shown: "the app refused" });
   await must("run_finished", { shown: "diverged" });
   await finish({ outcome: "diverged", step: "s4", reason: "the app refused", completed: [], not_run: ["s4"] });
+}
+if (fake.ignore_no && fake.ignore_no_end) {
+  await finish({ outcome: fake.ignore_no_end, step: "s4", completed: [], not_run: ["s4"] });
 }
 if (fake.steps === 2) {
   const shown2 = `Create a second account for ${inputs.full_name} (second.${inputs.email})`;

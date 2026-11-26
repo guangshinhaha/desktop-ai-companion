@@ -8,6 +8,8 @@
 //!   service's answer object. Only a masked request (`values: "masked"`) goes: the shell never clears values.
 //!   No service, a refusal or a bad reply is an error, and the executor then asks the officer.
 //! The officer, the task reference, the run id and the time are the shell's: the executor cannot set them.
+//! An `approved` record is accepted only for the step of the card the officer last answered yes to, and each
+//! yes covers one record (#112).
 //! No answer is never a yes: if the executor ends, or the officer's window closes, the run stops.
 //! Nothing here logs, prints or puts a value in an error.
 
@@ -46,6 +48,9 @@ pub trait ItemObserver {
     fn commit_begins(&mut self, _store: &mut Store) -> bool {
         true
     }
+    /// The executor sent an `approved` the officer never gave. It cannot be trusted to have waited, so
+    /// nothing proves what it did.
+    fn approval_refused(&mut self, _store: &mut Store) {}
     /// The `approved` record could not be written, so the executor will not act.
     fn commit_aborted(&mut self, _store: &mut Store) {}
 }
@@ -144,6 +149,8 @@ pub fn drive_with<R: BufRead, W: Write>(
     obs: &mut dyn ItemObserver,
     recover: &mut dyn FnMut(&Value) -> Option<Value>,
 ) -> Result<Value, String> {
+    // The step of the last card, if the officer said yes to it and no `approved` record has used that yes.
+    let mut granted: Option<String> = None;
     for line in reader.lines() {
         let line = line.map_err(|_| "cannot read the executor's output".to_string())?;
         if line.trim().is_empty() {
@@ -187,6 +194,13 @@ pub fn drive_with<R: BufRead, W: Write>(
                     continue;
                 };
                 let begins_commit = event == "approved";
+                // `take`: one yes, one record. Refused before the row or the trail is touched.
+                if begins_commit && !granted.take().is_some_and(|g| step.as_deref() == Some(g.as_str())) {
+                    // Before the reply: the executor may be gone, and the mark must already be saved.
+                    obs.approval_refused(store);
+                    reply_err(writer, &id, -32000, "the officer has not approved this step")?;
+                    continue;
+                }
                 if begins_commit && !obs.commit_begins(store) {
                     reply_err(writer, &id, -32000, "the row could not be marked as committing")?;
                     continue;
@@ -217,6 +231,8 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
             }
             "approval.request" => {
+                // A new card ends any earlier yes, whatever becomes of this one.
+                granted = None;
                 let mut card = params["card"].clone();
                 if !card.is_object() {
                     reply(writer, &id, json!({ "approved": false }))?;
@@ -230,6 +246,9 @@ pub fn drive_with<R: BufRead, W: Write>(
                 }
                 obs.approval_asked(store);
                 let approved = decide(&card);
+                if approved {
+                    granted = card["step"].as_str().map(str::to_string);
+                }
                 reply(writer, &id, json!({ "approved": approved }))?;
             }
             "recover.request" => {
@@ -499,12 +518,14 @@ mod tests {
             line(json!({"jsonrpc":"2.0","id":id,"method":"audit.append","params":p}))
         };
         let input = mk("x1", "run_started", json!({}))
+            + &card_line("s5")
             + &mk("x2", "approved", json!({"step":"s5","shown":"Create a staff account for Test Person (test@example.test)"}))
             + &mk("x3", "run_finished", json!({"shown":"finished"}))
             + &line(json!({"jsonrpc":"2.0","id":1,"result":{"outcome":"finished"}}));
         let mut out = Vec::new();
-        drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1_700_000_000, &mut |_| false).unwrap();
-        let rs = replies(&out);
+        drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1_700_000_000, &mut |_| true).unwrap();
+        let mut rs = replies(&out);
+        assert_eq!(rs.remove(1)["result"]["approved"], true);
         assert_eq!(rs.iter().map(|r| r["result"]["seq"].as_i64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
         s.verify_audit().unwrap();
         let export = s.export_audit().unwrap();
@@ -609,6 +630,64 @@ mod tests {
         let r = replies(&out);
         assert!(r[0]["error"].is_object() && r[1]["error"].is_object());
         assert_eq!(s.audit_count().unwrap(), 0);
+    }
+
+    fn card_line(step: &str) -> String {
+        line(json!({"jsonrpc":"2.0","id":"c","method":"approval.request","params":{"card":{"step":step}}}))
+    }
+
+    fn approved_line(step: &str) -> String {
+        line(json!({"jsonrpc":"2.0","id":"a","method":"audit.append","params":{"event":"approved","step":step,"shown":"synthetic"}}))
+    }
+
+    #[derive(Default)]
+    struct Commits(u32);
+    impl ItemObserver for Commits {
+        fn commit_begins(&mut self, _store: &mut Store) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+
+    /// Drives `input`, answering the cards with `answers` in order. Returns the replies to the `approved`
+    /// records (true: accepted), the records written and how often the row was told a commit begins.
+    fn gate(input: String, answers: &[bool]) -> (Vec<bool>, i64, u32) {
+        let (mut s, _d) = store();
+        let mut out = Vec::new();
+        let mut answers = answers.iter();
+        let mut commits = Commits::default();
+        let input = input + &line(json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        drive_with(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1, &mut |_| *answers.next().unwrap(), &mut |_| {}, &mut Observed::default(), &mut commits, &mut |_| None).unwrap();
+        let accepted = replies(&out).iter().filter(|r| r["id"] == "a").map(|r| r.get("error").is_none()).collect();
+        (accepted, s.audit_count().unwrap() as i64, commits.0)
+    }
+
+    #[test]
+    fn approved_after_a_no_is_refused() {
+        assert_eq!(gate(card_line("s5") + &approved_line("s5"), &[false]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn approved_with_no_card_first_is_refused() {
+        assert_eq!(gate(approved_line("s5"), &[]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn approved_for_another_step_than_the_yes_is_refused() {
+        assert_eq!(gate(card_line("s4") + &approved_line("s5"), &[true]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn one_yes_covers_one_approved_record() {
+        assert_eq!(gate(card_line("s5") + &approved_line("s5") + &approved_line("s5"), &[true]), (vec![true, false], 1, 1));
+    }
+
+    #[test]
+    fn a_later_card_replaces_an_unused_yes() {
+        let no = card_line("s4") + &card_line("s5") + &approved_line("s4");
+        assert_eq!(gate(no, &[true, false]), (vec![false], 0, 0));
+        let not_a_card = line(json!({"jsonrpc":"2.0","id":"c2","method":"approval.request","params":{"card":"s4"}}));
+        assert_eq!(gate(card_line("s4") + &not_a_card + &approved_line("s4"), &[true]), (vec![false], 0, 0));
     }
 
     #[test]
