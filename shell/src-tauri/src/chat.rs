@@ -113,6 +113,15 @@ impl HttpService {
         url.into()
     }
 
+    /// Plain http is only ever this machine, so it connects directly: a proxy variable would carry
+    /// the request, in clear text, to wherever it points. https still follows the proxy settings.
+    fn proxy(&self) -> Option<ureq::Proxy> {
+        match self.base.scheme() {
+            "https" => ureq::Proxy::try_from_env(),
+            _ => None,
+        }
+    }
+
     pub fn from_env() -> Result<HttpService, SendError> {
         match std::env::var("COMPANION_SERVICE_URL") {
             Ok(u) if !u.is_empty() => HttpService::new(&u),
@@ -129,6 +138,7 @@ impl HttpService {
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_global(Some(Duration::from_secs(45)))
             .max_redirects(0)
+            .proxy(self.proxy())
             .build()
             .into();
         let mut resp = agent
@@ -151,6 +161,7 @@ impl Service for HttpService {
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .max_redirects(0)
+            .proxy(self.proxy())
             .build()
             .into();
         let mut resp = agent
