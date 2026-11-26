@@ -264,7 +264,7 @@ impl Store {
         Ok(store)
     }
 
-    /// Every transaction here that writes starts through this (`migrate` says `BEGIN IMMEDIATE` itself).
+    /// Every transaction here that writes starts through this (`migrate` only has `&self`, so it begins its own).
     /// It takes the write lock up front, so another writer waits out the busy timeout. A deferred
     /// transaction that reads and then writes gets `database is locked` at once instead (#104).
     fn write_tx(&mut self) -> Result<Transaction<'_>> {
@@ -273,13 +273,18 @@ impl Store {
 
     /// Versioned and idempotent: re-running changes nothing.
     fn migrate(&self) -> Result<()> {
-        let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if v >= SCHEMA_VERSION {
+        let version = || self.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
+        // The first read takes no lock, so opening an up-to-date store never waits on a writer.
+        if version()? >= SCHEMA_VERSION {
             return Ok(());
         }
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS tasks (
+        // Read again under the write lock: another first open may have migrated meanwhile.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if version()? >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks (
                id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL,
                body TEXT NOT NULL, saved_at INTEGER NOT NULL,
                PRIMARY KEY (id, version));
@@ -343,9 +348,9 @@ impl Store {
                BEGIN SELECT RAISE(ABORT, 'audit control row is guarded'); END;
              CREATE TRIGGER IF NOT EXISTS audit_meta_no_delete BEFORE DELETE ON audit_meta
                BEGIN SELECT RAISE(ABORT, 'audit control row is guarded'); END;
-             PRAGMA user_version = 1;
-             COMMIT;",
+             PRAGMA user_version = 1;",
         )?;
+        tx.commit()?;
         Ok(())
     }
 

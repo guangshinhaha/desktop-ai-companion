@@ -511,6 +511,34 @@ fn race(dir: &Path, jobs: Vec<Job>) -> Vec<String> {
 }
 
 #[test]
+fn concurrent_opens_of_an_unmigrated_store_all_succeed() {
+    guarded(120, || {
+        for round in 0..20 {
+            let d = tmp(&format!("race-open-{round}"));
+            // A non-empty encrypted file at schema version 0. Racing the creation of the file itself
+            // is a separate gap: the empty-file guard refuses the losers.
+            let raw = Connection::open(d.join("s.db")).unwrap();
+            raw.pragma_update(None, "key", format!("x'{}'", "01".repeat(32))).unwrap();
+            raw.execute_batch("CREATE TABLE seed (x); DROP TABLE seed;").unwrap();
+            drop(raw);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let (d, b) = (d.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        Store::open(&d.join("s.db"), &Fixed([1u8; 32])).err().map(|e| e.to_string())
+                    })
+                })
+                .collect();
+            let errors: Vec<String> = handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
+            assert!(errors.is_empty(), "round {round}: {errors:?}");
+            open(&d).verify_audit().unwrap();
+        }
+    });
+}
+
+#[test]
 fn concurrent_audit_appends_all_succeed() {
     guarded(120, || {
         let d = tmp("race-audit");
