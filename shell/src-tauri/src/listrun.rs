@@ -869,6 +869,24 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_approval_after_a_real_one_ends_the_row_unknown_even_when_reported_finished() {
+        let mut s = store();
+        let rows = vec![json!({}); 3];
+        let never = || false;
+        let out = run_rows(&mut s, &params(&rows[..3], &never), &mut |st, _, _, obs| {
+            obs.approval_asked(st);
+            assert!(obs.commit_begins(st)); // step 1: a real yes, recorded
+            obs.approval_asked(st); // step 2: the officer says no
+            obs.approval_refused(st); // ... and the executor records approved anyway
+            assert!(!obs.commit_begins(st), "nothing more is accepted for the row");
+            Ok(json!({"outcome":"finished"}))
+        })
+        .unwrap();
+        assert_eq!(out, Outcome::Stopped { item: 1, state: UNKNOWN.into() });
+        assert_eq!(states(&s)[0], UNKNOWN);
+    }
+
+    #[test]
     fn a_first_step_whose_record_fails_goes_back_and_ends_diverged_with_nothing_done() {
         let mut s = store();
         let rows = vec![json!({}); 1];
