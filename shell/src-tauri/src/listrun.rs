@@ -16,6 +16,8 @@
 //!  6. A task has one unfinished list run at a time (#108). A start with that run's version and file picks it
 //!     up; any other start is refused. Where a store already holds more than one, none starts or continues
 //!     until the officer has ended all but one.
+//!  7. A task with no step that asks for approval never starts or continues a list run (#113): its rows would
+//!     act without ever reaching `committing`.
 //!
 //! No cell value is stored in `runs` or `run_items`: the run keeps the file's fingerprint, row count, whether
 //! the first row is a header, and the column mapping, and a resume must be given the same file again. A value
@@ -63,6 +65,58 @@ fn db<T>(r: crate::store::Result<T>) -> Result<T, String> {
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// How many of the task's steps the executor asks approval for whatever is on screen: its
+/// `ReplayTask.Step.needsApproval` (ReplayTask.swift), without the commit-word label rule. So this can count
+/// fewer steps than the executor asks for, never more. A step this cannot read makes the count 0.
+pub fn approval_steps(task: &Value) -> usize {
+    let Some(steps) = task["steps"].as_array() else { return 0 };
+    let asks: Option<Vec<bool>> = steps.iter().map(step_asks).collect();
+    asks.map_or(0, |a| a.into_iter().filter(|x| *x).count())
+}
+
+/// `None` for a step the executor would not load.
+fn step_asks(step: &Value) -> Option<bool> {
+    let role = match step["target"].as_object()?.get("role") {
+        None => None,
+        Some(r) => Some(r.as_str().filter(|r| !r.is_empty())?),
+    };
+    let flagged = match step["consequential"].as_str()? {
+        "yes" | "unknown" => true,
+        "no" => false,
+        _ => return None,
+    };
+    let not_one_of = |roles: &[&str]| !role.is_some_and(|r| roles.contains(&r));
+    let by_action = match step["action"].as_str()? {
+        "press" => true,
+        "set_value" => not_one_of(&["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"]),
+        "select" => not_one_of(&["AXPopUpButton", "AXComboBox", "AXMenuButton"]),
+        _ => return None,
+    };
+    Some(flagged || by_action)
+}
+
+/// Proof that a saved task version may run over a list. Only `require_approval_step` makes one.
+#[derive(Debug)]
+pub struct AsksApproval(());
+
+/// Refuses a task version with no step that asks for approval. A saved version never changes, so the answer holds.
+pub fn require_approval_step(store: &Store, task_id: &str, version: i64) -> Result<AsksApproval, String> {
+    let body = db(store.task_body(task_id, version))?.ok_or("no such task version")?;
+    let task: Value = serde_json::from_str(&body).map_err(|_| "the saved task is not readable")?;
+    if approval_steps(&task) == 0 {
+        return Err("this task cannot run over a list: it has no step that asks for approval, or a step that \
+                    cannot be read, so rows could run without your approval."
+            .into());
+    }
+    Ok(AsksApproval(()))
+}
+
+/// `require_approval_step` for the task version a run was started with.
+pub fn require_approval_step_of_run(store: &Store, run: &str) -> Result<AsksApproval, String> {
+    let info = db(store.run_info(run))?.ok_or("no such run")?;
+    require_approval_step(store, &info.0, info.1)
 }
 
 /// Makes a run safe to pick up again after a crash or a stop: a row that was `committing` becomes `unknown`
@@ -169,6 +223,8 @@ pub fn run_rows(store: &mut Store, p: &RunParams, replay: &mut ReplayRow) -> Res
     if db(store.run_items(p.run))?.len() != p.rows.len() {
         return Err("the file no longer matches the run".into());
     }
+    // Here as well as in the commands: every row runs through this function.
+    require_approval_step(store, &info.0, info.1)?;
     // Before any row is touched: another unfinished run of this task may already have created these rows.
     let mut others = db(store.mark_list_run_running(p.run, &info.0))?;
     if !others.is_empty() {
@@ -466,7 +522,8 @@ fn resumable(open: &[OpenRun], version: i64, file_sha256: &str) -> Result<String
 /// Starts a run over the file if the task has no unfinished list run. If it has exactly one, over this same
 /// version and file, that run is picked up, with the mapping it started with, and nothing new is created:
 /// rows already done are never asked again, and a row that was `committing` shows as `unknown` for the
-/// officer. Every other start is refused and writes nothing (#108).
+/// officer. Every other start is refused and writes nothing (#108), and so is any start of a task with no step
+/// that asks for approval (#113).
 #[allow(clippy::too_many_arguments)]
 pub fn start_or_resume(
     store: &mut Store,
@@ -479,6 +536,7 @@ pub fn start_or_resume(
     new_run: &str,
     now: i64,
 ) -> Result<Loaded, String> {
+    require_approval_step(store, task_id, version)?;
     let bytes = csv::read_bytes(path)?;
     let sha = csv::fingerprint(&bytes);
     let mut open = db(store.open_list_runs_of(task_id))?;
@@ -527,16 +585,105 @@ mod tests {
 
     static NO_LOG: Tally = Tally::off();
 
+    /// A task body with one step that asks for approval.
+    const GATED: &str = r#"{"steps":[{"id":"s1","action":"press","target":{"role":"AXButton"},"consequential":"yes"}]}"#;
+    /// Every step is one the executor runs without asking.
+    const UNGATED: &str = r#"{"steps":[{"id":"s1","action":"set_value","target":{"role":"AXTextField"},"consequential":"no"}]}"#;
+
+    fn step(action: &str, role: &str, consequential: &str) -> Value {
+        json!({"action": action, "target": {"role": role}, "consequential": consequential})
+    }
+
+    #[test]
+    fn a_step_asks_for_approval_by_the_executors_rule() {
+        let count = |s: Value| approval_steps(&json!({ "steps": [s] }));
+        for flag in ["yes", "unknown"] {
+            assert_eq!(count(step("set_value", "AXTextField", flag)), 1, "{flag}");
+        }
+        assert_eq!(count(step("press", "AXButton", "no")), 1, "a press always asks");
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            assert_eq!(count(step("set_value", role, "no")), 0, "{role}");
+        }
+        for role in ["AXPopUpButton", "AXComboBox", "AXMenuButton"] {
+            assert_eq!(count(step("select", role, "no")), 0, "{role}");
+        }
+        assert_eq!(count(step("set_value", "AXPopUpButton", "no")), 1);
+        assert_eq!(count(step("select", "AXTextField", "no")), 1);
+        assert_eq!(count(json!({"action":"set_value","target":{"label":"Name"},"consequential":"no"})), 1, "no role");
+    }
+
+    #[test]
+    fn a_task_with_a_step_that_cannot_be_read_counts_nothing() {
+        let good = step("press", "AXButton", "yes");
+        for bad in [
+            json!(null),
+            json!({}),
+            json!({"action":"press","target":{"role":"AXButton"}}),
+            json!({"action":"press","target":{"role":"AXButton"},"consequential":true}),
+            step("press", "AXButton", "maybe"),
+            step("type_keys", "AXTextField", "yes"),
+            step("press", "", "yes"),
+            json!({"action":"press","target":{"role":7},"consequential":"yes"}),
+            json!({"action":"press","consequential":"yes"}),
+        ] {
+            assert_eq!(approval_steps(&json!({ "steps": [good, bad] })), 0, "{bad}");
+        }
+        for task in [json!({}), json!({"steps": []}), json!({"steps": "s1"}), json!(null)] {
+            assert_eq!(approval_steps(&task), 0, "{task}");
+        }
+    }
+
+    #[test]
+    fn a_task_with_no_approval_step_gets_no_run() {
+        let (mut s, dir) = store_with_path();
+        let dir = dir.parent().unwrap().to_path_buf();
+        for (task, body) in [("tsk_n", UNGATED), ("tsk_bad", "not json")] {
+            s.save_task(task, "No card", body, 2).unwrap();
+            assert!(require_approval_step(&s, task, 1).is_err());
+            let path = dir.join("rows.csv");
+            std::fs::write(&path, "name\nTest Person\n").unwrap();
+            let why = start_or_resume(&mut s, &path, task, 1, &[], true, &BTreeMap::new(), "run_n", 3).unwrap_err();
+            assert!(why.contains(if task == "tsk_n" { "no step that asks for approval" } else { "not readable" }), "{why}");
+            assert_nothing_written(&s, "run_n");
+        }
+        assert!(require_approval_step(&s, "tsk_x", 1).is_ok());
+    }
+
+    #[test]
+    fn a_run_made_before_the_rule_neither_resumes_nor_runs() {
+        let mut s = store();
+        s.save_task("tsk_n", "No card", UNGATED, 2).unwrap();
+        // As the old code left it: an unfinished run of such a task, one row mid-way.
+        s.start_run("run_old", "tsk_n", 1, "{}", 3).unwrap();
+        s.create_run_items("run_old", 2).unwrap();
+        s.move_run_item("run_old", 1, &[PENDING], RUNNING, None).unwrap();
+        let before = (s.run_info("run_old").unwrap(), s.run_items("run_old").unwrap());
+        assert!(require_approval_step_of_run(&s, "run_old").unwrap_err().contains("no step that asks for approval"));
+        let rows = vec![json!({}); 2];
+        let never = || false;
+        let mut p = params(&rows, &never);
+        p.run = "run_old";
+        let why = run_rows(&mut s, &p, &mut |_, _, _, _| panic!("the executor must not start")).unwrap_err();
+        assert!(why.contains("no step that asks for approval"), "{why}");
+        assert_eq!((s.run_info("run_old").unwrap(), s.run_items("run_old").unwrap()), before);
+        // The officer can still end it.
+        end_run(&mut s, "run_old", "Test Officer", 4).unwrap();
+        assert!(require_approval_step_of_run(&s, "run_1").is_ok());
+    }
+
     fn store() -> Store {
         store_with_path().0
     }
 
     fn store_with_path() -> (Store, std::path::PathBuf) {
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("companion-listrun-{}-{n}", std::process::id()));
+        // The clock alone repeats between parallel tests (#100).
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("companion-listrun-{}-{n}-{k}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = Store::open(&dir.join("s.db"), &Fixed([9u8; 32])).unwrap();
-        s.save_task("tsk_x", "Test task", "{}", 1).unwrap();
+        s.save_task("tsk_x", "Test task", GATED, 1).unwrap();
         s.start_run("run_1", "tsk_x", 1, "{}", 1).unwrap();
         s.create_run_items("run_1", 3).unwrap();
         (s, dir.join("s.db"))
@@ -738,7 +885,7 @@ mod tests {
         let (mut s, db_path) = store_with_path();
         let dir = db_path.parent().unwrap().to_path_buf();
         s.finish_run("run_1", "ended").unwrap();
-        s.save_task("tsk_x", "Test task", "{}", 2).unwrap();
+        s.save_task("tsk_x", "Test task", GATED, 2).unwrap();
         assert!(!start(&mut s, &dir, FILE, 1, "run_a").unwrap().resumed);
         (s, dir)
     }
@@ -774,7 +921,7 @@ mod tests {
         let blocked = other.start_list_run("run_b", "tsk_x", 2, "{}", 3, 6).unwrap();
         assert_eq!(blocked.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["run_a"]);
         assert_nothing_written(&s, "run_b");
-        s.save_task("tsk_y", "Other", "{}", 3).unwrap();
+        s.save_task("tsk_y", "Other", GATED, 3).unwrap();
         assert!(other.start_list_run("run_y", "tsk_y", 1, "{}", 1, 6).unwrap().is_empty());
     }
 
@@ -783,6 +930,7 @@ mod tests {
         let (mut s, dir) = store_with_open_run();
         // As the old code did it: a second run over the same file, on a new version.
         let source = s.run_info("run_a").unwrap().unwrap().2;
+        s.save_task("tsk_x", "Test task", GATED, 2).unwrap();
         s.start_run("run_b", "tsk_x", 2, &source, 7).unwrap();
         s.create_run_items("run_b", 1).unwrap();
         s.move_run_item("run_a", 1, &[PENDING], COMMITTING, None).unwrap();

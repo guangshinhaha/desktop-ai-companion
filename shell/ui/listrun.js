@@ -133,9 +133,11 @@
       mount.appendChild(el("button", { type: "button", attrs: { "data-role": "choose" }, on: { click: choose } }, "Read the file"));
       if (!s.preview) return;
       mount.appendChild(el("p", { attrs: { "data-role": "found" } }, s.preview.rows + " rows. " + (s.header ? "" : "No header row: columns are numbered; tick the box above if the first row names them. ") + "Match each input to a column."));
-      if (s.preview.approval_steps === 0) {
+      // The shell refuses such a start too (#113). Anything but a count above zero blocks it here.
+      const blocked = !(s.preview.approval_steps > 0);
+      if (blocked) {
         mount.appendChild(el("p", { className: "flag unknown", attrs: { "data-role": "no-approval", role: "alert" } },
-          "This task has no step that asks for approval: every row would run without a card. Check the task before you start."));
+          "This task cannot run over a list: it has no step that asks for approval, or a step that cannot be read, so rows could run without your approval."));
       }
       const dup = s.preview.duplicate_rows;
       if (dup && dup.total > 0) {
@@ -155,7 +157,7 @@
         sel.addEventListener("change", () => { if (sel.value) s.mapping[name] = sel.value; else delete s.mapping[name]; });
         mount.appendChild(el("label", {}, name + " comes from ", sel));
       }
-      mount.appendChild(el("button", { type: "button", attrs: { "data-role": "start" }, on: { click: start } }, "Start: ask me before each row"));
+      mount.appendChild(el("button", { type: "button", disabled: blocked, attrs: { "data-role": "start" }, on: { click: start } }, "Start: ask me before each row"));
     }
 
     function drawRun() {
