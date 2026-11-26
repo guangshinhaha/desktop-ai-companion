@@ -254,8 +254,14 @@ pub fn drive_with<R: BufRead, W: Write>(
                 card["officer"] = json!(ctx.officer);
                 card["run"] = json!(ctx.run);
                 // A list run's card says which row it is for.
-                if let Some(row) = ctx.item {
-                    card["row"] = json!(row);
+                match ctx.item {
+                    Some(row) => card["row"] = json!(row),
+                    // A single run has no row, and the executor cannot give its card one.
+                    None => {
+                        if let Some(fields) = card.as_object_mut() {
+                            fields.remove("row");
+                        }
+                    }
                 }
                 obs.approval_asked(store);
                 let approved = decide(&card);
@@ -749,6 +755,17 @@ mod tests {
         let input = card_line("s5") + &append_line(json!({"event":"approved","step":"s5"}));
         let (cards, recs) = trail(input, &ctx(), true);
         assert_eq!(serde_json::from_str::<Value>(recs[0]["shown"].as_str().unwrap()).unwrap(), cards[0]);
+    }
+
+    #[test]
+    fn a_single_runs_card_carries_no_row_from_the_executor() {
+        let card = json!({"step":"s5","summary":"Create an account for Test Person","row":9});
+        let input = line(json!({"jsonrpc":"2.0","id":"c","method":"approval.request","params":{"card":card}}))
+            + &append_line(json!({"event":"approved","step":"s5"}));
+        let (cards, recs) = trail(input, &ctx(), true);
+        assert_eq!(cards[0].get("row"), None);
+        let kept: Value = serde_json::from_str(recs[0]["shown"].as_str().unwrap()).unwrap();
+        assert_eq!(kept.get("row"), None);
     }
 
     #[test]
