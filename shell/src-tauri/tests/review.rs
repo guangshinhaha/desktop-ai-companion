@@ -545,6 +545,14 @@ fn drafts_left_over_from_an_earlier_run_are_removed_at_launch() {
     recording::sweep_at_launch(Some(absent.clone()));
     assert!(!absent.exists());
     recording::sweep_at_launch(None);
+    // A drafts path that is a link must not make launch delete files in the folder it points to.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("draft-mine.json"), "{}").unwrap();
+    let linked = dir.join("linked-drafts");
+    std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+    recording::sweep_at_launch(Some(linked));
+    assert!(elsewhere.join("draft-mine.json").exists(), "launch deleted through a linked drafts folder");
 }
 
 #[test]
