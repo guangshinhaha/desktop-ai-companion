@@ -291,6 +291,24 @@ fn the_trail_carries_the_row_numbers_and_the_officers_marks_and_verifies() {
     assert!(!mark["shown"].as_str().unwrap().contains("@"), "the mark names a row, not a person");
 }
 
+#[test]
+fn an_executor_that_ignores_a_no_cannot_get_the_row_recorded_as_approved() {
+    let Some(app) = StandIn::start() else { return };
+    let fx = fixture("ignore-no");
+    let mut go = Go::new(&fx, &app.url);
+    go.fake = json!({"ignore_no": true});
+    go.reject = vec![1];
+
+    let (out, asked) = go.run();
+    let s = open(&fx.dir);
+    // It created the account anyway (the shell cannot stop that), so the officer has to look.
+    assert_eq!(states(&s)[0], "unknown", "neither done nor committing");
+    assert_eq!(asked, 1, "the run stops at that row");
+    assert_eq!(out, Outcome::Stopped { item: 1, state: "unknown".into() });
+    assert!(!s.export_audit().unwrap().contains(r#""event":"approved""#), "no approval the officer did not give");
+    s.verify_audit().unwrap();
+}
+
 /// Makes the store refuse the `approved` record for one step, as a full disk or a locked file would.
 fn refuse_approved_for(dir: &Path, step: &str) {
     let conn = rusqlite::Connection::open(dir.join("s.db")).unwrap();

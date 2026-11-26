@@ -499,12 +499,14 @@ mod tests {
             line(json!({"jsonrpc":"2.0","id":id,"method":"audit.append","params":p}))
         };
         let input = mk("x1", "run_started", json!({}))
+            + &card_line("s5")
             + &mk("x2", "approved", json!({"step":"s5","shown":"Create a staff account for Test Person (test@example.test)"}))
             + &mk("x3", "run_finished", json!({"shown":"finished"}))
             + &line(json!({"jsonrpc":"2.0","id":1,"result":{"outcome":"finished"}}));
         let mut out = Vec::new();
-        drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1_700_000_000, &mut |_| false).unwrap();
-        let rs = replies(&out);
+        drive(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1_700_000_000, &mut |_| true).unwrap();
+        let mut rs = replies(&out);
+        assert_eq!(rs.remove(1)["result"]["approved"], true);
         assert_eq!(rs.iter().map(|r| r["result"]["seq"].as_i64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
         s.verify_audit().unwrap();
         let export = s.export_audit().unwrap();
@@ -609,6 +611,64 @@ mod tests {
         let r = replies(&out);
         assert!(r[0]["error"].is_object() && r[1]["error"].is_object());
         assert_eq!(s.audit_count().unwrap(), 0);
+    }
+
+    fn card_line(step: &str) -> String {
+        line(json!({"jsonrpc":"2.0","id":"c","method":"approval.request","params":{"card":{"step":step}}}))
+    }
+
+    fn approved_line(step: &str) -> String {
+        line(json!({"jsonrpc":"2.0","id":"a","method":"audit.append","params":{"event":"approved","step":step,"shown":"synthetic"}}))
+    }
+
+    #[derive(Default)]
+    struct Commits(u32);
+    impl ItemObserver for Commits {
+        fn commit_begins(&mut self, _store: &mut Store) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+
+    /// Drives `input`, answering the cards with `answers` in order. Returns the replies to the `approved`
+    /// records (true: accepted), the records written and how often the row was told a commit begins.
+    fn gate(input: String, answers: &[bool]) -> (Vec<bool>, i64, u32) {
+        let (mut s, _d) = store();
+        let mut out = Vec::new();
+        let mut answers = answers.iter();
+        let mut commits = Commits::default();
+        let input = input + &line(json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        drive_with(Cursor::new(input), &mut out, &mut s, &ctx(), 1, &|| 1, &mut |_| *answers.next().unwrap(), &mut |_| {}, &mut Observed::default(), &mut commits, &mut |_| None).unwrap();
+        let accepted = replies(&out).iter().filter(|r| r["id"] == "a").map(|r| r.get("error").is_none()).collect();
+        (accepted, s.audit_count().unwrap() as i64, commits.0)
+    }
+
+    #[test]
+    fn approved_after_a_no_is_refused() {
+        assert_eq!(gate(card_line("s5") + &approved_line("s5"), &[false]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn approved_with_no_card_first_is_refused() {
+        assert_eq!(gate(approved_line("s5"), &[]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn approved_for_another_step_than_the_yes_is_refused() {
+        assert_eq!(gate(card_line("s4") + &approved_line("s5"), &[true]), (vec![false], 0, 0));
+    }
+
+    #[test]
+    fn one_yes_covers_one_approved_record() {
+        assert_eq!(gate(card_line("s5") + &approved_line("s5") + &approved_line("s5"), &[true]), (vec![true, false], 1, 1));
+    }
+
+    #[test]
+    fn a_later_card_replaces_an_unused_yes() {
+        let no = card_line("s4") + &card_line("s5") + &approved_line("s4");
+        assert_eq!(gate(no, &[true, false]), (vec![false], 0, 0));
+        let not_a_card = line(json!({"jsonrpc":"2.0","id":"c2","method":"approval.request","params":{"card":"s4"}}));
+        assert_eq!(gate(card_line("s4") + &not_a_card + &approved_line("s4"), &[true]), (vec![false], 0, 0));
     }
 
     #[test]
