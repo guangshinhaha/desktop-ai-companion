@@ -173,7 +173,7 @@ fn only_https_or_this_machine_is_a_service_address() {
     for ok in ["https://service.example.test", "http://localhost:8787", "http://127.0.0.1:8787/x", "http://[::1]:1"] {
         assert!(service_url_ok(ok), "{ok}");
     }
-    for bad in ["http://service.example.test", "http://localhost.evil.test", "http://127.0.0.1.evil.test", "http://localhost@evil.test", "ftp://x", "", "service"] {
+    for bad in ["http://service.example.test", "http://localhost.evil.test", "http://127.0.0.1.evil.test", "http://localhost@evil.test", r"http://evil.test\@localhost:8787", "http://localhost:80@evil.test", "http://user@localhost", "http://:pw@localhost", "https://user:pw@service.example.test", "https://", "ftp://x", "", "service"] {
         assert!(!service_url_ok(bad), "{bad}");
     }
     assert_eq!(HttpService::new("http://service.example.test").err(), Some(SendError::NotConfigured));
@@ -213,6 +213,16 @@ fn http_403_is_the_ceiling_refusal_and_other_statuses_are_plain_failures() {
         let e = HttpService::new(&url).unwrap().chat(&json!({}), &mut |_| {}).unwrap_err();
         h.join().unwrap();
         assert_eq!(e, want, "status {status}");
+    }
+}
+
+#[test]
+fn a_403_that_is_not_the_ceiling_refusal_never_suggests_reclassifying() {
+    for body in ["{\"error\":\"origin_not_allowed\"}", "not json", ""] {
+        let (url, h) = serve(403, body);
+        let e = HttpService::new(&url).unwrap().chat(&json!({}), &mut |_| {}).unwrap_err();
+        h.join().unwrap();
+        assert_eq!(e, SendError::Unreachable, "body {body:?}");
     }
 }
 

@@ -26,10 +26,10 @@ async function start({ route = stubRoute(), config = CONFIG, options } = {}) {
   server.unref();
   const url = `http://127.0.0.1:${server.address().port}/recover`;
   async function post(body, { raw = false, method = "POST" } = {}) {
-    const res = await fetch(url, { method, body: method === "GET" ? undefined : raw ? body : JSON.stringify(body) });
+    const res = await fetch(url, { method, headers: { "content-type": "application/json" }, body: method === "GET" ? undefined : raw ? body : JSON.stringify(body) });
     return { status: res.status, json: await res.json() };
   }
-  return { post, calls, events, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }) };
+  return { post, url, calls, events, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }) };
 }
 
 const routeAnswering = (answer) => ({ name: "fake", async *stream() {}, async recover() { return answer; } });
@@ -143,5 +143,26 @@ test("a route that never answers hits the timeout: 502, never a hang, and the ro
   assert.equal(r.status, 502);
   assert.equal(s.events[0].errorClass, "TimeoutError");
   assert.ok(stopped);
+  await s.close();
+});
+
+// #103: /recover carries the same ceiling, so it gets the same request checks as /chat.
+test("a repeated top-level key, a wrong path, a non-JSON content type or any Origin never reaches the route", async () => {
+  const s = await start();
+  const json = { "content-type": "application/json" };
+  const ok = JSON.stringify(request());
+  const dup = (key) => `{"classification":"secret",${ok.slice(1).replace('"classification"', `"${key}"`)}`;
+  for (const [name, want, { path = "/recover", headers = json, body = ok }] of [
+    ["repeated key", 400, { body: dup("classification") }],
+    ["repeated escaped key", 400, { body: dup("\\u0063lassification") }],
+    ["wrong path", 404, { path: "/chat" }],
+    ["text/plain", 415, { headers: { "content-type": "text/plain" } }],
+    ["origin", 403, { headers: { ...json, origin: "http://evil.test" } }],
+  ]) {
+    const res = await fetch(s.url.replace("/recover", path), { method: "POST", headers, body });
+    await res.text();
+    assert.equal(res.status, want, name);
+  }
+  assert.equal(s.calls.length, 0);
   await s.close();
 });

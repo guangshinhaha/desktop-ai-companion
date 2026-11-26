@@ -64,13 +64,56 @@ export async function readBody(req: IncomingMessage, signal: AbortSignal, ms: nu
   return guard(read, signal, ms);
 }
 
+/**
+ * JSON.parse keeps the last of a repeated key, so a reader that takes the first would see another request
+ * (and another classification). `text` must already parse as an object. Keys are compared decoded.
+ */
+function repeatsTopLevelKey(text: string): boolean {
+  // A whole string (and the colon that makes it a key), or a bracket. Everything else is skipped.
+  const token = /("[^"\\]*(?:\\.[^"\\]*)*")(\s*:)?|[{}[\]]/g;
+  const seen = new Set<string>();
+  let depth = 0;
+  for (const [t, str, colon] of text.matchAll(token)) {
+    if (t === "{" || t === "[") depth++;
+    else if (t === "}" || t === "]") depth--;
+    else if (depth === 1 && colon) {
+      const key = JSON.parse(str!) as string;
+      if (seen.has(key)) return true;
+      seen.add(key);
+    }
+  }
+  return false;
+}
+
+export function parseBody(text: string): unknown {
+  let body: unknown;
+  try { body = JSON.parse(text); } catch { throw new BadRequestError("body is not valid JSON"); }
+  if (typeof body === "object" && body !== null && !Array.isArray(body) && repeatsTopLevelKey(text)) {
+    throw new BadRequestError("repeated key");
+  }
+  return body;
+}
+
+/**
+ * Checked before the body is read. Our client is not a browser and sends no Origin, so any Origin is refused.
+ * This is not sign-in (#29).
+ */
+export function requestRefusal(req: IncomingMessage, path: string): { status: number; error: string } | undefined {
+  if (req.url?.split("?")[0] !== path) return { status: 404, error: "not_found" };
+  if (req.method !== "POST") return { status: 405, error: "method_not_allowed" };
+  if (req.headers.origin !== undefined) return { status: 403, error: "origin_not_allowed" };
+  const type = req.headers["content-type"]?.split(";")[0]!.trim().toLowerCase();
+  if (type !== "application/json") return { status: 415, error: "unsupported_media_type" };
+  return undefined;
+}
+
 export function send(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
 /**
- * Handler for POST /chat. Mount it behind the service's sign-in check (#29).
+ * Handler for POST /chat. Mount it behind the service's sign-in check (#29), at that exact path.
  * Reply is newline-delimited JSON: {"text":"..."} chunks, then {"done":true}.
  */
 export function createChatHandler(config: AdapterConfig, adapter: ModelAdapter, log: Logger, options: ChatOptions = {}) {
@@ -84,11 +127,11 @@ export function createChatHandler(config: AdapterConfig, adapter: ModelAdapter, 
     res.on("close", () => { if (!res.writableEnded) abort.abort(); });
     let iterator: AsyncIterator<string> | undefined;
     try {
-      if (req.method !== "POST") { ev.outcome = "bad_request"; ev.status = 405; return send(res, 405, { error: "method_not_allowed" }); }
+      const refused = requestRefusal(req, "/chat");
+      if (refused) { ev.outcome = "bad_request"; ev.status = refused.status; return send(res, refused.status, { error: refused.error }); }
       const text = await readBody(req, abort.signal, bodyTimeoutMs);
       ev.requestBytes = Buffer.byteLength(text);
-      let body: Record<string, unknown>;
-      try { body = JSON.parse(text) as Record<string, unknown>; } catch { throw new BadRequestError("body is not valid JSON"); }
+      const body = parseBody(text) as Record<string, unknown>;
       if (typeof body !== "object" || body === null || Array.isArray(body)) throw new BadRequestError("body must be an object");
       if (typeof body.classification === "string" && config.levels.includes(body.classification)) ev.classification = body.classification;
       if (typeof body.model === "string" && config.models.includes(body.model)) ev.model = body.model;

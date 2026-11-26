@@ -463,6 +463,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tiny_http",
  "ureq",
+ "url",
  "zip",
 ]
 

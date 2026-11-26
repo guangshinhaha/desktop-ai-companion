@@ -9,7 +9,9 @@
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+use url::{Host, Url};
 
 /// Classification levels the officer can pick, lowest first. The service decides the ceiling;
 /// anything it does not recognise it treats as above the ceiling.
@@ -71,33 +73,53 @@ pub trait Service {
 }
 
 /// Plain http is allowed only to this machine (a local service during development).
-/// Anything else must be https, so chat content never crosses a network unencrypted.
-pub fn service_url_ok(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
+/// Anything else must be https, so chat content never crosses a network unencrypted. No user info.
+/// Returns the parsed URL: requests are built from it, so the host checked is the host called.
+fn parse_service_url(url: &str) -> Option<Url> {
+    let url = Url::parse(url).ok()?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
     }
-    let Some(rest) = url.strip_prefix("http://") else { return false };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or("");
-    host == "localhost"
-        || host.starts_with("localhost:")
-        || host == "127.0.0.1"
-        || host.starts_with("127.0.0.1:")
-        || host == "[::1]"
-        || host.starts_with("[::1]:")
+    let ok = match (url.scheme(), url.host()?) {
+        ("https", _) => true,
+        ("http", Host::Domain(d)) => d == "localhost",
+        ("http", Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
+        ("http", Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
+        _ => false,
+    };
+    ok.then_some(url)
+}
+
+pub fn service_url_ok(url: &str) -> bool {
+    parse_service_url(url).is_some()
 }
 
 pub struct HttpService {
-    base: String,
+    base: Url,
 }
 
 impl HttpService {
     pub fn new(base: &str) -> Result<HttpService, SendError> {
-        let base = base.trim_end_matches('/');
-        if !service_url_ok(base) {
-            return Err(SendError::NotConfigured);
+        let base = parse_service_url(base).ok_or(SendError::NotConfigured)?;
+        Ok(HttpService { base })
+    }
+
+    fn endpoint(&self, name: &str) -> String {
+        let mut url = self.base.clone();
+        // http and https URLs always have path segments.
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().push(name);
         }
-        Ok(HttpService { base: base.to_string() })
+        url.into()
+    }
+
+    /// Plain http is only ever this machine, so it connects directly: a proxy variable would carry
+    /// the request, in clear text, to wherever it points. https still follows the proxy settings.
+    fn proxy(&self) -> Option<ureq::Proxy> {
+        match self.base.scheme() {
+            "https" => ureq::Proxy::try_from_env(),
+            _ => None,
+        }
     }
 
     pub fn from_env() -> Result<HttpService, SendError> {
@@ -116,10 +138,11 @@ impl HttpService {
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_global(Some(Duration::from_secs(45)))
             .max_redirects(0)
+            .proxy(self.proxy())
             .build()
             .into();
         let mut resp = agent
-            .post(&format!("{}/recover", self.base))
+            .post(&self.endpoint("recover"))
             .header("content-type", "application/json")
             .send(body.to_string().as_bytes())
             .ok()?;
@@ -138,16 +161,23 @@ impl Service for HttpService {
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .max_redirects(0)
+            .proxy(self.proxy())
             .build()
             .into();
-        let resp = agent
-            .post(&format!("{}/chat", self.base))
+        let mut resp = agent
+            .post(&self.endpoint("chat"))
             .header("content-type", "application/json")
             .send(body.to_string().as_bytes())
             .map_err(|_| SendError::Unreachable)?;
         match resp.status().as_u16() {
             200 => {}
-            403 => return Err(SendError::AboveCeiling),
+            // Only the ceiling refusal may suggest the classification. The service also answers 403
+            // for other reasons (an `Origin` header), and any proxy can.
+            403 => {
+                let text = resp.body_mut().with_config().limit(64 * 1024).read_to_string().unwrap_or_default();
+                let ceiling = serde_json::from_str::<Value>(&text).is_ok_and(|v| v["error"] == "above_ceiling");
+                return Err(if ceiling { SendError::AboveCeiling } else { SendError::Unreachable });
+            }
             413 => return Err(SendError::TooLong),
             400 => return Err(SendError::BadMessages),
             408 | 502 | 504 => return Err(SendError::ReplyFailed),

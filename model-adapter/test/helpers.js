@@ -19,7 +19,7 @@ export async function start({ config = CONFIG, route = stubRoute(), options, log
   const { port } = server.address();
   const url = `http://127.0.0.1:${port}/chat`;
   async function post(body, { raw = false } = {}) {
-    const res = await fetch(url, { method: "POST", body: raw ? body : JSON.stringify(body) });
+    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: raw ? body : JSON.stringify(body) });
     return { status: res.status, text: await res.text() };
   }
   return { post, url, port, events, calls, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }) };
