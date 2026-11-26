@@ -84,3 +84,67 @@ test("a route that fails mid-stream ends the reply with an error line, not a han
   assert.equal(s.events[0].outcome, "route_error");
   await s.close();
 });
+
+// #103: hardening. Synthetic data only.
+const M = `"messages":${JSON.stringify(msgs)}`;
+// The second spelling writes the "c" of the key as a JSON unicode escape: the same key to JSON.parse.
+const ESCAPED = "\\u0063lassification";
+
+test("a repeated top-level key, however it is spelt, gets 400 and the route is never called", async () => {
+  const s = await start();
+  for (const body of [
+    `{"classification":"secret","classification":"official-open",${M}}`,
+    `{"classification":"secret","${ESCAPED}":"official-open",${M}}`,
+    `{"classification":"official-open","classification":"secret",${M}}`,
+    `{"classification":"official-open",${M} , "messages" : []}`,
+    `{"classification":"official-open",${M},"__proto__":1,"__proto__":2}`,
+  ]) {
+    const r = await s.post(body, { raw: true });
+    assert.equal(r.status, 400, body);
+  }
+  assert.equal(s.calls.length, 0);
+  assert.ok(s.events.every((e) => e.outcome === "bad_request"));
+  await s.close();
+});
+
+test("keys repeated only below the top level, or only inside strings, are not top-level repeats", async () => {
+  const s = await start();
+  const content = 'say "classification": {"classification": "x"} \\ ]}';
+  const r = await s.post({ classification: "official-open", note: { classification: 1, a: [{ classification: 2 }] }, other: "classification", messages: [{ role: "user", content }, { role: "user", content }] });
+  assert.equal(r.status, 200);
+  assert.equal(s.calls[0].messages[0].content, content);
+  const big = await s.post({ classification: "official-open", messages: [{ role: "user", content: '"\\'.repeat(200_000) }] });
+  assert.equal(big.status, 200, "a long run of escapes is scanned");
+  await s.close();
+});
+
+test("the route receives messages with only role and content", async () => {
+  const s = await start();
+  const r = await s.post(`{"classification":"official-open","messages":[{"role":"user","content":"hi","name":"x","tool_calls":[],"__proto__":{"a":1}}]}`, { raw: true });
+  assert.equal(r.status, 200);
+  assert.deepEqual(Reflect.ownKeys(s.calls[0].messages[0]), ["role", "content"]);
+  await s.close();
+});
+
+async function send(s, { path = "/chat", headers = { "content-type": "application/json" } } = {}) {
+  const res = await fetch(s.url.replace("/chat", path), { method: "POST", headers, body: Buffer.from(`{"classification":"official-open",${M}}`) });
+  await res.text();
+  return res.status;
+}
+
+test("a wrong path gets 404, a non-JSON content type 415 and any Origin 403, none reaching the route", async () => {
+  const s = await start();
+  const json = { "content-type": "application/json" };
+  for (const path of ["/", "/anything", "/chat/", "/chat/x", "/Chat", "/recover"]) assert.equal(await send(s, { path }), 404, path);
+  assert.equal(await send(s, { headers: {} }), 415, "no content type");
+  for (const type of ["text/plain", "text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "application/jsonp", "text/plain; a=application/json"]) {
+    assert.equal(await send(s, { headers: { "content-type": type } }), 415, type);
+  }
+  for (const origin of ["http://evil.test", "null", "http://localhost", `http://127.0.0.1:${s.port}`, ""]) {
+    assert.equal(await send(s, { headers: { ...json, origin } }), 403, `origin ${origin}`);
+  }
+  assert.equal(s.calls.length, 0);
+  assert.ok(s.events.every((e) => e.outcome === "bad_request"));
+  assert.equal(await send(s, { path: "/chat?x=1", headers: { "content-type": "Application/JSON ; charset=utf-8" } }), 200);
+  await s.close();
+});

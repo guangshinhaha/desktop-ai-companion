@@ -173,7 +173,7 @@ fn only_https_or_this_machine_is_a_service_address() {
     for ok in ["https://service.example.test", "http://localhost:8787", "http://127.0.0.1:8787/x", "http://[::1]:1"] {
         assert!(service_url_ok(ok), "{ok}");
     }
-    for bad in ["http://service.example.test", "http://localhost.evil.test", "http://127.0.0.1.evil.test", "http://localhost@evil.test", "ftp://x", "", "service"] {
+    for bad in ["http://service.example.test", "http://localhost.evil.test", "http://127.0.0.1.evil.test", "http://localhost@evil.test", r"http://evil.test\@localhost:8787", "http://localhost:80@evil.test", "http://user@localhost", "http://:pw@localhost", "https://user:pw@service.example.test", "https://", "ftp://x", "", "service"] {
         assert!(!service_url_ok(bad), "{bad}");
     }
     assert_eq!(HttpService::new("http://service.example.test").err(), Some(SendError::NotConfigured));

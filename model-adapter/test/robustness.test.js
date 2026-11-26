@@ -31,7 +31,7 @@ test("client abort on a hung route is logged as aborted and the route is told to
   const route = { name: "r", stream: () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}), return: async () => { returned = true; return { done: true }; } }) }) };
   const s = await start({ route });
   const ac = new AbortController();
-  fetch(s.url, { method: "POST", body: JSON.stringify(body), signal: ac.signal }).catch(() => {});
+  fetch(s.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: ac.signal }).catch(() => {});
   await sleep(150);
   ac.abort();
   await until(() => s.events.length === 1);
@@ -44,7 +44,7 @@ test("a route that ignores abort cannot log ok for a gone client", async () => {
   const route = { name: "r", async *stream() { for (let i = 0; i < 6; i++) { await sleep(100); yield "x"; } } };
   const s = await start({ route });
   const ac = new AbortController();
-  fetch(s.url, { method: "POST", body: JSON.stringify(body), signal: ac.signal }).catch(() => {});
+  fetch(s.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: ac.signal }).catch(() => {});
   await sleep(150);
   ac.abort();
   await until(() => s.events.length === 1);
@@ -70,7 +70,7 @@ test("a body that never finishes times out with 408 and is logged", async () => 
   let got = "";
   sock.on("data", (d) => { got += d; });
   sock.on("error", () => {});
-  sock.write("POST /chat HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n{");
+  sock.write("POST /chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{");
   await until(() => s.events.length === 1);
   assert.equal(s.events[0].status, 408);
   assert.match(got, /408/);
@@ -82,7 +82,7 @@ test("a client dropping mid-body is logged as aborted, not as a route error", as
   const s = await start();
   const sock = net.connect(s.port, "127.0.0.1");
   sock.on("error", () => {});
-  sock.write("POST /chat HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n{");
+  sock.write("POST /chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{");
   await sleep(100);
   sock.destroy();
   await until(() => s.events.length === 1);
