@@ -330,6 +330,81 @@ final class StopTests: XCTestCase {
         XCTAssertEqual(atResume?.approved, false, "and is not recorded as approved until it can run")
     }
 
+    // MARK: a stop on a run that diverges (#105)
+
+    /// The one `run_stopped` of a diverged run: after `step_diverged`, with `run_finished` still "diverged".
+    func divergedStop(_ kinds: [String], _ shown: [String?], file: StaticString = #filePath, line: UInt = #line) -> String {
+        XCTAssertEqual(Array(kinds.suffix(3)), ["step_diverged", "run_stopped", "run_finished"], file: file, line: line)
+        XCTAssertEqual(kinds.filter { $0 == "run_stopped" }.count, 1, file: file, line: line)
+        XCTAssertEqual(shown.last ?? nil, "diverged", file: file, line: line)
+        return shown.dropLast().last.flatMap { $0 } ?? ""
+    }
+
+    func testAStopDuringTheApprovalRecordOfARunThatThenDivergesIsRecorded() throws {
+        let h = formHost()
+        // The stop arrives while the approval is being recorded, and the window goes before the check after it.
+        let msgs = try serveRun(h) { m, p in
+            guard m == "audit.append", p["event"] as? String == "approved" else { return nil }
+            h.tree = nil
+            return Self.stopLine
+        }
+        XCTAssertEqual((msgs.last { $0["id"] as? Int == 1 }?["result"] as? [String: Any])?["outcome"] as? String, "diverged")
+        let records = msgs.filter { $0["method"] as? String == "audit.append" }.compactMap { $0["params"] as? [String: Any] }
+        let shown = divergedStop(events(msgs), records.map { $0["shown"] as? String })
+        XCTAssertEqual(records.dropLast().last?["step"] as? String, "s3")
+        XCTAssertEqual(shown, "Stopped by the officer. The run had already diverged at step s3. Completed: s1, s2. Not run: s3. The approval for step s3 was recorded and its action was not taken.")
+        XCTAssertFalse(h.actions.contains("press:Create account"))
+    }
+
+    func testAStopDuringAFailedActionIsRecordedAndTheActionIsNotCalledNotRun() throws {
+        let h = formHost()
+        h.onPress = nil
+        h.pressResult = .failed("the press was refused")
+        let r = try run(h, poll: once(Self.stopLine) { h.actions.contains("press:Create account") })
+        guard case .diverged(let step, _) = r.report.outcome else { return XCTFail("\(r.report.outcome)") }
+        XCTAssertEqual(step, "s3")
+        let shown = divergedStop(r.audit.kinds.map(\.rawValue), r.audit.events.map(\.shown))
+        XCTAssertEqual(shown, "Stopped by the officer. The run had already diverged at step s3. Completed: s1, s2. Not run: none. An action was attempted at step s3 and is not confirmed: check the app.")
+    }
+
+    func testAnActionRecoveryTookCountsAsAttemptedInTheStopOfADivergedRun() throws {
+        // A notice is in front of step s1, so the step's own action never happens: only recovery types.
+        let h = FakeHost()
+        h.tree = formBehindNotice()
+        let t = try makeTask()
+        final class TypeThenNonsense: RecoverySource {
+            var asked = 0
+            func ask(_ request: [String: Any]) -> [String: Any]? {
+                asked += 1
+                if asked > 1 { return ["answer": "nonsense"] }
+                var a = RecoveryReplayTests.retype; a["ref"] = ref(in: request, label: "Full name") ?? "n-none"
+                return a
+            }
+        }
+        let audit = RecordingAudit()
+        audit.host = h
+        // The stop arrives as the refusal of the second answer is recorded, after the last stop check.
+        let control = RunControl(poll: once(Self.stopLine) { audit.kinds.contains(.stepDiverged) })
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
+                         ceiling: 2, audit: audit, control: control, recovery: TypeThenNonsense(),
+                         recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
+        guard case .diverged = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertEqual(h.actions, ["set:full-name"])
+        XCTAssertEqual(audit.kinds, [.runStarted, .recovered, .stepDiverged, .stepDiverged, .runStopped, .runFinished])
+        XCTAssertEqual(audit.events.first { $0.kind == .runStopped }?.shown,
+                       "Stopped by the officer. The run had already diverged at step s1. Completed: none. Not run: s2, s3. An action was attempted at step s1 and is not confirmed: check the app.")
+    }
+
+    func testARunWithNoStopThatDivergesWritesNoStop() throws {
+        let h = formHost()
+        h.onPress = nil
+        h.pressResult = .failed("the press was refused")
+        let r = try run(h, poll: { nil })
+        guard case .diverged = r.report.outcome else { return XCTFail("\(r.report.outcome)") }
+        XCTAssertEqual(r.audit.kinds, [.runStarted, .approved, .stepDiverged, .runFinished])
+        XCTAssertEqual(r.audit.events.last?.shown, "diverged")
+    }
+
     // MARK: reading lines
 
     func testLineReaderPollsWithoutWaitingAndKeepsPartialLines() throws {
