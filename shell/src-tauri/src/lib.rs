@@ -868,6 +868,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            recording::sweep_at_launch(recording::drafts_dir());
+
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Companion", true, None::<&str>)?;
             let list = tauri::menu::MenuItem::with_id(app, "listrun", "Run a task over a spreadsheet...", true, None::<&str>)?;
             let notes = tauri::menu::MenuItem::with_id(app, "notes", "Task notes", true, None::<&str>)?;

@@ -530,6 +530,24 @@ fn a_constant_for_a_choice_input_must_be_one_of_its_choices() {
 }
 
 #[test]
+fn drafts_left_over_from_an_earlier_run_are_removed_at_launch() {
+    let dir = tmp("launch-sweep");
+    let drafts = dir.join("drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    for f in ["draft-1-2.json", "draft-3-4.json", "keep.txt"] {
+        std::fs::write(drafts.join(f), "{}").unwrap();
+    }
+    recording::sweep_at_launch(Some(drafts.clone()));
+    let left: Vec<_> = std::fs::read_dir(&drafts).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["keep.txt"]);
+    // A first launch has no drafts folder, and a launch with no home folder has no path.
+    let absent = dir.join("absent");
+    recording::sweep_at_launch(Some(absent.clone()));
+    assert!(!absent.exists());
+    recording::sweep_at_launch(None);
+}
+
+#[test]
 fn old_drafts_are_swept_at_start_and_an_existing_folder_is_made_private() {
     let dir = tmp("sweep");
     let drafts = dir.join("drafts");

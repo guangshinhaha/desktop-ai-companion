@@ -54,6 +54,14 @@ pub fn sweep(dir: &Path, keep: Option<&Path>) {
     }
 }
 
+/// A draft under review lives in memory only, so any draft file present at launch is left over
+/// from an earlier run (quit, crash or restart before save or discard).
+pub fn sweep_at_launch(dir: Option<PathBuf>) {
+    if let Some(d) = dir {
+        sweep(&d, None);
+    }
+}
+
 pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, String> {
     if !valid_bundle(app_bundle) {
         return Err("that is not an application bundle id".into());
