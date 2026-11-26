@@ -42,7 +42,8 @@ export function createModelAdapter(config: AdapterConfig, route: ModelRoute): Mo
       const ok = typeof x === "object" && x !== null && ["user", "assistant", "system"].includes((x as ChatMessage).role) && typeof (x as ChatMessage).content === "string";
       if (!ok) throw new BadRequestError("each message needs a role and string content");
     }
-    return { model, messages: m as ChatMessage[] };
+    // Rebuilt, so no other field the caller sent reaches the route.
+    return { model, messages: (m as ChatMessage[]).map(({ role, content }) => ({ role, content })) };
   }
   return {
     routeName: route.name,

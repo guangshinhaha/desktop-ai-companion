@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { BadRequestError } from "./adapter.ts";
-import { ClientGoneError, errClass, guard, readBody, send, TimeoutError } from "./chat.ts";
+import { ClientGoneError, errClass, guard, parseBody, readBody, requestRefusal, send, TimeoutError } from "./chat.ts";
 import { withinCeiling } from "./classification.ts";
 import type { AdapterConfig } from "./config.ts";
 import type { Logger, LogEvent } from "./log.ts";
@@ -62,11 +62,11 @@ export function createRecoverHandler(config: AdapterConfig, route: ModelRoute, l
     const abort = new AbortController();
     res.on("close", () => { if (!res.writableEnded) abort.abort(); });
     try {
-      if (req.method !== "POST") { ev.outcome = "bad_request"; ev.status = 405; return send(res, 405, { error: "method_not_allowed" }); }
+      const refused = requestRefusal(req, "/recover");
+      if (refused) { ev.outcome = "bad_request"; ev.status = refused.status; return send(res, refused.status, { error: refused.error }); }
       const text = await readBody(req, abort.signal, bodyTimeoutMs);
       ev.requestBytes = Buffer.byteLength(text);
-      let body: unknown;
-      try { body = JSON.parse(text); } catch { throw new BadRequestError("body is not valid JSON"); }
+      const body = parseBody(text);
       const classification = isObject(body) ? body.classification : undefined;
       if (!withinCeiling(config, classification)) {
         ev.outcome = "refused_ceiling"; ev.status = 403;
