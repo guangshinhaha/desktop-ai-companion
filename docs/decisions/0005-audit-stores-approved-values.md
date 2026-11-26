@@ -17,5 +17,6 @@ An approval record can say "approved creating an account for this person", or on
 
 - Values live only in the audit store. Other events carry no values. The export for verification goes over stdin and never to disk.
 - Run values print on a card only to a terminal; into a pipe or file they are hidden (#76).
-- Anyone with the store key can forge a whole trail by recomputing the hashes. Only the central copy (#29) closes that.
+- The hashes use no secret. Anyone holding a plain-text export can edit it or cut its tail, recompute the hashes and rewrite the control line, with no key, so `verify-audit` shows only that an export is consistent with itself. The live store has the limits in decision 0007: a key holder can rewrite the trail, and someone with access to the files can restore an older copy or delete the store. The off-device anchor is the central copy (#29), which is not built; even then, records changed before their first sync are outside what it can show.
+- The `approved` record's values are the card the shell showed, stored as JSON. A `rejected` record stores none (#107).
 - Retention is not enforced by code yet; it is config for #29 to apply.
