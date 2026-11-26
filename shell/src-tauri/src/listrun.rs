@@ -677,7 +677,10 @@ mod tests {
 
     fn store_with_path() -> (Store, std::path::PathBuf) {
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("companion-listrun-{}-{n}", std::process::id()));
+        // The clock alone repeats between parallel tests (#100).
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("companion-listrun-{}-{n}-{k}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = Store::open(&dir.join("s.db"), &Fixed([9u8; 32])).unwrap();
         s.save_task("tsk_x", "Test task", GATED, 1).unwrap();
