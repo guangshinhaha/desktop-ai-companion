@@ -150,6 +150,25 @@ fn an_executor_that_does_not_stop_is_ended_and_the_shell_records_the_stop() {
 }
 
 #[test]
+fn a_forced_stop_names_the_list_row_and_the_step_in_flight() {
+    let dir = tmp("stuck-row");
+    let bin = script(&dir, &format!("read -r start\n{STARTED}\nexec sleep 30"));
+    let mut store = open(&dir);
+    let handle: Arc<Mutex<Option<RunHandle>>> = Arc::default();
+    let (h2, h3) = (handle.clone(), handle.clone());
+    let mut on_start = move |h: RunHandle| *h2.lock().unwrap() = Some(h);
+    let mut on_progress = |_p: &Value| h3.lock().unwrap().clone().unwrap().stop();
+    let mut hooks = Hooks { on_start: &mut on_start, on_progress: &mut on_progress, stop_grace: Duration::from_millis(200) };
+    let row = RunContext { item: Some(2), ..ctx() };
+    assert!(run_replay_with(&bin, &mut store, &row, &task(), &json!({}), None, &mut |_| false, &mut hooks).is_err());
+    let records: Vec<Value> = store.export_audit().unwrap().lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
+    let named: Vec<(&str, Option<i64>, Option<&str>)> =
+        records.iter().map(|r| (r["event"].as_str().unwrap(), r["item"].as_i64(), r["step"].as_str())).collect();
+    assert_eq!(named, [("run_stopped", Some(2), Some("s1")), ("run_finished", Some(2), Some("s1"))]);
+    store.verify_audit().unwrap();
+}
+
+#[test]
 fn a_run_nobody_stopped_that_loses_its_executor_writes_no_stop() {
     let dir = tmp("died");
     let bin = script(&dir, "read -r start\nexit 1");

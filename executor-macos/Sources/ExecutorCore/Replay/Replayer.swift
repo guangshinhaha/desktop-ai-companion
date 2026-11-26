@@ -66,6 +66,8 @@ public final class Replayer {
 
     /// The step whose approval is in the trail but whose action has not been taken. A stop in that gap says so.
     private var approvedNotActed: String?
+    /// The last step an action was tried on, by the step itself or by recovery. A stop never lists it as not run.
+    private var attempted: String?
     private var cancelled: (() -> Bool)? { control.map { c in { c.isStopped } } }
     private var stopAsked: Bool { control?.isStopped ?? false }
 
@@ -80,16 +82,26 @@ public final class Replayer {
         let report = runSteps()
         if let audit {
             var outcome = "finished"
+            func list(_ ids: [String]) -> String { ids.isEmpty ? "none" : ids.joined(separator: ", ") }
+            let unactedApproval = approvedNotActed.map { " The approval for step \($0) was recorded and its action was not taken." } ?? ""
             switch report.outcome {
             case .diverged(let step, let reason):
                 // Reasons name steps and elements, never run values (see the report type).
                 _ = audit.record(AuditEvent(.stepDiverged, step: step, shown: ApprovalGate.safe(reason)))
+                // A stop that was asked stays on the trail when the run ends by diverging.
+                if stopAsked {
+                    let tried = attempted == step
+                    let notRun = tried ? Array(report.notRun.dropFirst()) : report.notRun
+                    var shown = "Stopped by the officer. The run had already diverged at step \(step). Completed: \(list(report.completed)). Not run: \(list(notRun))."
+                    shown += unactedApproval
+                    if tried { shown += " An action was attempted at step \(step) and is not confirmed: check the app." }
+                    _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
+                }
                 outcome = "diverged"
             case .stopped(let step, let actionDone):
                 // Step ids and counts only. This is the record of the stop (PRD C-4).
-                func list(_ ids: [String]) -> String { ids.isEmpty ? "none" : ids.joined(separator: ", ") }
                 var shown = "Stopped by the officer at step \(step). Completed: \(list(report.completed)). Not run: \(list(report.notRun))."
-                if let s = approvedNotActed { shown += " The approval for step \(s) was recorded and its action was not taken." }
+                shown += unactedApproval
                 if actionDone { shown += " The step's action was done and its check was not confirmed." }
                 _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
                 outcome = "stopped"
@@ -197,6 +209,7 @@ public final class Replayer {
             // 3. Act. Last look at the stop: after this, nothing is done for a step the officer stopped.
             if stopAsked { return stopReport(at: i) }
             approvedNotActed = nil
+            attempted = step.id
             let acted = perform(step, on: match.node, approval: approval)
             // 4. Wait for the checks.
             switch acted {
@@ -315,6 +328,7 @@ public final class Replayer {
                 }
                 if settled(hold) { return .stopped }
                 guard let input = step.value, let v = inputs.resolve(input) else { return .gaveUp("\(first). No value for this step. \(officer)") }
+                attempted = step.id
                 let result = host.setValue(node, to: v.reveal())
                 if case .failed(let why) = result { return .gaveUp("\(first). Recovery's action failed (\(why)). \(officer)") }
             }

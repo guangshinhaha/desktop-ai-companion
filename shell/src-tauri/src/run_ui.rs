@@ -61,10 +61,8 @@ fn open_window(app: &AppHandle) {
 /// Starts tracking a run. Refuses if one is already on: one replay at a time.
 /// The returned guard ends the run if dropped without `finish`, so a panic cannot leave the slot taken
 /// or the shortcut registered.
-pub fn begin(app: &AppHandle, mut progress: Progress) -> Result<RunGuard, String> {
-    // Failing to register (another app holds it) leaves the window's Stop button and Escape; the view says so.
-    let registered = app.global_shortcut().register(stop_shortcut()).is_ok();
-    progress.set_shortcut(registered);
+pub fn begin(app: &AppHandle, progress: Progress) -> Result<RunGuard, String> {
+    // The slot is claimed before the shortcut is touched: a refused run leaves the live run's shortcut alone.
     let taken = with_slot(app, |s| {
         if s.as_ref().is_some_and(|r| r.is_live()) {
             return true;
@@ -73,13 +71,21 @@ pub fn begin(app: &AppHandle, mut progress: Progress) -> Result<RunGuard, String
         false
     });
     if taken {
-        // Not ours: leave the first run's shortcut as it is.
         return Err("a replay is already running".into());
     }
+    // Made as soon as the slot is ours, so a panic below still gives it back.
+    let handle = app.clone();
+    let guard = RunGuard(Some(crate::progress::OnDrop::new(Box::new(move || end(&handle, &Err("the run ended unexpectedly".into()))))));
+    // Failing to register (another app holds it) leaves the window's Stop button and Escape; the view says so.
+    let registered = app.global_shortcut().register(stop_shortcut()).is_ok();
+    with_slot(app, |s| {
+        if let Some(r) = s.as_mut() {
+            r.progress.set_shortcut(registered);
+        }
+    });
     open_window(app);
     publish(app);
-    let handle = app.clone();
-    Ok(RunGuard(Some(crate::progress::OnDrop::new(Box::new(move || end(&handle, &Err("the run ended unexpectedly".into())))))))
+    Ok(guard)
 }
 
 pub struct RunGuard(Option<crate::progress::OnDrop<Box<dyn FnOnce() + Send>>>);
