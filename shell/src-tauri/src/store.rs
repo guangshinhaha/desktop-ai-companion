@@ -2,7 +2,7 @@
 //! The key lives in the macOS keychain. No network. Nothing here logs or prints a value:
 //! errors carry a kind, never row content.
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
@@ -264,6 +264,13 @@ impl Store {
         Ok(store)
     }
 
+    /// Every transaction here that writes starts through this (`migrate` says `BEGIN IMMEDIATE` itself).
+    /// It takes the write lock up front, so another writer waits out the busy timeout. A deferred
+    /// transaction that reads and then writes gets `database is locked` at once instead (#104).
+    fn write_tx(&mut self) -> Result<Transaction<'_>> {
+        Ok(self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
     /// Versioned and idempotent: re-running changes nothing.
     fn migrate(&self) -> Result<()> {
         let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -271,7 +278,7 @@ impl Store {
             return Ok(());
         }
         self.conn.execute_batch(
-            "BEGIN;
+            "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS tasks (
                id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL,
                body TEXT NOT NULL, saved_at INTEGER NOT NULL,
@@ -430,7 +437,7 @@ impl Store {
         completed: &[String],
         now: i64,
     ) -> Result<Option<&'static str>> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let exists: bool = tx.query_row(
             "SELECT count(*) > 0 FROM tasks WHERE id = ?1 AND version = ?2",
             params![task_id, version],
@@ -496,7 +503,7 @@ impl Store {
 
     /// Saves a task as a new version (max + 1; 1 for a new id). Older versions are kept.
     pub fn save_task(&mut self, id: &str, name: &str, body: &str, now: i64) -> Result<i64> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM tasks WHERE id = ?1",
             [id],
@@ -522,7 +529,7 @@ impl Store {
         now: i64,
         build: impl FnOnce(i64) -> Result<String>,
     ) -> Result<i64> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM tasks WHERE id = ?1",
             [id],
@@ -631,7 +638,7 @@ impl Store {
     /// Creates a list run's rows 1..=n, all `pending`. Rows are numbered from 1, the same number the audit
     /// trail's `item` carries. All or none.
     pub fn create_run_items(&mut self, run_id: &str, n: i64) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         for item in 1..=n {
             tx.execute(
                 "INSERT INTO run_items (run_id, item, state, last_step) VALUES (?1, ?2, 'pending', NULL)",
@@ -654,7 +661,7 @@ impl Store {
         n: i64,
         now: i64,
     ) -> Result<Vec<OpenRun>> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let open = open_runs_of(&tx, task_id, id)?;
         if open.is_empty() {
             tx.execute(
@@ -681,7 +688,7 @@ impl Store {
     /// Marks a list run `running`, only if no OTHER list run of its task is unfinished, in one immediate
     /// transaction (this also guards reopening a finished run). Returns those others; empty means it was marked.
     pub fn mark_list_run_running(&mut self, id: &str, task_id: &str) -> Result<Vec<OpenRun>> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let others = open_runs_of(&tx, task_id, id)?;
         if others.is_empty() {
             tx.execute("UPDATE runs SET status = 'running' WHERE id = ?1", params![id])?;
@@ -786,7 +793,7 @@ impl Store {
 
     /// Appends a hash-chained audit record. Returns its seq.
     pub fn append_audit(&mut self, e: &AuditEntry) -> Result<i64> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let seq = append_in(&tx, e)?;
         tx.commit()?;
         Ok(seq)
@@ -897,7 +904,7 @@ impl Store {
             return Err(StoreError::Db("retention must be at least 1 day".into()));
         }
         let cutoff = now - i64::from(retention_days) * SECONDS_PER_DAY;
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let (head_seq, anchor_seq): (i64, i64) = tx.query_row(
             "SELECT head_seq, anchor_seq FROM audit_meta",
             [],
