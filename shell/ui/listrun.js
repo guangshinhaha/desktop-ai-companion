@@ -137,6 +137,14 @@
         mount.appendChild(el("p", { className: "flag unknown", attrs: { "data-role": "no-approval", role: "alert" } },
           "This task has no step that asks for approval: every row would run without a card. Check the task before you start."));
       }
+      const dup = s.preview.duplicate_rows;
+      if (dup && dup.total > 0) {
+        const more = dup.total - dup.pairs.length;
+        mount.appendChild(el("p", { className: "flag unknown", attrs: { "data-role": "duplicate-rows", role: "alert" } },
+          "Some rows are identical: " + dup.pairs.map(([a, b]) => "rows " + a + " and " + b).join("; ") +
+          (more > 0 ? "; and " + more + " more " + (more === 1 ? "pair" : "pairs") : "") +
+          ". Each row runs on its own, so the same entry could be made twice. Check the file before you start."));
+      }
       for (const name of s.preview.inputs) {
         const sel = el("select", { attrs: { "data-role": "map-" + name } });
         sel.appendChild(el("option", { value: "" }, "(choose a column)"));

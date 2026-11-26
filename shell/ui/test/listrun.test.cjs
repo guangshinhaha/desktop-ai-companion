@@ -138,3 +138,31 @@ test("a run error and a task with no approval step are shown", async () => {
   b.ui.draw();
   assert.equal(role(b.mount, "no-approval").length, 1);
 });
+
+test("identical rows are warned about by row number, and Start stays enabled", async () => {
+  const { ui, mount, calls } = setup({ run: "run_1", status: "running", items: [] });
+  ui.state.preview = { columns: ["A"], rows: 7, inputs: ["x"], suggested: {}, approval_steps: 1, duplicate_rows: { pairs: [[1, 3], [2, 7]], total: 2 } };
+  ui.draw();
+  const w = role(mount, "duplicate-rows");
+  assert.equal(w.length, 1);
+  assert.equal(w[0].attrs.role, "alert");
+  assert.match(w[0].textContent, /rows 1 and 3; rows 2 and 7\./);
+  assert.doesNotMatch(w[0].textContent, /more/);
+  assert.equal(role(mount, "start")[0].disabled, false);
+  await role(mount, "start")[0].click();
+  assert.equal(calls.filter((c) => c[0] === "listrun_start").length, 1);
+});
+
+test("when there are more identical rows than listed, the warning says how many more", () => {
+  const { ui, mount } = setup({ items: [] });
+  ui.state.preview = { columns: ["A"], rows: 26, inputs: ["x"], suggested: {}, approval_steps: 1, duplicate_rows: { pairs: [[1, 2], [1, 3]], total: 25 } };
+  ui.draw();
+  assert.match(role(mount, "duplicate-rows")[0].textContent, /rows 1 and 2; rows 1 and 3; and 23 more pairs\./);
+});
+
+test("with no identical rows there is no duplicate warning", () => {
+  const { ui, mount } = setup({ items: [] });
+  ui.state.preview = { columns: ["A"], rows: 2, inputs: ["x"], suggested: {}, approval_steps: 1, duplicate_rows: { pairs: [], total: 0 } };
+  ui.draw();
+  assert.equal(role(mount, "duplicate-rows").length, 0);
+});

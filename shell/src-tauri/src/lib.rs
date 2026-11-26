@@ -521,25 +521,16 @@ fn saved_task(store: &store::Store, task_id: &str, version: i64) -> Result<serde
     serde_json::from_str(&body).map_err(|_| "the saved task is not readable".to_string())
 }
 
-/// Reads the file on this machine and says what it holds: column names and a row count, never a cell.
-/// Until the officer says the first row is a header, no cell is shown as a name: the columns are numbered.
+/// Reads the file on this machine and says what it holds: column names, a row count and the numbers of identical
+/// rows, never a data cell. Until the officer says the first row is a header, no cell is shown as a name: the
+/// columns are numbered.
 #[tauri::command]
 async fn listrun_preview(path: String, task_id: String, version: i64, header: bool) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let store = open_store()?;
         let task = saved_task(&store, &task_id, version)?;
-        let inputs = csv::task_inputs(&task);
         let (file, _) = csv::read_file(std::path::Path::new(&path), header)?;
-        let names: Vec<&String> = inputs.iter().map(|i| &i.name).collect();
-        // A step that is not marked "no" is asked about. None means every row runs with no card.
-        let asked = task["steps"].as_array().map_or(0, |s| s.iter().filter(|x| x["consequential"] != "no").count());
-        Ok(serde_json::json!({
-            "columns": file.header,
-            "rows": file.rows.len(),
-            "inputs": names,
-            "suggested": if header { csv::suggest_mapping(&file.header, &inputs) } else { Default::default() },
-            "approval_steps": asked,
-        }))
+        Ok(csv::preview(&file, &task, header))
     })
     .await
     .map_err(|e| e.to_string())?

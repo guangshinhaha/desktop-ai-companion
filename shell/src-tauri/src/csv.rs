@@ -11,6 +11,7 @@ pub const MAX_ROWS: usize = 5000;
 pub const MAX_COLUMNS: usize = 64;
 /// Same as the executor's `RunInputs.maxValueLength`: a longer value would be refused there anyway.
 pub const MAX_VALUE_CHARS: usize = 256;
+const MAX_DUPLICATE_PAIRS: usize = 20;
 
 #[derive(Debug, PartialEq)]
 pub struct Csv {
@@ -138,9 +139,12 @@ pub fn parse(bytes: &[u8], has_header: bool) -> Result<Csv, String> {
         if h.iter().any(bad) {
             return Err("a column name holds a control or hidden character".into());
         }
-        let mut seen = std::collections::BTreeSet::new();
-        if let Some(d) = h.iter().find(|h| !seen.insert(h.as_str())) {
-            return Err(format!("two columns are both called \"{d}\""));
+        // By position: if the box was ticked wrongly, a "name" is a cell.
+        let mut seen = BTreeMap::new();
+        for (i, name) in h.iter().enumerate() {
+            if let Some(first) = seen.insert(name.as_str(), i) {
+                return Err(format!("columns {} and {} have the same name", first + 1, i + 1));
+            }
         }
         h
     } else {
@@ -198,6 +202,40 @@ pub fn suggest_mapping(header: &[String], inputs: &[InputSpec]) -> BTreeMap<Stri
         .filter(|i| header.iter().any(|h| h == &i.name))
         .map(|i| (i.name.clone(), i.name.clone()))
         .collect()
+}
+
+/// What the list run screen may know before Start: column names, counts and row numbers, never a data cell.
+pub fn preview(file: &Csv, task: &Value, header: bool) -> Value {
+    let inputs = task_inputs(task);
+    let names: Vec<&String> = inputs.iter().map(|i| &i.name).collect();
+    // A step that is not marked "no" is asked about. None means every row runs with no card.
+    let asked = task["steps"].as_array().map_or(0, |s| s.iter().filter(|x| x["consequential"] != "no").count());
+    let (pairs, total) = duplicate_rows(file);
+    json!({
+        "columns": file.header,
+        "rows": file.rows.len(),
+        "inputs": names,
+        "suggested": if header { suggest_mapping(&file.header, &inputs) } else { Default::default() },
+        "approval_steps": asked,
+        "duplicate_rows": { "pairs": pairs, "total": total },
+    })
+}
+
+/// Rows whose every cell matches an earlier row, as (first such row, this row), numbered from 1 as in the run.
+/// The first `MAX_DUPLICATE_PAIRS` pairs, and how many there are in all.
+fn duplicate_rows(csv: &Csv) -> (Vec<(usize, usize)>, usize) {
+    let mut first = std::collections::HashMap::new();
+    let (mut pairs, mut total) = (Vec::new(), 0);
+    for (i, row) in csv.rows.iter().enumerate() {
+        let earlier = *first.entry(row).or_insert(i + 1);
+        if earlier != i + 1 {
+            total += 1;
+            if pairs.len() < MAX_DUPLICATE_PAIRS {
+                pairs.push((earlier, i + 1));
+            }
+        }
+    }
+    (pairs, total)
 }
 
 /// One value that cannot be typed. Names the row and the input, never the value.
@@ -297,6 +335,40 @@ mod tests {
         assert!(parse(b"a,b\n\"1,2\n").is_err());
         assert!(parse(b"a\n\x07\n").unwrap_err().contains("row 1"));
         assert!(parse(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn a_repeated_column_name_is_refused_by_position_never_by_value() {
+        // The officer wrongly ticked "the first row holds column names", so that row is a person's details.
+        let e = parse(b"x,Ann Test,y,Ann Test\n1,2,3,4\n").unwrap_err();
+        assert!(e.contains("columns 2 and 4"), "{e}");
+        assert!(!e.contains("Ann"), "{e}");
+    }
+
+    #[test]
+    fn the_preview_pairs_identical_whole_rows_by_number_and_holds_no_cell() {
+        // Rows 3 and 4 repeat rows 1 and 2 once trimmed. Row 5 differs from row 1 in a column the task does not use.
+        let c = parse(b"full_name,note\nAnn Test,a\nBo Test,b\n Ann Test ,\"a\"\nBo Test,b\nAnn Test,z\nAnn Test,a\n").unwrap();
+        let task = json!({"inputs":[{"name":"full_name","type":"text"}]});
+        let p = preview(&c, &task, true);
+        assert_eq!(p["duplicate_rows"], json!({"pairs": [[1, 3], [2, 4], [1, 6]], "total": 3}));
+        assert!(!p.to_string().contains("Ann") && !p.to_string().contains("Bo Test"));
+        // With no header the first row is data and is compared like any other.
+        let c = super::parse(b"Ann Test\nAnn Test\n", false).unwrap();
+        let p = preview(&c, &task, false);
+        assert_eq!(p["duplicate_rows"], json!({"pairs": [[1, 2]], "total": 1}));
+        assert!(!p.to_string().contains("Ann"));
+    }
+
+    #[test]
+    fn the_preview_lists_at_most_20_pairs_and_counts_them_all() {
+        let c = parse(format!("a\n{}", "x\n".repeat(26)).as_bytes()).unwrap();
+        let d = preview(&c, &json!({}), true)["duplicate_rows"].clone();
+        assert_eq!(d["pairs"].as_array().unwrap().len(), 20);
+        assert_eq!(d["pairs"][19], json!([1, 21]));
+        assert_eq!(d["total"], 25);
+        let none = parse(b"a,b\n1,2\n1,3\n").unwrap();
+        assert_eq!(preview(&none, &json!({}), true)["duplicate_rows"], json!({"pairs": [], "total": 0}));
     }
 
     #[test]
