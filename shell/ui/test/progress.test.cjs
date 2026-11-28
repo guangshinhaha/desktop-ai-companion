@@ -126,14 +126,38 @@ function stoppedView(report) {
   });
 }
 
-test("a stop after the action says the step may have taken effect, and does not say the app was left as it is", async () => {
-  const { ui, mount } = setup(stoppedView({ action_done: true }));
+// The attempted step is not in the executor's not_run, and action_done is "unknown" (#138).
+test("a stop after an attempted action says it may have taken effect, never that it was done or not done", async () => {
+  const { ui, mount } = setup(stoppedView({ action_done: "unknown", not_run: ["s3"] }));
   await ui.load();
-  assert.match(role(mount, "outcome")[0].textContent, /Step s2 may have taken effect/);
-  assert.doesNotMatch(role(mount, "outcome")[0].textContent, /Nothing further was done/);
-  assert.match(role(mount, "acted")[0].textContent, /action was done and its check was not confirmed/);
-  assert.equal(role(mount, "not-run")[0].textContent, "Not done: s3");
+  assert.equal(role(mount, "outcome")[0].textContent, "Stopped. Step s2 may have taken effect.");
+  assert.equal(role(mount, "count")[0].textContent, "1 of 3 steps done, 1 not confirmed, 1 remaining.");
+  assert.equal(role(mount, "not-run")[0].textContent, "Not started: s3");
+  assert.equal(role(mount, "acted")[0].textContent, "Step s2: whether its action happened is unknown. Check the app before running again.");
   assert.equal(role(mount, "left-as-is").length, 0);
+  assert.doesNotMatch(mount.textContent, /action was done|Nothing further was done/);
+});
+
+for (const outcome of ["diverged", "not_approved"]) {
+  test(`a ${outcome} run with an attempted step says so and does not list it as not done`, async () => {
+    const v = stoppedView({ outcome, action_done: "unknown", not_run: [], reason: "the app refused" });
+    const { ui, mount } = setup({ ...v, state: outcome });
+    await ui.load();
+    assert.match(role(mount, "outcome")[0].textContent, /^The run stopped.*\. Step s2 may have taken effect\.$/);
+    assert.equal(role(mount, "not-run")[0].textContent, "Not started: none");
+    assert.match(role(mount, "acted")[0].textContent, /Step s2: whether its action happened is unknown/);
+    assert.equal(role(mount, "left-as-is").length, 0);
+    assert.doesNotMatch(mount.textContent, /Nothing further was done|Not done:/);
+  });
+}
+
+test("a diverged run that tried nothing keeps the step under not done", async () => {
+  const v = stoppedView({ outcome: "diverged", reason: "element not found" });
+  const { ui, mount } = setup({ ...v, state: "diverged" });
+  await ui.load();
+  assert.equal(role(mount, "outcome")[0].textContent, "The run stopped because the app did not match the recording.");
+  assert.equal(role(mount, "not-run")[0].textContent, "Not done: s2, s3");
+  assert.equal(role(mount, "acted").length, 0);
 });
 
 test("an executor that had to be ended mid-step is shown as stopped with the step's effect unknown", async () => {
@@ -141,7 +165,7 @@ test("an executor that had to be ended mid-step is shown as stopped with the ste
   await ui.load();
   assert.match(role(mount, "acted")[0].textContent, /whether its action happened is unknown/);
   assert.equal(role(mount, "left-as-is").length, 0);
-  assert.equal(role(mount, "not-run")[0].textContent, "Not done: s3");
+  assert.equal(role(mount, "not-run")[0].textContent, "Not started: s3");
 });
 
 test("when the system-wide shortcut could not be registered the hint says so", async () => {

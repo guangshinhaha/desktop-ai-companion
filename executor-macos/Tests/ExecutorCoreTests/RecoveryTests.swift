@@ -415,7 +415,7 @@ final class RecoveryReplayTests: XCTestCase {
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
                          ceiling: 2, audit: audit, control: control, recovery: model,
                          recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
-        XCTAssertEqual(r.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(r.outcome, .stopped(step: "s1"))
         XCTAssertTrue(h.actions.isEmpty)
         XCTAssertFalse(audit.kinds.contains(.recovered))
         XCTAssertTrue(audit.kinds.contains(.runStopped))
@@ -438,7 +438,7 @@ final class RecoveryReplayTests: XCTestCase {
         let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
                          ceiling: 2, audit: audit, control: control, recovery: StopThenClose(control),
                          recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
-        guard case .stopped(step: "s1", _) = r.outcome else { return XCTFail("\(r.outcome)") }
+        guard case .stopped(step: "s1") = r.outcome else { return XCTFail("\(r.outcome)") }
         XCTAssertEqual(h.actions, ["set:full-name"], "only the step's own typing; recovery's answer was not acted on")
     }
 
