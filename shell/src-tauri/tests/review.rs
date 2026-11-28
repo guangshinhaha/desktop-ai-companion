@@ -527,6 +527,25 @@ fn a_recorder_that_exits_with_an_error_after_writing_leaves_no_file() {
 }
 
 #[test]
+fn a_paused_recorder_is_not_taken_as_exited_and_can_still_be_stopped() {
+    let dir = tmp("paused");
+    let bin = fake_executor(&dir, &recorded().to_string(), true);
+    let (run, exit) = start(&bin, &dir.join("drafts"));
+    wait_ready(&dir);
+    let pid = std::fs::read_to_string(dir.join("ready")).unwrap().trim().to_string();
+    let signal = |name: &str| assert!(Command::new("kill").args([name, &pid]).status().unwrap().success());
+
+    signal("-STOP");
+    assert!(exit.recv_timeout(Duration::from_millis(500)).is_err(), "a paused recorder was reported as exited");
+    signal("-CONT");
+    assert!(exit.recv_timeout(Duration::from_millis(500)).is_err(), "a resumed recorder was reported as exited");
+
+    run.stopper().stop().unwrap();
+    let written = exit.recv_timeout(Duration::from_secs(5)).expect("the stop did not reach the recorder");
+    assert!(written.is_ok(), "{written:?}");
+}
+
+#[test]
 fn a_recorder_that_ignores_the_stop_is_ended_and_leaves_no_file() {
     let dir = tmp("rec-stuck");
     let bin = dir.join("fake-stuck");

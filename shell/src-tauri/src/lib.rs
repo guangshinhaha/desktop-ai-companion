@@ -391,6 +391,7 @@ async fn task_note_remove(task_id: String, note_id: i64) -> Result<serde_json::V
 
 fn open_review_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(REVIEW) {
+        let _ = w.unminimize(); // focusing alone leaves a minimised window where it is
         let _ = w.set_focus();
         return;
     }
@@ -873,7 +874,9 @@ pub fn run() {
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Companion", true, None::<&str>)?;
             let list = tauri::menu::MenuItem::with_id(app, "listrun", "Run a task over a spreadsheet...", true, None::<&str>)?;
             let notes = tauri::menu::MenuItem::with_id(app, "notes", "Task notes", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&list, &notes, &quit])?;
+            // The way back to a review whose window was closed: no new recording starts until it ends.
+            let review = tauri::menu::MenuItem::with_id(app, "review", "Review recording", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&review, &list, &notes, &quit])?;
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?)
                 .icon_as_template(true)
@@ -883,6 +886,8 @@ pub fn run() {
                 .on_menu_event(|app, e| {
                     if e.id() == "quit" {
                         app.exit(0);
+                    } else if e.id() == "review" {
+                        open_review_window(app);
                     } else if e.id() == "listrun" {
                         open_listrun_window(app);
                     } else if e.id() == "notes" {

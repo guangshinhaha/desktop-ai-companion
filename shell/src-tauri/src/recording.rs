@@ -6,7 +6,7 @@
 use crate::review::Draft;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Ceiling for the executor to finish writing after a stop signal. A bound on waiting, not a pause.
@@ -155,6 +155,16 @@ pub fn start(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let out = dir.join(format!("draft-{}-{nanos}.json", std::process::id()));
+    // The watcher exists before the recorder does: a recorder with nothing watching it would run on.
+    let (hand_over, run) = mpsc::channel::<(Arc<Watched>, Child, PathBuf)>();
+    std::thread::Builder::new()
+        .spawn(move || {
+            // No run arrives when the recorder never started.
+            if let Ok((watched, child, out)) = run.recv() {
+                on_exit(watch(&watched, child, out));
+            }
+        })
+        .map_err(|e| format!("cannot start the recorder: {}", e.kind()))?;
     let child = Command::new(bin)
         .args(["record", "--app", app_bundle, "--out"])
         .arg(&out)
@@ -168,8 +178,8 @@ pub fn start(
         end: Mutex::default(),
         ended: Condvar::new(),
     });
-    let theirs = Arc::clone(&watched);
-    std::thread::spawn(move || on_exit(watch(&theirs, child, out)));
+    // The watcher is blocked on this channel, so the send has a receiver.
+    let _ = hand_over.send((Arc::clone(&watched), child, out));
     Ok(Recording { watched })
 }
 
@@ -198,14 +208,30 @@ fn watch(watched: &Watched, mut child: Child, out: PathBuf) -> Result<PathBuf, S
 fn wait_without_reaping(pid: libc::pid_t) {
     loop {
         // SAFETY: `info` is a plain struct that waitid fills in; nothing else is passed to it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
             libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
         };
-        // Any error but an interrupt means there is nothing to wait for; the reap that follows says so.
-        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        if r != 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return; // nothing to wait for; the reap that follows says so
+        }
+        if matches!(info.si_code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED) {
             return;
         }
+        // macOS also answers here for a paused child, which is still alive. Take that report,
+        // or the next wait returns it again at once. No exit is taken: WEXITED is not asked for.
+        // SAFETY: as above.
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            )
+        };
     }
 }
 
