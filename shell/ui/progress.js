@@ -43,15 +43,18 @@
       return ids.length ? ids.join(", ") : "none";
     }
 
-    // The step the stop may have caught after its action: done, or not known. Otherwise nothing was acted on.
+    // The step an action was tried on, or may have been, and was not confirmed: on a stop, a divergence or any
+    // other end. It is never called done or not done (#138). Otherwise null.
     function actedStep(r) {
-      return r && view.state === "stopped" && (r.action_done === true || r.action_done === "unknown") && r.step ? r.step : null;
+      return r && r.action_done && r.step ? r.step : null;
     }
 
     function outcomeText() {
+      const over = OVER[view.state] || "The run ended.";
       const acted = actedStep(view.report);
-      if (acted) return "Stopped. Step " + acted + " may have taken effect.";
-      return OVER[view.state] || "The run ended.";
+      if (!acted) return over;
+      // "Nothing further was done" is left out: it reads as if nothing was done at all.
+      return (view.state === "stopped" ? "Stopped." : over) + " Step " + acted + " may have taken effect.";
     }
 
     function draw() {
@@ -63,7 +66,9 @@
       const total = view.steps.length;
       const done = view.steps.filter((s) => s.status === "done").length;
       mount.appendChild(el("h1", {}, view.task));
-      mount.appendChild(el("p", { attrs: { "data-role": "count" } }, done + " of " + total + " steps done, " + (total - done) + " remaining."));
+      const acted = view.over ? actedStep(view.report) : null;
+      const unsure = acted ? "1 not confirmed, " : "";
+      mount.appendChild(el("p", { attrs: { "data-role": "count" } }, done + " of " + total + " steps done, " + unsure + (total - done - (acted ? 1 : 0)) + " remaining."));
       if (!view.over) {
         const say = view.current && view.current.say ? view.current.say : "Starting.";
         mount.appendChild(el("p", { className: "say", attrs: { "data-role": "say" } }, say));
@@ -76,13 +81,12 @@
         ...view.steps.map((s) => el("li", { attrs: { "data-status": s.status } }, MARK[s.status] + " " + s.say))));
       if (view.over && view.report) {
         const r = view.report;
-        const acted = actedStep(r);
         mount.appendChild(el("p", { attrs: { "data-role": "completed" } }, "Completed: " + names(r.completed || [])));
-        // A step that may have been acted on is not listed as not done.
-        mount.appendChild(el("p", { attrs: { "data-role": "not-run" } }, "Not done: " + names((r.not_run || []).filter((id) => id !== acted))));
+        // The attempted step is not listed here. "Not started", so that "none" does not read as "all done".
+        const rest = (r.not_run || []).filter((id) => id !== acted);
+        mount.appendChild(el("p", { attrs: { "data-role": "not-run" } }, (acted ? "Not started: " : "Not done: ") + names(rest)));
         if (acted) {
-          const how = r.action_done === true ? "its action was done and its check was not confirmed" : "whether its action happened is unknown";
-          mount.appendChild(el("p", { className: "flag", attrs: { "data-role": "acted" } }, "Step " + acted + ": " + how + ". Check the app before running again."));
+          mount.appendChild(el("p", { className: "flag", attrs: { "data-role": "acted" } }, "Step " + acted + ": whether its action happened is unknown. Check the app before running again."));
         }
         if (r.reason) mount.appendChild(el("p", { attrs: { "data-role": "reason" } }, "Reason: " + r.reason));
         if (view.state === "stopped" && !acted) {

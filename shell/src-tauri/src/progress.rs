@@ -512,6 +512,14 @@ mod tests {
     }
 
     #[test]
+    fn a_divergence_after_an_attempted_action_reaches_the_window_as_unconfirmed() {
+        let mut p = Progress::new("r", &task());
+        p.finish(&Ok(json!({ "outcome": "diverged", "step": "s2", "action_done": "unknown", "reason": "the action failed", "completed": ["s1"], "not_run": ["s3"] })));
+        assert_eq!(p.view()["report"]["action_done"], "unknown");
+        assert_eq!(p.view()["report"]["not_run"], json!(["s3"]));
+    }
+
+    #[test]
     fn stop_before_the_executor_exists_is_remembered_and_stop_after_the_end_does_nothing() {
         let mut r = ActiveRun::new(Progress::new("r", &task()));
         r.stop();
