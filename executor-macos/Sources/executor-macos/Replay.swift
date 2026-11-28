@@ -105,9 +105,11 @@ func runReplay(_ args: [String]) -> Never {
         unconfirmed(step)
         exit(2)
     case .notApproved(let step):
-        say("run stopped: step \(step) was not approved, and nothing was done for it")
+        // Recovery may have typed into the step before the officer rejected it.
+        say("run stopped: step \(step) was not approved\(report.actionTried ? "" : ", and nothing was done for it")")
         say("  completed: \(list(report.completed))")
         say("  not run: \(list(report.notRun))")
+        unconfirmed(step)
         exit(4)
     case .stopped(let step):
         // The terminal command has no stop control; this is here so the switch stays complete.
