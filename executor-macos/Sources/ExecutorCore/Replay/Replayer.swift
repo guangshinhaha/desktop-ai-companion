@@ -5,17 +5,20 @@ public struct ReplayReport {
         case finished
         /// The step could not be done or its check never passed. The reason holds names and labels, never values.
         case diverged(step: String, reason: String)
-        /// The officer did not approve the step. Nothing was done for it.
+        /// The officer did not approve the step, so its approved action never ran.
         case notApproved(step: String)
         /// Refused before the first action (precondition, unsupported task).
         case refused(String)
-        /// The officer stopped the run. Nothing was done after the stop. `actionDone` is true when the step
-        /// had been acted on but its checks were not confirmed yet: look at the app for that one.
-        case stopped(step: String, actionDone: Bool)
+        /// The officer stopped the run. Nothing was done after the stop.
+        case stopped(step: String)
     }
     public var outcome: Outcome
     public var completed: [String]
+    /// The steps never tried. A step an action was tried on is never here (#138).
     public var notRun: [String]
+    /// True when an action was tried on the outcome's step, by the step itself or by recovery, and the step was
+    /// not confirmed. It is then in neither `completed` nor `notRun`: look at the app for that one.
+    public var actionTried: Bool = false
     /// True only for a divergence that means the target's interface is not what was recorded: the target was
     /// not found or matched more than one element, or the step's own check never held. False for anything else
     /// (a dialog, a failed audit write, a closed window, a failed action), so a re-verification flag is never
@@ -66,8 +69,8 @@ public final class Replayer {
 
     /// The step whose approval is in the trail but whose action has not been taken. A stop in that gap says so.
     private var approvedNotActed: String?
-    /// The last step an action was tried on, by the step itself or by recovery. A stop never lists it as not run.
-    private var attempted: String?
+    /// Whether an action was tried on the step now running, by the step itself or by recovery.
+    private var tried = false
     private var cancelled: (() -> Bool)? { control.map { c in { c.isStopped } } }
     private var stopAsked: Bool { control?.isStopped ?? false }
 
@@ -75,6 +78,7 @@ public final class Replayer {
     /// then `step_diverged` if it stopped and `run_finished` always. When a record cannot be written the run
     /// stops, so nothing is done that the trail does not know about.
     public func run() -> ReplayReport {
+        tried = false
         if let audit, !audit.record(AuditEvent(.runStarted)) {
             return ReplayReport(outcome: .refused("the audit trail could not be written; nothing was done"),
                                 completed: [], notRun: task.steps.map(\.id))
@@ -84,25 +88,24 @@ public final class Replayer {
             var outcome = "finished"
             func list(_ ids: [String]) -> String { ids.isEmpty ? "none" : ids.joined(separator: ", ") }
             let unactedApproval = approvedNotActed.map { " The approval for step \($0) was recorded and its action was not taken." } ?? ""
+            func unconfirmed(_ step: String) -> String {
+                report.actionTried ? " An action was attempted at step \(step) and is not confirmed: check the app." : ""
+            }
             switch report.outcome {
             case .diverged(let step, let reason):
                 // Reasons name steps and elements, never run values (see the report type).
                 _ = audit.record(AuditEvent(.stepDiverged, step: step, shown: ApprovalGate.safe(reason)))
                 // A stop that was asked stays on the trail when the run ends by diverging.
                 if stopAsked {
-                    let tried = attempted == step
-                    let notRun = tried ? Array(report.notRun.dropFirst()) : report.notRun
-                    var shown = "Stopped by the officer. The run had already diverged at step \(step). Completed: \(list(report.completed)). Not run: \(list(notRun))."
-                    shown += unactedApproval
-                    if tried { shown += " An action was attempted at step \(step) and is not confirmed: check the app." }
+                    var shown = "Stopped by the officer. The run had already diverged at step \(step). Completed: \(list(report.completed)). Not run: \(list(report.notRun))."
+                    shown += unactedApproval + unconfirmed(step)
                     _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
                 }
                 outcome = "diverged"
-            case .stopped(let step, let actionDone):
+            case .stopped(let step):
                 // Step ids and counts only. This is the record of the stop (PRD C-4).
                 var shown = "Stopped by the officer at step \(step). Completed: \(list(report.completed)). Not run: \(list(report.notRun))."
-                shown += unactedApproval
-                if actionDone { shown += " The step's action was done and its check was not confirmed." }
+                shown += unactedApproval + unconfirmed(step)
                 _ = audit.record(AuditEvent(.runStopped, step: step, shown: ApprovalGate.safe(shown)))
                 outcome = "stopped"
             case .notApproved: outcome = "not_approved"
@@ -117,12 +120,12 @@ public final class Replayer {
     private func runSteps() -> ReplayReport {
         var done: [String] = []
         func report(_ o: ReplayReport.Outcome, at index: Int, interfaceChanged: Bool = false) -> ReplayReport {
-            ReplayReport(outcome: o, completed: done, notRun: task.steps[index...].map(\.id), interfaceChanged: interfaceChanged)
+            ReplayReport(outcome: o, completed: done, notRun: task.steps[(tried ? index + 1 : index)...].map(\.id),
+                         actionTried: tried, interfaceChanged: interfaceChanged)
         }
 
-        func stopReport(at index: Int, actionDone: Bool = false) -> ReplayReport {
-            ReplayReport(outcome: .stopped(step: task.steps[index].id, actionDone: actionDone),
-                         completed: done, notRun: task.steps[index...].map(\.id))
+        func stopReport(at index: Int) -> ReplayReport {
+            report(.stopped(step: task.steps[index].id), at: index)
         }
 
         for pre in task.preconditions {
@@ -134,6 +137,7 @@ public final class Replayer {
         log("precondition(s) met: \(task.preconditions.count)")
 
         for (i, step) in task.steps.enumerated() {
+            tried = false
             let here = { (k: ReplayProgress.Kind) in
                 ReplayProgress(kind: k, step: step.id, say: ApprovalGate.safe(step.say), index: i + 1, total: self.task.steps.count)
             }
@@ -185,14 +189,14 @@ public final class Replayer {
                     if stopAsked { return stopReport(at: i) }
                     // The record comes before the action. No record, no action.
                     if let audit, !audit.record(AuditEvent(.approved, step: step.id, shown: shown)) {
-                        return report(.diverged(step: step.id, reason: "the audit trail could not be written; nothing was done for this step"), at: i)
+                        return report(.diverged(step: step.id, reason: "the audit trail could not be written, so the approved action was not taken"), at: i)
                     }
                     approvedNotActed = step.id
                     approval = a
                 }
                 // The officer may have taken a while. Look again, once, and act only on what is there now.
                 guard let snap = host.snapshot() else {
-                    return report(.diverged(step: step.id, reason: "the window is gone after approval; nothing was done"), at: i)
+                    return report(.diverged(step: step.id, reason: "the window is gone after approval; the approved action was not taken"), at: i)
                 }
                 if let d = unexpectedDialog(in: snap, step: step) {
                     return report(.diverged(step: step.id, reason: "\(d) appeared after approval; nothing was clicked"), at: i)
@@ -202,14 +206,14 @@ public final class Replayer {
                                          && Self.mustAsk(step, live: m.node):
                     match = m
                 default:
-                    return report(.diverged(step: step.id, reason: "the element changed or went away after approval; nothing was done"), at: i)
+                    return report(.diverged(step: step.id, reason: "the element changed or went away after approval; the approved action was not taken"), at: i)
                 }
             }
 
             // 3. Act. Last look at the stop: after this, nothing is done for a step the officer stopped.
             if stopAsked { return stopReport(at: i) }
             approvedNotActed = nil
-            attempted = step.id
+            tried = true
             let acted = perform(step, on: match.node, approval: approval)
             // 4. Wait for the checks.
             switch acted {
@@ -219,7 +223,7 @@ public final class Replayer {
                 return report(.diverged(step: step.id, reason: "the action failed (\(why)).\(tail)"), at: i)
             case .ok:
                 if let (why, interface) = awaitChecks(step, ceiling: stepCeiling, gated: gated) {
-                    if stopAsked { return stopReport(at: i, actionDone: true) }
+                    if stopAsked { return stopReport(at: i) }
                     // A gated step's action may have taken effect: it is never recovered or retried. The officer looks.
                     guard recovery != nil, !gated else {
                         return report(.diverged(step: step.id, reason: why), at: i, interfaceChanged: interface)
@@ -231,7 +235,7 @@ public final class Replayer {
                     }
                     switch recover(step, divergence: why, spent: &spent, hold: hold, resume: recheck) {
                     case .recovered: break
-                    case .stopped: return stopReport(at: i, actionDone: true)
+                    case .stopped: return stopReport(at: i)
                     case .gaveUp(let w): return report(.diverged(step: step.id, reason: w), at: i, interfaceChanged: interface)
                     }
                 }
@@ -292,8 +296,8 @@ public final class Replayer {
             let head = "Recovery at step \(step.id) (attempt \(attempt) of \(max))"
             func refused(_ why: String) -> String? {
                 // The refusal is a record too. No record, no further attempt.
-                if let audit, !audit.record(AuditEvent(.stepDiverged, step: step.id, shown: ApprovalGate.safe("\(head): the answer was refused: \(why). Nothing was done."))) {
-                    return "\(first). The audit trail could not be written; nothing was done. \(officer)"
+                if let audit, !audit.record(AuditEvent(.stepDiverged, step: step.id, shown: ApprovalGate.safe("\(head): the answer was refused: \(why). It was not acted on."))) {
+                    return "\(first). The audit trail could not be written, so recovery stopped there. \(officer)"
                 }
                 return nil
             }
@@ -311,7 +315,7 @@ public final class Replayer {
                 return .gaveUp("\(last). Recovery asked for the officer: \(why)")
             case .success(.retry):
                 guard written("\(head): wait for the step again. Why: \(last).") else {
-                    return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
+                    return .gaveUp("\(first). The audit trail could not be written, so recovery stopped there. \(officer)")
                 }
             case .success(.setValue(let ref)):
                 guard let now = host.snapshot() else { return .gaveUp("\(last). Recovery could not see the window. \(officer)") }
@@ -324,11 +328,11 @@ public final class Replayer {
                 case .success(let n): node = n
                 }
                 guard written("\(head): type the step's own input into \(node.role) \"\(node.label ?? "")\". Why: \(last).") else {
-                    return .gaveUp("\(first). The audit trail could not be written; nothing was done. \(officer)")
+                    return .gaveUp("\(first). The audit trail could not be written, so recovery stopped there. \(officer)")
                 }
                 if settled(hold) { return .stopped }
                 guard let input = step.value, let v = inputs.resolve(input) else { return .gaveUp("\(first). No value for this step. \(officer)") }
-                attempted = step.id
+                tried = true
                 let result = host.setValue(node, to: v.reveal())
                 if case .failed(let why) = result { return .gaveUp("\(first). Recovery's action failed (\(why)). \(officer)") }
             }
@@ -415,7 +419,7 @@ public final class Replayer {
             sawWindow = true
             guard let failing = checksFailure(step, root: root) else { return .done(()) }
             // A passing check wins over a dialog that the step expects; otherwise a new dialog is a stop.
-            if let d = unexpectedDialog(in: root, step: step) { return .stop("unexpected dialog: \(d) appeared and was not clicked. The step's action was done and the dialog is still open; recovery is Phase 1") }
+            if let d = unexpectedDialog(in: root, step: step) { return .stop("unexpected dialog: \(d) appeared and was not clicked. The step's action is not confirmed and the dialog is still open") }
             last = failing
             return .keepWaiting
         }

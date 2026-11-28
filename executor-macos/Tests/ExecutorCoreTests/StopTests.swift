@@ -59,7 +59,7 @@ final class StopTests: XCTestCase {
         var stopAt: TimeInterval?
         let poll = once(Self.stopLine) { if h.clock >= 1.0 { stopAt = h.clock; return true }; return false }
         let r = try run(h, poll: poll)
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s1"))
         XCTAssertLessThanOrEqual(h.clock - (stopAt ?? 99), 0.5, "the wait is cut into slices")
         XCTAssertLessThan(h.clock, 5, "it did not wait out the 30 s ceiling")
         XCTAssertTrue(h.actions.isEmpty)
@@ -70,7 +70,7 @@ final class StopTests: XCTestCase {
     func testStopBeforeTheFirstStepActsOnNothing() throws {
         let h = formHost()
         let r = try run(h, poll: { Self.stopLine })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s1"))
         XCTAssertTrue(h.actions.isEmpty)
         XCTAssertEqual(r.audit.kinds, [.runStarted, .runStopped, .runFinished])
     }
@@ -78,7 +78,7 @@ final class StopTests: XCTestCase {
     func testStopBetweenStepsKeepsWhatWasDoneAndReportsTheRest() throws {
         let h = formHost()
         let r = try run(h, poll: once(Self.stopLine) { h.actions.count >= 1 })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s2", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s2"))
         XCTAssertEqual(r.report.completed, ["s1"])
         XCTAssertEqual(r.report.notRun, ["s2", "s3"])
         XCTAssertEqual(h.actions, ["set:full-name"], "nothing after the stop; the field the officer's run filled stays as it is")
@@ -88,7 +88,7 @@ final class StopTests: XCTestCase {
         let h = formHost()
         var src: ScriptedApproval?
         let r = try run(h, answers: ["n"], poll: once(Self.stopLine) { (src?.asked ?? 0) > 0 }, asked: { src = $0 })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s3", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s3"))
         XCTAssertEqual(r.report.completed, ["s1", "s2"])
         XCTAssertFalse(h.actions.contains("press:Create account"))
         XCTAssertEqual(r.audit.kinds, [.runStarted, .runStopped, .runFinished])
@@ -99,7 +99,7 @@ final class StopTests: XCTestCase {
         var src: ScriptedApproval?
         // The officer says y, and the stop arrives right behind it.
         let r = try run(h, answers: ["y"], poll: once(Self.stopLine) { (src?.asked ?? 0) > 0 }, asked: { src = $0 })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s3", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s3"))
         XCTAssertFalse(h.actions.contains("press:Create account"))
         XCTAssertFalse(r.audit.kinds.contains(.approved), "an approval for an action that was not taken is not recorded")
     }
@@ -108,12 +108,77 @@ final class StopTests: XCTestCase {
         let h = FakeHost()
         h.tree = provisioningForm() // pressing does nothing visible, so the check waits
         let r = try run(h, poll: once(Self.stopLine) { h.actions.contains("press:Create account") && h.clock >= 1 })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s3", actionDone: true))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s3"))
+        XCTAssertTrue(r.report.actionTried)
         XCTAssertEqual(r.report.completed, ["s1", "s2"])
-        XCTAssertEqual(r.report.notRun, ["s3"])
+        XCTAssertEqual(r.report.notRun, [], "the pressed step is not listed as not run (#138)")
         XCTAssertEqual(h.actions.filter { $0.hasPrefix("press") }.count, 1)
-        let shown = r.audit.events.first { $0.kind == .runStopped }?.shown ?? ""
-        XCTAssertTrue(shown.contains("action was done"), shown)
+        let shown = r.audit.events.first { $0.kind == .runStopped }?.shown
+        XCTAssertEqual(shown, "Stopped by the officer at step s3. Completed: s1, s2. Not run: none. An action was attempted at step s3 and is not confirmed: check the app.")
+    }
+
+    /// #138, the second case: recovery typed, then the stop came while the target was still being looked for.
+    func testAStopAfterRecoveryTypedWhileFindingTheTargetDoesNotListTheStepAsNotRun() throws {
+        let h = FakeHost()
+        h.tree = formBehindNotice()
+        let control = RunControl()
+        h.onSet = { _, _ in control.stop() }
+        let t = try makeTask()
+        let audit = RecordingAudit()
+        let r = Replayer(task: t, inputs: try makeInputs(t), host: h, gate: ApprovalGate(source: ScriptedApproval([]), out: { _ in }),
+                         ceiling: 2, audit: audit, control: control,
+                         recovery: RecoveryReplayTests.PickingModel([("Full name", RecoveryReplayTests.retype)]),
+                         recoveryPolicy: RecoveryPolicy(classification: "official-closed"), log: { _ in }).run()
+        guard case .stopped(step: "s1") = r.outcome else { return XCTFail("\(r.outcome)") }
+        XCTAssertEqual(h.actions, ["set:full-name"], "only recovery's typing")
+        XCTAssertEqual(r.completed, [])
+        XCTAssertEqual(r.notRun, ["s2", "s3"])
+        XCTAssertEqual(audit.events.first { $0.kind == .runStopped }?.shown,
+                       "Stopped by the officer at step s1. Completed: none. Not run: s2, s3. An action was attempted at step s1 and is not confirmed: check the app.")
+    }
+
+    func testAStopOverRPCAfterAnActionSendsItAsUnconfirmedAndNotAsNotRun() throws {
+        let h = FakeHost()
+        h.tree = provisioningForm()
+        var stopped = false
+        let result = try serveRunPolling(h) { if !stopped && h.actions.contains("press:Create account") { stopped = true; return Self.stopLine }; return nil }
+        XCTAssertEqual(result?["outcome"] as? String, "stopped")
+        XCTAssertEqual(result?["not_run"] as? [String], [])
+        XCTAssertEqual(result?["action_done"] as? String, "unknown", "attempted is not the same as done")
+    }
+
+    func testADivergedRunDoesNotListTheAttemptedStepAsNotRun() throws {
+        let h = formHost()
+        h.pressResult = .failed("the app refused")
+        let result = try serveRunPolling(h) { nil }
+        XCTAssertEqual(result?["outcome"] as? String, "diverged")
+        XCTAssertEqual(result?["step"] as? String, "s3")
+        XCTAssertEqual(result?["completed"] as? [String], ["s1", "s2"])
+        XCTAssertEqual(result?["not_run"] as? [String], [])
+        XCTAssertEqual(result?["action_done"] as? String, "unknown")
+    }
+
+    func testADivergedRunThatTriedNothingOnTheStepStillListsItAsNotRun() throws {
+        let h = FakeHost()
+        h.tree = formBehindNotice() // a dialog is open before the first step acts
+        let result = try serveRunPolling(h) { nil }
+        XCTAssertEqual(result?["outcome"] as? String, "diverged")
+        XCTAssertEqual(result?["not_run"] as? [String], ["s1", "s2", "s3"])
+        XCTAssertNil(result?["action_done"])
+    }
+
+    func serveRunPolling(_ h: FakeHost, poll: @escaping () -> String?) throws -> [String: Any]? {
+        var out: [String] = []
+        var queue = [String(decoding: try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": "replay.start",
+            "params": ["task": taskJSON(), "inputs": ["full_name": "Aiden Tan", "email": "a@x.example.test"]]]), as: UTF8.self)]
+        RPC.serve(input: {
+            if !queue.isEmpty { return queue.removeFirst() }
+            guard let last = out.last, let o = RPC.parse(last), let method = o["method"] as? String, let id = o["id"] else { return nil }
+            if method == "approval.request" { return RPC.encode(["jsonrpc": "2.0", "id": id, "result": ["approved": true]]) }
+            return RPC.encode(["jsonrpc": "2.0", "id": id, "result": ["seq": 1]])
+        }, poll: poll, output: { out.append($0) }, hostFactory: { _, _ in h })
+        return out.compactMap(RPC.parse).last { $0["id"] as? Int == 1 }?["result"] as? [String: Any]
     }
 
     func testTheStopIsInTheAuditTrailWithWhatCompletedAndWhatDidNot() throws {
@@ -151,14 +216,14 @@ final class StopTests: XCTestCase {
     func testStopWhilePausedEndsTheRunWithoutActing() throws {
         let h = formHost()
         let r = try run(h, poll: once(Self.pauseLine) { true }, block: { Self.stopLine })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s1"))
         XCTAssertTrue(h.actions.isEmpty)
     }
 
     func testTheShellGoingAwayWhilePausedStopsTheRun() throws {
         let h = formHost()
         let r = try run(h, poll: once(Self.pauseLine) { true }, block: { nil })
-        XCTAssertEqual(r.report.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(r.report.outcome, .stopped(step: "s1"))
         XCTAssertTrue(h.actions.isEmpty)
     }
 
@@ -188,7 +253,7 @@ final class StopTests: XCTestCase {
         }
         let report = r.run()
         let endedAt = ProcessInfo.processInfo.systemUptime
-        XCTAssertEqual(report.outcome, .stopped(step: "s1", actionDone: false))
+        XCTAssertEqual(report.outcome, .stopped(step: "s1"))
         box.lock(); defer { box.unlock() }
         XCTAssertLessThan(endedAt - sentAt, 0.5)
     }

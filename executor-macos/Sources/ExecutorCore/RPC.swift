@@ -117,8 +117,10 @@ public enum RPC {
         case .diverged(let step, let reason): result["outcome"] = "diverged"; result["step"] = step; result["reason"] = reason; result["interface_changed"] = report.interfaceChanged
         case .notApproved(let step): result["outcome"] = "not_approved"; result["step"] = step
         case .refused(let why): result["outcome"] = "refused"; result["reason"] = why
-        case .stopped(let step, let actionDone): result["outcome"] = "stopped"; result["step"] = step; result["action_done"] = actionDone
+        case .stopped(let step): result["outcome"] = "stopped"; result["step"] = step; result["action_done"] = false
         }
+        // Attempted is not done: whether the action happened is never claimed. Any outcome with a step can carry it.
+        if report.actionTried { result["action_done"] = "unknown" }
         return encode(["jsonrpc": "2.0", "id": id, "result": result])
     }
 
