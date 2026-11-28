@@ -26,6 +26,7 @@ sha2 = "0.11.1"
 core-foundation = "0.10.1"
 ureq = "3"
 url = "2"
+libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12.1"
 

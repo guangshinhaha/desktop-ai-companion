@@ -453,6 +453,7 @@ name = "companion-shell"
 version = "0.1.0"
 dependencies = [
  "core-foundation",
+ "libc",
  "pdf-extract",
  "rusqlite",
  "security-framework",

@@ -1,14 +1,15 @@
 //! Review tests (#26). Synthetic data only. The store key is injected (never the login keychain).
 //! Saved tasks are checked by the real `scripts/validate-task`.
 
-use companion_shell::recording;
+use companion_shell::recording::{self, Phase};
 use companion_shell::review::{check_task, iso_utc, Draft};
 use companion_shell::store::{Fixed, Store};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Once;
+use std::sync::{mpsc, Arc, Mutex, Once};
+use std::time::Duration;
 
 const SECRET: &str = "Zebra-Quokka-7731"; // synthetic stand-in for a typed value
 const NOW: i64 = 1_795_000_000;
@@ -374,14 +375,16 @@ fn a_failed_save_keeps_nothing_in_the_store_and_the_value_only_after_a_good_save
 // ---- recording start and stop ----------------------------------------------------------
 
 /// A stand-in executor: on SIGINT it writes the recorded task to --out and exits 0, as the real
-/// one does at stop.
+/// one does at stop. SIGUSR1 does the same and stands in for Stop recording in the REC menu,
+/// where the shell sends nothing and the recorder ends by itself.
 fn fake_executor(dir: &Path, task: &str, write: bool) -> PathBuf {
     let bin = dir.join("fake-executor");
     let payload = dir.join("payload.json");
     std::fs::write(&payload, task).unwrap();
     let body = format!(
         "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = \"--out\" ] && out=\"$2\"; shift; done\n\
-         trap '{} exit 0' INT\ntouch \"{}/ready\"\nwhile :; do sleep 1 & wait $!; done\n",
+         trap '{} exit 0' INT USR1\necho $$ > \"{}/ready\"\n\
+         while :; do sleep 1 & wait $!; done\n",
         if write {
             format!("cp \"{}\" \"$out\";", payload.display())
         } else {
@@ -396,12 +399,47 @@ fn fake_executor(dir: &Path, task: &str, write: bool) -> PathBuf {
 }
 
 /// The stand-in installs its stop handler, then touches `ready`. Waits for that, bounded.
+/// The stand-in writes `ready` with a shell builtin: macOS /bin/sh can drop a SIGINT that arrives
+/// while it waits for a command such as `touch` or `mv` (#92). The newline says the write is whole.
 fn wait_ready(dir: &Path) {
     let t = std::time::Instant::now();
-    while !dir.join("ready").exists() {
-        assert!(t.elapsed().as_secs() < 10, "stand-in executor never became ready");
+    while !std::fs::read_to_string(dir.join("ready")).is_ok_and(|s| s.ends_with('\n')) {
+        assert!(t.elapsed() < BOUND, "stand-in executor never became ready");
         std::thread::yield_now();
     }
+}
+
+/// What the stand-in's exit produced, with a bound so a watcher that never fires fails the test.
+type Exit = mpsc::Receiver<Result<PathBuf, String>>;
+const BOUND: Duration = Duration::from_secs(30);
+
+fn start(bin: &Path, drafts: &Path) -> (recording::Recording, Exit) {
+    let (tx, rx) = mpsc::channel();
+    let rec = recording::start(bin, "com.google.Chrome", drafts, move |r| {
+        let _ = tx.send(r);
+    })
+    .unwrap();
+    (rec, rx)
+}
+
+/// Stop recording in the REC menu: the recorder ends on its own, with no call from the shell.
+fn choose_stop_in_rec_menu(dir: &Path) {
+    wait_ready(dir);
+    let pid = std::fs::read_to_string(dir.join("ready")).unwrap();
+    assert!(Command::new("/bin/kill").args(["-USR1", pid.trim()]).status().unwrap().success());
+}
+
+/// The same call `record_start` makes. The receiver fires when the shell has what to show.
+fn begin(phase: &Arc<Mutex<Phase>>, bin: &Path, drafts: &Path) -> Result<mpsc::Receiver<()>, String> {
+    let (tx, rx) = mpsc::channel();
+    recording::begin(phase, bin, "com.google.Chrome", drafts, move || {
+        let _ = tx.send(());
+    })?;
+    Ok(rx)
+}
+
+fn drafts_in(dir: &Path) -> usize {
+    std::fs::read_dir(dir).unwrap().count()
 }
 
 #[test]
@@ -409,9 +447,10 @@ fn stopping_a_recording_yields_the_file_the_review_opens() {
     let dir = tmp("rec");
     let bin = fake_executor(&dir, &recorded().to_string(), true);
     let drafts = dir.join("drafts");
-    let rec = recording::start(&bin, "com.google.Chrome", &drafts).unwrap();
+    let (rec, exit) = start(&bin, &drafts);
     wait_ready(&dir);
-    let path = recording::stop(rec).unwrap();
+    rec.stopper().stop().unwrap();
+    let path = exit.recv_timeout(BOUND).unwrap().unwrap();
     assert!(path.starts_with(&drafts));
     let d = Draft::from_file(&path).unwrap();
     assert_eq!(d.view()["steps"].as_array().unwrap().len(), 4);
@@ -420,14 +459,122 @@ fn stopping_a_recording_yields_the_file_the_review_opens() {
 }
 
 #[test]
+fn stop_in_the_rec_menu_puts_the_recording_under_review_with_no_call_from_the_shell() {
+    let dir = tmp("rec-menu");
+    let bin = fake_executor(&dir, &recorded().to_string(), true);
+    let drafts = dir.join("drafts");
+    let phase = Arc::new(Mutex::new(Phase::default()));
+    let finished = begin(&phase, &bin, &drafts).unwrap();
+    choose_stop_in_rec_menu(&dir);
+    finished.recv_timeout(BOUND).expect("the shell did not notice that the recorder finished");
+    let p = phase.lock().unwrap();
+    let Phase::Review(d) = &*p else { panic!("no draft under review") };
+    assert_eq!(d.view()["steps"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn no_new_recording_starts_while_one_is_going_stopping_or_under_review() {
+    let dir = tmp("rec-busy");
+    let bin = fake_executor(&dir, &recorded().to_string(), true);
+    let drafts = dir.join("drafts");
+    let phase = Arc::new(Mutex::new(Phase::default()));
+    let finished = begin(&phase, &bin, &drafts).unwrap();
+    assert!(begin(&phase, &bin, &drafts).unwrap_err().contains("already recording"));
+    choose_stop_in_rec_menu(&dir);
+    finished.recv_timeout(BOUND).unwrap();
+    assert!(begin(&phase, &bin, &drafts).unwrap_err().contains("under review"));
+    // The refused start swept nothing: the draft under review still has its file.
+    assert_eq!(drafts_in(&drafts), 1);
+}
+
+#[test]
+fn a_recorder_that_fails_or_writes_nothing_usable_says_so_and_a_new_recording_can_start() {
+    // (name, what the recorder writes, whether it writes, what the officer is told)
+    for (name, task, write, told) in [
+        ("rec-fail", "{}", false, "was not saved"),
+        ("rec-bad", "not json", true, "not a recorded task"),
+    ] {
+        let dir = tmp(name);
+        let bin = fake_executor(&dir, task, write);
+        let drafts = dir.join("drafts");
+        let phase = Arc::new(Mutex::new(Phase::default()));
+        let finished = begin(&phase, &bin, &drafts).unwrap();
+        choose_stop_in_rec_menu(&dir);
+        finished.recv_timeout(BOUND).unwrap();
+        match &*phase.lock().unwrap() {
+            Phase::Failed(why) => assert!(why.contains(told), "{name}: {why}"),
+            _ => panic!("{name}: the failure was not kept for the officer"),
+        }
+        assert_eq!(drafts_in(&drafts), 0, "{name}: a refused recording does not linger");
+        std::fs::remove_file(dir.join("ready")).unwrap();
+        let again = begin(&phase, &bin, &drafts).unwrap();
+        choose_stop_in_rec_menu(&dir);
+        again.recv_timeout(BOUND).unwrap();
+    }
+}
+
+#[test]
+fn a_recorder_that_exits_with_an_error_after_writing_leaves_no_file() {
+    let dir = tmp("rec-crash");
+    let bin = dir.join("fake-crash");
+    std::fs::write(&bin, "#!/bin/sh\nfor a; do out=\"$a\"; done\necho '{' > \"$out\"\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let drafts = dir.join("drafts");
+    let (_rec, exit) = start(&bin, &drafts);
+    assert!(exit.recv_timeout(BOUND).unwrap().unwrap_err().contains("was not saved"));
+    assert_eq!(drafts_in(&drafts), 0);
+}
+
+#[test]
+fn a_paused_recorder_is_not_taken_as_exited_and_can_still_be_stopped() {
+    let dir = tmp("paused");
+    let bin = fake_executor(&dir, &recorded().to_string(), true);
+    let (run, exit) = start(&bin, &dir.join("drafts"));
+    wait_ready(&dir);
+    let pid = std::fs::read_to_string(dir.join("ready")).unwrap().trim().to_string();
+    let signal = |name: &str| assert!(Command::new("kill").args([name, &pid]).status().unwrap().success());
+
+    signal("-STOP");
+    assert!(exit.recv_timeout(Duration::from_millis(500)).is_err(), "a paused recorder was reported as exited");
+    signal("-CONT");
+    assert!(exit.recv_timeout(Duration::from_millis(500)).is_err(), "a resumed recorder was reported as exited");
+
+    run.stopper().stop().unwrap();
+    let written = exit.recv_timeout(Duration::from_secs(5)).expect("the stop did not reach the recorder");
+    assert!(written.is_ok(), "{written:?}");
+}
+
+#[test]
+fn a_recorder_that_ignores_the_stop_is_ended_and_leaves_no_file() {
+    let dir = tmp("rec-stuck");
+    let bin = dir.join("fake-stuck");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\ntrap '' INT\necho > \"{}/ready\"\nexec sleep 600\n", dir.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (rec, exit) = start(&bin, &dir.join("drafts"));
+    wait_ready(&dir);
+    let stopper = rec.stopper();
+    stopper.stop_within(Duration::from_millis(200)).unwrap();
+    assert!(exit.recv_timeout(BOUND).unwrap().unwrap_err().contains("did not stop in time"));
+    // Stopping a recorder that has already gone signals nothing.
+    stopper.stop().unwrap();
+}
+
+#[test]
 fn a_recording_with_no_file_reports_failure_and_a_bad_bundle_never_starts() {
     let dir = tmp("rec-none");
     let bin = fake_executor(&dir, "{}", false);
-    let rec = recording::start(&bin, "com.google.Chrome", &dir.join("drafts")).unwrap();
+    let (rec, exit) = start(&bin, &dir.join("drafts"));
     wait_ready(&dir);
-    assert!(recording::stop(rec).is_err());
+    rec.stopper().stop().unwrap();
+    assert!(exit.recv_timeout(BOUND).unwrap().is_err());
     for bad in ["", "--out", "a b", "x;rm", "../x"] {
-        assert!(recording::start(&bin, bad, &dir.join("drafts")).is_err(), "{bad}");
+        assert!(recording::start(&bin, bad, &dir.join("drafts"), |_| {}).is_err(), "{bad}");
     }
 }
 
@@ -436,11 +583,12 @@ fn drafts_folder_is_private() {
     let dir = tmp("rec-mode");
     let bin = fake_executor(&dir, &recorded().to_string(), true);
     let drafts = dir.join("drafts");
-    let rec = recording::start(&bin, "com.google.Chrome", &drafts).unwrap();
+    let (rec, exit) = start(&bin, &drafts);
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&drafts).unwrap().permissions().mode() & 0o777, 0o700);
     wait_ready(&dir);
-    let _ = recording::stop(rec);
+    rec.stopper().stop().unwrap();
+    let _ = exit.recv_timeout(BOUND);
 }
 
 #[test]
@@ -565,10 +713,11 @@ fn old_drafts_are_swept_at_start_and_an_existing_folder_is_made_private() {
     std::fs::write(drafts.join("draft-old.json"), "{}").unwrap();
     std::fs::write(drafts.join("keep.txt"), "x").unwrap();
     let bin = fake_executor(&dir, &recorded().to_string(), true);
-    let rec = recording::start(&bin, "com.google.Chrome", &drafts).unwrap();
+    let (rec, exit) = start(&bin, &drafts);
     assert!(!drafts.join("draft-old.json").exists(), "leftover drafts are swept at the next start");
     assert!(drafts.join("keep.txt").exists(), "only draft files are touched");
     assert_eq!(std::fs::metadata(&drafts).unwrap().permissions().mode() & 0o777, 0o700);
     wait_ready(&dir);
-    let _ = recording::stop(rec);
+    rec.stopper().stop().unwrap();
+    let _ = exit.recv_timeout(BOUND);
 }
