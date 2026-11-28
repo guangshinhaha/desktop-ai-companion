@@ -1,18 +1,56 @@
-//! Starts and stops the executor's `record` run (TD 5.1). The executor owns the event tap and
-//! the recording indicator; the shell only starts it, signals stop, and opens the review when the
-//! file appears. The file is written by the executor only at stop, descriptors and input names only.
+//! Runs the executor's `record` run (TD 5.1). The executor owns the event tap and the recording
+//! indicator. The shell starts it, waits for it to exit, and puts what it wrote under review.
+//! The officer stops it from the REC menu, so the exit is the one signal that a recording ended.
+//! The file is written by the executor only at stop, descriptors and input names only.
 
+use crate::review::Draft;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Ceiling for the executor to finish writing after a stop signal. A bound on waiting, not a pause.
 const STOP_CEILING: Duration = Duration::from_secs(15);
 
+/// A recorder run in progress.
 pub struct Recording {
-    child: Child,
-    out: PathBuf,
+    watched: Arc<Watched>,
+}
+
+/// Asks a recorder to stop. Safe to hold after the run has ended.
+pub struct Stopper(Arc<Watched>);
+
+/// What the exit watcher and a stop share. The pid may be signalled only while `exited` is false
+/// and the lock is held: the watcher sets it before it reaps, so the pid cannot have been reused.
+struct Watched {
+    pid: libc::pid_t,
+    end: Mutex<End>,
+    ended: Condvar,
+}
+
+#[derive(Default)]
+struct End {
+    exited: bool,
+    /// The recorder ignored a stop and was killed. Nothing it left is kept.
+    forced: bool,
+}
+
+/// Where recording stands. One value, so a run and a draft under review cannot both exist.
+/// A stopping recorder is still `Recording` until it has exited and its file has been read.
+#[derive(Default)]
+pub enum Phase {
+    #[default]
+    Idle,
+    Recording(Recording),
+    /// Memory only, until save or discard.
+    Review(Draft),
+    /// The last recording gave nothing to review. Why, in words for the officer.
+    Failed(String),
+}
+
+/// A panic elsewhere must not leave a finished recorder unnoticed.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Where unreviewed recordings wait: a private folder next to the store.
@@ -65,7 +103,48 @@ pub fn sweep_at_launch(dir: Option<PathBuf>) {
     }
 }
 
-pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, String> {
+/// Starts a recording unless one is going, stopping or under review. When the recorder exits,
+/// however it was stopped, `phase` moves to `Review` or `Failed` and then `finished` is called,
+/// with no lock held.
+pub fn begin(
+    phase: &Arc<Mutex<Phase>>,
+    bin: &Path,
+    app_bundle: &str,
+    dir: &Path,
+    finished: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    // Held until the run is in place, so a recorder that exits at once waits to be recorded as one.
+    let mut now = lock(phase);
+    match &*now {
+        Phase::Recording(_) => return Err("already recording".into()),
+        Phase::Review(_) => return Err("save or discard the recording under review first".into()),
+        Phase::Idle | Phase::Failed(_) => {}
+    }
+    let shared = Arc::clone(phase);
+    let run = start(bin, app_bundle, dir, move |written| {
+        let reviewed = written.and_then(|path| {
+            Draft::from_file(&path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&path); // a refused recording does not linger
+            })
+        });
+        *lock(&shared) = match reviewed {
+            Ok(draft) => Phase::Review(draft),
+            Err(why) => Phase::Failed(why),
+        };
+        finished();
+    })?;
+    *now = Phase::Recording(run);
+    Ok(())
+}
+
+/// Starts the recorder. `on_exit` is called once, from a thread that blocks until the process
+/// exits: the file it wrote, or why there is none. A run that failed leaves no file.
+pub fn start(
+    bin: &Path,
+    app_bundle: &str,
+    dir: &Path,
+    on_exit: impl FnOnce(Result<PathBuf, String>) + Send + 'static,
+) -> Result<Recording, String> {
     if !valid_bundle(app_bundle) {
         return Err("that is not an application bundle id".into());
     }
@@ -84,33 +163,87 @@ pub fn start(bin: &Path, app_bundle: &str, dir: &Path) -> Result<Recording, Stri
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("cannot start the recorder: {}", e.kind()))?;
-    Ok(Recording { child, out })
+    let watched = Arc::new(Watched {
+        pid: child.id() as libc::pid_t,
+        end: Mutex::default(),
+        ended: Condvar::new(),
+    });
+    let theirs = Arc::clone(&watched);
+    std::thread::spawn(move || on_exit(watch(&theirs, child, out)));
+    Ok(Recording { watched })
 }
 
-/// Signals stop (SIGINT, which the executor handles by turning the tap and indicator off and
-/// then writing the file), waits for it to exit, and returns the file's path.
-pub fn stop(mut rec: Recording) -> Result<PathBuf, String> {
-    let pid = rec.child.id().to_string();
-    let signalled = Command::new("/bin/kill").args(["-INT", &pid]).status().is_ok_and(|s| s.success());
-    if !signalled {
-        let _ = rec.child.kill();
-        let _ = rec.child.wait();
-        return Err("could not tell the recorder to stop".into());
+/// Blocks until the recorder exits, then reaps it and judges what it left.
+fn watch(watched: &Watched, mut child: Child, out: PathBuf) -> Result<PathBuf, String> {
+    wait_without_reaping(watched.pid);
+    let forced = {
+        let mut end = lock(&watched.end);
+        end.exited = true;
+        watched.ended.notify_all();
+        end.forced
+    };
+    let succeeded = child.wait().is_ok_and(|s| s.success());
+    if !forced && succeeded && out.exists() {
+        return Ok(out);
     }
-    let (tx, rx) = mpsc::channel();
-    let mut child = rec.child;
-    let ceiling_pid = pid.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait());
-    });
-    match rx.recv_timeout(STOP_CEILING) {
-        Ok(Ok(status)) if status.success() && rec.out.exists() => Ok(rec.out),
-        Ok(_) => Err("the recording was not saved (no steps were recorded, or the recorder failed)".into()),
-        Err(_) => {
-            // A recorder that ignores the stop must not keep its tap and indicator running. The
-            // waiting thread reaps it once it is gone.
-            let _ = Command::new("/bin/kill").args(["-KILL", &ceiling_pid]).status();
-            Err("the recorder did not stop in time and was ended".into())
+    let _ = std::fs::remove_file(&out);
+    Err(if forced {
+        "the recorder did not stop in time and was ended".into()
+    } else {
+        "the recording was not saved (no steps were recorded, or the recorder failed)".into()
+    })
+}
+
+/// Returns once the process has exited but before it is reaped, so its pid is still its own.
+fn wait_without_reaping(pid: libc::pid_t) {
+    loop {
+        // SAFETY: `info` is a plain struct that waitid fills in; nothing else is passed to it.
+        let r = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        // Any error but an interrupt means there is nothing to wait for; the reap that follows says so.
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
         }
+    }
+}
+
+impl Recording {
+    pub fn stopper(&self) -> Stopper {
+        Stopper(Arc::clone(&self.watched))
+    }
+}
+
+impl Stopper {
+    /// Signals stop (SIGINT, which the executor handles by turning the tap and indicator off and
+    /// then writing the file) and returns once it has exited. The result goes to `on_exit`.
+    pub fn stop(&self) -> Result<(), String> {
+        self.stop_within(STOP_CEILING)
+    }
+
+    /// `stop` with its own bound. A recorder still running after it is killed: one that ignores
+    /// the stop must not keep its tap and indicator on.
+    pub fn stop_within(&self, ceiling: Duration) -> Result<(), String> {
+        let w = &*self.0;
+        let mut end = lock(&w.end);
+        if end.exited {
+            return Ok(());
+        }
+        // SAFETY (both kills): not yet reaped while `exited` is false under this lock.
+        if unsafe { libc::kill(w.pid, libc::SIGINT) } != 0 {
+            end.forced = true;
+            unsafe { libc::kill(w.pid, libc::SIGKILL) };
+            return Err("could not tell the recorder to stop".into());
+        }
+        let (mut end, _) = w
+            .ended
+            .wait_timeout_while(end, ceiling, |e| !e.exited)
+            .unwrap_or_else(|e| e.into_inner());
+        if !end.exited {
+            end.forced = true;
+            unsafe { libc::kill(w.pid, libc::SIGKILL) };
+        }
+        Ok(())
     }
 }

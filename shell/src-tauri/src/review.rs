@@ -475,8 +475,8 @@ impl Draft {
         }
     }
 
-    /// A copy kept while a save is attempted, so a failure (store locked, task not ready) does
-    /// not cost the officer their edits. Memory only.
+    /// The copy a save consumes, so a failure (store locked, task not ready) leaves the draft
+    /// under review with the officer's edits. Memory only.
     pub fn clone_for_retry(&self) -> Draft {
         Draft { task: self.task.clone(), source: self.source.clone() }
     }

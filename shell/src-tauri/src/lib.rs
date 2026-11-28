@@ -122,11 +122,11 @@ async fn ping_executor() -> Result<String, String> {
 
 const REVIEW: &str = "review";
 
-/// The one draft under review and the recorder run in progress. Memory only.
+/// What is in progress on screen. Memory only.
 #[derive(Default)]
 struct Session {
-    draft: Mutex<Option<review::Draft>>,
-    recording: Mutex<Option<recording::Recording>>,
+    /// The recorder run, or the draft it left for review.
+    recording: std::sync::Arc<Mutex<recording::Phase>>,
     approval: Mutex<Option<PendingApproval>>,
     /// The replay on screen, or the last one's report.
     run: Mutex<Option<progress::ActiveRun>>,
@@ -401,6 +401,18 @@ fn open_review_window(app: &AppHandle) {
         .build();
 }
 
+/// A finished recording: the draft, or why there is none, on screen and in front. The officer
+/// stopped it from the recorded app, and a window left over from an earlier recording is redrawn.
+fn show_review(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(REVIEW) {
+        let _ = w.eval("window.location.reload()");
+    }
+    open_review_window(app);
+    if let Some(w) = app.get_webview_window(REVIEW) {
+        let _ = w.set_focus();
+    }
+}
+
 fn close_review_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(REVIEW) {
         let _ = w.close();
@@ -420,51 +432,48 @@ fn open_store() -> Result<store::Store, String> {
 }
 
 #[tauri::command]
-fn record_start(session: tauri::State<Session>, app_bundle: String) -> Result<(), String> {
-    let mut slot = session.recording.lock().map_err(|_| "busy")?;
-    if slot.is_some() {
-        return Err("already recording".into());
-    }
+fn record_start(app: AppHandle, app_bundle: String) -> Result<(), String> {
+    let phase = app.state::<Session>().recording.clone();
     let dir = recording::drafts_dir().ok_or("no home folder")?;
-    *slot = Some(recording::start(&executor::executor_path(), &app_bundle, &dir)?);
-    Ok(())
+    let handle = app.clone();
+    let started = recording::begin(&phase, &executor::executor_path(), &app_bundle, &dir, move || {
+        show_review(&handle);
+    });
+    // Refused for a draft still under review: bring it back, in case its window was closed.
+    if started.is_err() && phase.lock().is_ok_and(|p| matches!(*p, recording::Phase::Review(_))) {
+        open_review_window(&app);
+    }
+    started
 }
 
-/// Stop: the executor turns the tap off and writes the file; the review opens on it.
+/// Stop from the shell. The recorder turns the tap off, writes the file and exits, and the review
+/// opens as it does for Stop recording in the REC menu.
 #[tauri::command]
 async fn record_stop(app: AppHandle) -> Result<(), String> {
-    let rec = app
-        .state::<Session>()
-        .recording
-        .lock()
-        .map_err(|_| "busy")?
-        .take()
-        .ok_or("not recording")?;
-    let path = tauri::async_runtime::spawn_blocking(move || recording::stop(rec))
-        .await
-        .map_err(|e| e.to_string())??;
-    let draft = match review::Draft::from_file(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path); // a refused recording does not linger
-            return Err(e);
-        }
+    let stopper = match &*app.state::<Session>().recording.lock().map_err(|_| "busy")? {
+        recording::Phase::Recording(r) => r.stopper(),
+        _ => return Err("not recording".into()),
     };
-    *app.state::<Session>().draft.lock().map_err(|_| "busy")? = Some(draft);
-    open_review_window(&app);
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || stopper.stop())
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 fn review_view(session: tauri::State<Session>) -> Result<serde_json::Value, String> {
-    let d = session.draft.lock().map_err(|_| "busy")?;
-    d.as_ref().map(|d| d.view()).ok_or_else(|| "nothing to review".into())
+    match &*session.recording.lock().map_err(|_| "busy")? {
+        recording::Phase::Review(d) => Ok(d.view()),
+        recording::Phase::Failed(why) => Err(why.clone()),
+        _ => Err("nothing to review".into()),
+    }
 }
 
 #[tauri::command]
 fn review_edit(session: tauri::State<Session>, edit: serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut d = session.draft.lock().map_err(|_| "busy")?;
-    let draft = d.as_mut().ok_or("nothing to review")?;
+    let mut phase = session.recording.lock().map_err(|_| "busy")?;
+    let recording::Phase::Review(draft) = &mut *phase else {
+        return Err("nothing to review".into());
+    };
     draft.apply(&edit)?;
     Ok(draft.view())
 }
@@ -472,29 +481,26 @@ fn review_edit(session: tauri::State<Session>, edit: serde_json::Value) -> Resul
 #[tauri::command]
 fn review_save(app: AppHandle, author: String) -> Result<serde_json::Value, String> {
     let session = app.state::<Session>();
-    let mut slot = session.draft.lock().map_err(|_| "busy")?;
-    let draft = slot.take().ok_or("nothing to review")?;
-    // A failed save must not lose the officer's edits: the draft goes back.
-    let kept = draft.clone_for_retry();
-    let saved = open_store().and_then(|mut store| draft.save(&mut store, &author, now_secs()));
-    match saved {
-        Ok((id, version)) => {
-            drop(slot);
-            close_review_window(&app);
-            Ok(serde_json::json!({ "id": id, "version": version }))
-        }
-        Err(e) => {
-            *slot = Some(kept);
-            Err(e)
-        }
-    }
+    let mut phase = session.recording.lock().map_err(|_| "busy")?;
+    let recording::Phase::Review(draft) = &*phase else {
+        return Err("nothing to review".into());
+    };
+    // The draft stays under review unless the save works, so a failure loses no edits.
+    let (id, version) =
+        open_store().and_then(|mut store| draft.clone_for_retry().save(&mut store, &author, now_secs()))?;
+    *phase = recording::Phase::Idle;
+    drop(phase);
+    close_review_window(&app);
+    Ok(serde_json::json!({ "id": id, "version": version }))
 }
 
 #[tauri::command]
 fn review_discard(app: AppHandle) {
-    if let Ok(mut slot) = app.state::<Session>().draft.lock() {
-        if let Some(d) = slot.take() {
-            d.discard();
+    if let Ok(mut phase) = app.state::<Session>().recording.lock() {
+        match std::mem::take(&mut *phase) {
+            recording::Phase::Review(d) => d.discard(),
+            // A run in progress is not discarded from here.
+            other => *phase = other,
         }
     }
     close_review_window(&app);
